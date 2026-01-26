@@ -1,0 +1,58 @@
+# Build directories
+/build
+/dist
+/bin
+/out
+
+# vcpkg installed packages (local, machine-specific)
+/vcpkg_installed
+/vcpkg-configuration.lock.json
+
+# CMake cache and generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+
+# Build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# CUDA compilation intermediates
+*.cubin
+*.ptx
+*.fatbin
+*.cu.c
+tmpxft_*
+
+# Visual Studio / MSBuild
+.vs/
+*.vcxproj.user
+*.vcxproj.filters
+*.sln.user
+Debug/
+Release/
+x64/
+x86/
+.vscode/
+*.code-workspace
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
