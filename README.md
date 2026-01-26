@@ -1,4 +1,4 @@
-# Dynamic Foam 2D
+# Dynamic Foam
 
 Radiant Foam Physics Engine using C++ and CUDA.
 
