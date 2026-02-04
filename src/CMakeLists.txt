@@ -3,6 +3,9 @@ find_package(glfw3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_package(OpenGL REQUIRED)
+find_package(EnTT CONFIG REQUIRED)
+find_package(fmt CONFIG REQUIRED)
+find_package(glm CONFIG REQUIRED)
 
 # Fetch ImGui backends from GitHub
 include(FetchContent)
@@ -37,6 +40,9 @@ target_link_libraries(dynamic_foam
         imgui::imgui
         OpenGL::GL
         CUDA::cudart
+        EnTT::EnTT
+        fmt::fmt
+        glm::glm
 )
 
 # CUDA settings
