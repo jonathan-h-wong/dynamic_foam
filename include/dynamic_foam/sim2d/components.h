@@ -33,6 +33,11 @@ struct InertiaTensor {
     glm::mat3 value{1.0f}; // Identity matrix by default
 };
 
+struct Draggable {};
+
+// Mutually exclusive physics properties
+struct Static {};
+struct Dynamic {};
 
 // ============================================================================
 // Particle Components
@@ -58,12 +63,10 @@ struct ParticleMass {
     float value{1.0f};
 };
 
-struct IsBlade {
-    bool value{true};
-};
+// Mutually exclusive topological properties
+struct Cutter {};
+struct Cuttable {};
 
-struct IsCuttable {
-    bool value{true};
-};
+struct Surface {};
 
 } // namespace dynamic_foam::sim2d
