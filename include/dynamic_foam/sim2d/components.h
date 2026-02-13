@@ -33,7 +33,7 @@ struct InertiaTensor {
     glm::mat3 value{1.0f}; // Identity matrix by default
 };
 
-struct Draggable {};
+struct Controller {};
 
 // Mutually exclusive physics properties
 struct Static {};
@@ -43,11 +43,11 @@ struct Dynamic {};
 // Particle Components
 // ============================================================================
 
-struct ParticlePosition {
+struct ParticleWorldPosition {
     glm::vec3 value{0.0f};
 };
 
-struct ParticleVelocity {
+struct ParticleLocalPosition {
     glm::vec3 value{0.0f};
 };
 
