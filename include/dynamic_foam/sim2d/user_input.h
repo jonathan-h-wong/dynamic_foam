@@ -2,13 +2,13 @@
 
 #include "imgui.h"
 
-namespace DynamicFoam {
-    namespace Sim2D {
-        struct UserInput {
-            ImVec2 mouse_pos;
-            bool left_mouse_clicked;
-        };
+namespace DynamicFoam::Sim2D{
 
-        UserInput PollUserInput();
-    }
+// Simple cursor-only input for 2D simulation
+struct UserInput {
+    ImVec2 mouse_pos;
+    bool left_mouse_clicked;
+};
+
+UserInput PollUserInput();
 }

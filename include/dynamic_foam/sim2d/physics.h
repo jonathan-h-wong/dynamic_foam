@@ -1,7 +1,7 @@
 #pragma once
 
-namespace dynamic_foam::sim2d {
+namespace DynamicFoam::Sim2D {
 
 // Physics implementations for 2D simulation
 
-} // namespace dynamic_foam::sim2d
+}
