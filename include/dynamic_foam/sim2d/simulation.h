@@ -4,6 +4,9 @@
 #include "dynamic_foam/sim2d/adjacency.h"
 #include "dynamic_foam/sim2d/scenegraph.h"
 #include "dynamic_foam/sim2d/user_input.h"
+#include <dynamic_foam/sim2d/topology.h>
+#include <dynamic_foam/sim2d/physics.h>
+#include <dynamic_foam/sim2d/render.h>
 
 namespace DynamicFoam::Sim2D {
 
@@ -36,6 +39,9 @@ class Simulation {
         entt::registry foamRegistry;
         entt::registry particleRegistry;
         std::unordered_map<int, AdjacencyList<entt::entity>> foamAdjacencyLists;
+        Topology topologySubsystem;
+        Physics physicsSubsystem;
+        Render renderSubsystem;
     };
 
 }

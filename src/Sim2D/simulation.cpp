@@ -15,15 +15,15 @@ namespace DynamicFoam::Sim2D {
     }
 
     void Simulation::updateTopology() {
-        // Update foam topology based on current state and interactions
+        topologySubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists);
     }
 
     void Simulation::updatePhysics(float deltaTime) {
-        // Update physics simulation for all entities based on deltaTime
+        physicsSubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists, deltaTime);
     }
 
     void Simulation::render() {
-        // Render the current state of the simulation
+        renderSubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists);
     }
 
     void Simulation::step(float deltaTime) {

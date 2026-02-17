@@ -10,7 +10,8 @@ class Render {
 
         void update(
             entt::registry& foamRegistry,
-            entt::registry& particleRegistry
+            entt::registry& particleRegistry,
+            const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
         );
     };
 }
