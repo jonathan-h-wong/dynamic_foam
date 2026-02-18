@@ -15,6 +15,9 @@ namespace DynamicFoam::Sim2D {
     struct InertiaTensor {
         glm::mat3 value{1.0f}; // Identity matrix by default
     };
+    struct Density {
+        float value{1.0f};
+    };
 
     // Transient Components
     struct Position {

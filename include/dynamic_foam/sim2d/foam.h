@@ -17,6 +17,7 @@ namespace DynamicFoam::Sim2D {
         std::unordered_map<int, glm::vec3> particlePosition;
 
         // Physics
+        float density;
         std::unordered_map<int, glm::vec3> particleMass;
 
         // Rendering
@@ -30,14 +31,16 @@ namespace DynamicFoam::Sim2D {
             const std::unordered_map<int, glm::vec3>& position,
             const std::unordered_map<int, glm::vec3>& mass,
             const std::unordered_map<int, glm::vec3>& color,
-            const std::unordered_map<int, float>& opacity
+            const std::unordered_map<int, float>& opacity,
+            float density = 1.0f
         ) : adjacencyList(adjList),
             isStencil(stencil),
             isMutable(mutable_map),
             particlePosition(position),
             particleMass(mass),
             particleColor(color),
-            particleOpacity(opacity) {
+            particleOpacity(opacity),
+            density(density) {
             validate();
         }
 
