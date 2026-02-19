@@ -1,4 +1,5 @@
-# include "dynamic_foam/sim2d/sample_scene.h"
+#include "dynamic_foam/sim2d/sample_scene.h"
+#include "dynamic_foam/sim2d/utils.h"
 
 namespace DynamicFoam::Sim2D {
     Foam generateFoamBar(
@@ -7,62 +8,89 @@ namespace DynamicFoam::Sim2D {
         int widthParticles, 
         int heightParticles, 
         float density, 
-        const glm::vec3& color) {
-        // Example foam generation logic
-        AdjacencyList<int> adjList;
+        const glm::vec3& color_param) {
+        
+        std::vector<int> particleIds;
+        std::vector<glm::vec2> positions_vec2;
+        std::unordered_map<int, glm::vec3> position;
         std::unordered_map<int, bool> stencil;
         std::unordered_map<int, bool> mutable_map;
-        std::unordered_map<int, glm::vec3> position;
         std::unordered_map<int, glm::vec3> mass;
         std::unordered_map<int, glm::vec3> color;
         std::unordered_map<int, float> opacity;
 
-        // TODO
-        // Create width/height grid of particles centered on origin. 
+        int paddedWidth = widthParticles + 2;
+        int paddedHeight = heightParticles + 2;
+        float dx = static_cast<float>(width) / (widthParticles - 1);
+        float dy = static_cast<float>(height) / (heightParticles - 1);
 
-        // Stencil map is entirely false
-        // Mutable map is entirely true
-        // Position map is grid layout
-        // TEMP: Mass map is uniform  (Write MC Integration utility)
-        // Color map is enitrely the input color
-        // Opacity map is entirely 1.0f
+        for (int i = 0; i < paddedWidth; ++i) {
+            for (int j = 0; j < paddedHeight; ++j) {
+                int id = i * paddedHeight + j;
+                particleIds.push_back(id);
 
-        // Okay, I believe I need to write the MC utility first
-        // That is the workhorse for topology subsystem anyway
-        // Essentially, pass in particle positions to DT. 
-        
-        // triangulate()
-        // I: Particle positions
-        // O: AdjList
-        
-        // triangulateWithAreaIntegration()
-        // I: Particle positions
-        // O: AdjList, vol map
+                float x = (i - 1) * dx - width / 2.0f;
+                float y = (j - 1) * dy - height / 2.0f;
+                position[id] = glm::vec3(x, y, 0.0f);
+                positions_vec2.push_back(glm::vec2(x, y));
+
+                bool isPadding = (i == 0 || i == paddedWidth - 1 || j == 0 || j == paddedHeight - 1);
+                
+                stencil[id] = false;
+                mutable_map[id] = true;
+                color[id] = color_param;
+                opacity[id] = isPadding ? 0.0f : 1.0f;
+            }
+        }
+
+        auto [adjList, areaMap] = triangulateWithAreaIntegration(positions_vec2, particleIds);
+
+        for (const auto& id : particleIds) {
+            mass[id] = glm::vec3(areaMap[id] * density);
+        }
 
         return Foam(adjList, stencil, mutable_map, position, mass, color, opacity, density);
     }
 
     Foam generateFoamPointCursor() {
-        // Example foam generation logic
-        AdjacencyList<int> adjList;
+        std::vector<int> particleIds;
+        std::vector<glm::vec2> positions_vec2;
+        std::unordered_map<int, glm::vec3> position;
         std::unordered_map<int, bool> stencil;
         std::unordered_map<int, bool> mutable_map;
-        std::unordered_map<int, glm::vec3> position;
         std::unordered_map<int, glm::vec3> mass;
         std::unordered_map<int, glm::vec3> color;
         std::unordered_map<int, float> opacity;
 
-        // Populate the above data structures with foam data
-        
-        // TODO
-        // Create single particle at origin surrounded by particles (6-8). 
-        
-        // Stencil map is entirely true
-        // Mutable map is entirely false
-        // Position map is radial layout
-        // Mass is negligible-- can be entirely 1.0f
-        // Color map is entirely white
-        // Opacity map is entirely 1.0f
+        // Central particle
+        int centerId = 0;
+        particleIds.push_back(centerId);
+        position[centerId] = glm::vec3(0.0f, 0.0f, 0.0f);
+        positions_vec2.push_back(glm::vec2(0.0f, 0.0f));
+        opacity[centerId] = 1.0f;
+
+        // Surrounding particles
+        int numSurrounding = 8;
+        float radius = 0.2f;
+        for (int i = 0; i < numSurrounding; ++i) {
+            int id = i + 1;
+            particleIds.push_back(id);
+            float angle = 2.0f * glm::pi<float>() * static_cast<float>(i) / numSurrounding;
+            float x = radius * cos(angle);
+            float y = radius * sin(angle);
+            position[id] = glm::vec3(x, y, 0.0f);
+            positions_vec2.push_back(glm::vec2(x, y));
+            opacity[id] = 0.0f; // Padding particles
+        }
+
+        AdjacencyList<int> adjList = triangulate(positions_vec2, particleIds);
+
+        for (const auto& id : particleIds) {
+            stencil[id] = true;
+            mutable_map[id] = false;
+            mass[id] = glm::vec3(1.0f);
+            color[id] = glm::vec3(1.0f); // White
+        }
 
         return Foam(adjList, stencil, mutable_map, position, mass, color, opacity, 1.0f);
     }
