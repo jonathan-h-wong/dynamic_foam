@@ -5,6 +5,9 @@
 #include <utility>
 #include <tuple>
 
+#include <glm/glm.hpp>
+#include <glm/mat3x3.hpp>
+
 #include "dynamic_foam/sim2d/adjacency_list.h"
 #include <CGAL/Delaunay_triangulation_2.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
@@ -60,6 +63,80 @@ triangulateWithAreaIntegration(
     const std::vector<T>& particleIds,
     int samplesPerCell = 10000,
     unsigned int seed = 42
+);
+
+/**
+ * @brief Finds connected components in a graph based on an opacity map.
+ *
+ * This function performs a graph traversal (like BFS or DFS) to identify
+ * connected components. The traversal is bounded by vertices with an opacity
+ * of 0.0f. Each component is assigned a unique integer ID.
+ *
+ * @tparam T The type of the node IDs.
+ * @param adjList The adjacency list representing the graph.
+ * @param opacityMap A map from node IDs to their opacity values (0.0f to 1.0f).
+ * @return A map from node IDs to their component ID. Nodes with 0.0f opacity
+ *         or nodes that are not part of any component will not be in the map.
+ */
+template <typename T>
+std::unordered_map<T, int> findConnectedComponents(
+    const AdjacencyList<T>& adjList,
+    const std::unordered_map<T, float>& opacityMap
+);
+
+/**
+ * @brief Finds surface cells in a graph based on an opacity map.
+ *
+ * A surface cell is defined as a vertex with an opacity greater than 0
+ * that is a neighbor to any vertex with an opacity of 0.
+ *
+ * @tparam T The type of the node IDs.
+ * @param adjList The adjacency list representing the graph.
+ * @param opacityMap A map from node IDs to their opacity values (0.0f to 1.0f).
+ * @return A vector of IDs of the surface cells.
+ */
+template <typename T>
+std::vector<T> findSurfaceCells(
+    const AdjacencyList<T>& adjList,
+    const std::unordered_map<T, float>& opacityMap
+);
+
+/**
+ * @brief Calculates the center of mass for a collection of particles.
+ *
+ * @tparam T The type of the particle IDs.
+ * @param positions A map from particle IDs to their positions (glm::vec3).
+ * @param masses A map from particle IDs to their masses (float).
+ * @return glm::vec3 The calculated center of mass.
+ */
+template <typename T>
+glm::vec3 calculateCenterOfMass(
+    const std::unordered_map<T, glm::vec3>& positions,
+    const std::unordered_map<T, float>& masses
+);
+
+/**
+ * @brief Calculates the inertia tensor for a collection of particles.
+ *
+ * @tparam T The type of the particle IDs.
+ * @param localPositions A map from particle IDs to their local positions relative to the center of mass.
+ * @param masses A map from particle IDs to their masses.
+ * @return glm::mat3 The calculated inertia tensor.
+ */
+template <typename T>
+glm::mat3 calculateInertiaTensor(
+    const std::unordered_map<T, glm::vec3>& localPositions,
+    const std::unordered_map<T, float>& masses
+);
+
+/**
+ * @brief Calculates the Axis-Aligned Bounding Box (AABB) for a collection of positions.
+ *
+ * @param positions A vector of positions (glm::vec3).
+ * @return A pair containing the min and max corners of the AABB as glm::vec3.
+ */
+std::pair<glm::vec3, glm::vec3> calculateAABB(
+    const std::vector<glm::vec3>& positions
 );
 
 } // namespace DynamicFoam::Sim2D

@@ -4,6 +4,8 @@
 #pragma once
 #include <random>
 #include <cuda_runtime.h>
+#include <glm/glm.hpp>
+#include <glm/mat3x3.hpp>
 
 #include "dynamic_foam/sim2d/utils.h"
 #include "dynamic_foam/sim2d/adjacency_list.h"
@@ -332,6 +334,164 @@ triangulateWithAreaIntegration(
     }
     
     return {adjList, areaMap};
+}
+
+// Find leaf nodes in the adjacency list
+template <typename T>
+std::unordered_map<T, int> findConnectedComponents(
+    const AdjacencyList<T>& adjList,
+    const std::unordered_map<T, float>& opacityMap
+) {
+    std::unordered_map<T, int> componentLabels;
+    std::unordered_set<T> visited;
+    int componentId = 0;
+
+    for (const auto& pair : opacityMap) {
+        const T& startNode = pair.first;
+        float opacity = pair.second;
+
+        if (opacity > 0.0f && visited.find(startNode) == visited.end()) {
+            // Start of a new component
+            componentId++;
+            std::vector<T> stack;
+
+            stack.push_back(startNode);
+            visited.insert(startNode);
+            componentLabels[startNode] = componentId;
+
+            while (!stack.empty()) {
+                T currentNode = stack.back();
+                stack.pop_back();
+
+                for (const auto& neighbor : adjList.getNeighbors(currentNode)) {
+                    auto it = opacityMap.find(neighbor);
+                    if (it != opacityMap.end() && it->second > 0.0f && visited.find(neighbor) == visited.end()) {
+                        visited.insert(neighbor);
+                        componentLabels[neighbor] = componentId;
+                        stack.push_back(neighbor);
+                    }
+                }
+            }
+        }
+    }
+
+    return componentLabels;
+}
+
+// Find surface cells
+template <typename T>
+std::vector<T> findSurfaceCells(
+    const AdjacencyList<T>& adjList,
+    const std::unordered_map<T, float>& opacityMap
+) {
+    std::vector<T> surfaceCells;
+    for (const auto& pair : opacityMap) {
+        const T& nodeId = pair.first;
+        float opacity = pair.second;
+
+        if (opacity > 0.0f) {
+            bool isSurfaceCell = false;
+            for (const auto& neighborId : adjList.getNeighbors(nodeId)) {
+                auto it = opacityMap.find(neighborId);
+                if (it == opacityMap.end() || it->second == 0.0f) {
+                    isSurfaceCell = true;
+                    break;
+                }
+            }
+            if (isSurfaceCell) {
+                surfaceCells.push_back(nodeId);
+            }
+        }
+    }
+    return surfaceCells;
+}
+
+// Calculate center of mass
+template <typename T>
+glm::vec3 calculateCenterOfMass(
+    const std::unordered_map<T, glm::vec3>& positions,
+    const std::unordered_map<T, float>& masses
+) {
+    glm::vec3 com(0.0f);
+    float totalMass = 0.0f;
+
+    for (const auto& pair : positions) {
+        const T& id = pair.first;
+        const glm::vec3& pos = pair.second;
+        
+        auto massIt = masses.find(id);
+        if (massIt != masses.end()) {
+            float mass = massIt->second;
+            com += pos * mass;
+            totalMass += mass;
+        }
+    }
+
+    if (totalMass > 0.0f) {
+        com /= totalMass;
+    }
+
+    return com;
+}
+
+// Calculate inertia tensor
+template <typename T>
+glm::mat3 calculateInertiaTensor(
+    const std::unordered_map<T, glm::vec3>& localPositions,
+    const std::unordered_map<T, float>& masses
+) {
+    glm::mat3 inertiaTensor(0.0f);
+
+    for (const auto& pair : localPositions) {
+        const T& id = pair.first;
+        const glm::vec3& r = pair.second; // Local position
+        
+        auto massIt = masses.find(id);
+        if (massIt != masses.end()) {
+            float mass = massIt->second;
+            
+            // Diagonal elements
+            inertiaTensor[0][0] += mass * (r.y * r.y + r.z * r.z);
+            inertiaTensor[1][1] += mass * (r.x * r.x + r.z * r.z);
+            inertiaTensor[2][2] += mass * (r.x * r.x + r.y * r.y);
+            
+            // Off-diagonal elements
+            inertiaTensor[0][1] -= mass * r.x * r.y;
+            inertiaTensor[0][2] -= mass * r.x * r.z;
+            inertiaTensor[1][2] -= mass * r.y * r.z;
+        }
+    }
+
+    // Symmetrize the matrix
+    inertiaTensor[1][0] = inertiaTensor[0][1];
+    inertiaTensor[2][0] = inertiaTensor[0][2];
+    inertiaTensor[2][1] = inertiaTensor[1][2];
+
+    return inertiaTensor;
+}
+
+// Calculate AABB
+std::pair<glm::vec3, glm::vec3> calculateAABB(
+    const std::vector<glm::vec3>& positions
+) {
+    if (positions.empty()) {
+        return {glm::vec3(0.0f), glm::vec3(0.0f)};
+    }
+
+    glm::vec3 min = positions[0];
+    glm::vec3 max = positions[0];
+
+    for (size_t i = 1; i < positions.size(); ++i) {
+        const glm::vec3& pos = positions[i];
+        min.x = std::min(min.x, pos.x);
+        min.y = std::min(min.y, pos.y);
+        min.z = std::min(min.z, pos.z);
+        max.x = std::max(max.x, pos.x);
+        max.y = std::max(max.y, pos.y);
+        max.z = std::max(max.z, pos.z);
+    }
+
+    return {min, max};
 }
 
 } // namespace DynamicFoam::Sim2D
