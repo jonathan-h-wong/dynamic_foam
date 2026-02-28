@@ -45,11 +45,20 @@ namespace DynamicFoam::Sim2D {
 
         auto [adjList, areaMap, voronoiVertices] = triangulateWithMetadata(positions_vec2, particleIds);
 
+        std::unordered_map<int, std::vector<glm::vec3>> voronoiVertices3D;
+        for (const auto& [id, vertices] : voronoiVertices) {
+            std::vector<glm::vec3> vertices3D;
+            for (const auto& v : vertices) {
+                vertices3D.emplace_back(v.x, v.y, 0.0f);
+            }
+            voronoiVertices3D[id] = vertices3D;
+        }
+
         for (const auto& id : particleIds) {
             mass[id] = areaMap[id] * density;
         }
 
-        return Foam(adjList, stencil, mutable_map, position, voronoiVertices, mass, color, opacity, density);
+        return Foam(adjList, stencil, mutable_map, position, voronoiVertices3D, mass, color, opacity, density);
     }
 
     Foam generateFoamPointCursor() {
@@ -85,6 +94,15 @@ namespace DynamicFoam::Sim2D {
 
         auto [adjList, areaMap, voronoiVertices] = triangulateWithMetadata(positions_vec2, particleIds);
 
+        std::unordered_map<int, std::vector<glm::vec3>> voronoiVertices3D;
+        for (const auto& [id, vertices] : voronoiVertices) {
+            std::vector<glm::vec3> vertices3D;
+            for (const auto& v : vertices) {
+                vertices3D.emplace_back(v.x, v.y, 0.0f);
+            }
+            voronoiVertices3D[id] = vertices3D;
+        }
+
         for (const auto& id : particleIds) {
             stencil[id] = true;
             mutable_map[id] = false;
@@ -92,7 +110,7 @@ namespace DynamicFoam::Sim2D {
             color[id] = glm::vec3(1.0f); // White
         }
 
-        return Foam(adjList, stencil, mutable_map, position, voronoiVertices, mass, color, opacity, 1.0f);
+        return Foam(adjList, stencil, mutable_map, position, voronoiVertices3D, mass, color, opacity, 1.0f);
     }
 
     SceneGraph createSampleSceneGraph() {
