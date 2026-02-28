@@ -15,7 +15,7 @@ namespace DynamicFoam::Sim2D {
         std::unordered_map<int, glm::vec3> position;
         std::unordered_map<int, bool> stencil;
         std::unordered_map<int, bool> mutable_map;
-        std::unordered_map<int, glm::vec3> mass;
+        std::unordered_map<int, float> mass;
         std::unordered_map<int, glm::vec3> color;
         std::unordered_map<int, float> opacity;
 
@@ -43,13 +43,13 @@ namespace DynamicFoam::Sim2D {
             }
         }
 
-        auto [adjList, areaMap] = triangulateWithAreaIntegration(positions_vec2, particleIds);
+        auto [adjList, areaMap, voronoiVertices] = triangulateWithMetadata(positions_vec2, particleIds);
 
         for (const auto& id : particleIds) {
-            mass[id] = glm::vec3(areaMap[id] * density);
+            mass[id] = areaMap[id] * density;
         }
 
-        return Foam(adjList, stencil, mutable_map, position, mass, color, opacity, density);
+        return Foam(adjList, stencil, mutable_map, position, voronoiVertices, mass, color, opacity, density);
     }
 
     Foam generateFoamPointCursor() {
@@ -58,7 +58,7 @@ namespace DynamicFoam::Sim2D {
         std::unordered_map<int, glm::vec3> position;
         std::unordered_map<int, bool> stencil;
         std::unordered_map<int, bool> mutable_map;
-        std::unordered_map<int, glm::vec3> mass;
+        std::unordered_map<int, float> mass;
         std::unordered_map<int, glm::vec3> color;
         std::unordered_map<int, float> opacity;
 
@@ -83,16 +83,16 @@ namespace DynamicFoam::Sim2D {
             opacity[id] = 0.0f; // Padding particles
         }
 
-        AdjacencyList<int> adjList = triangulate(positions_vec2, particleIds);
+        auto [adjList, areaMap, voronoiVertices] = triangulateWithMetadata(positions_vec2, particleIds);
 
         for (const auto& id : particleIds) {
             stencil[id] = true;
             mutable_map[id] = false;
-            mass[id] = glm::vec3(1.0f);
+            mass[id] = areaMap[id];
             color[id] = glm::vec3(1.0f); // White
         }
 
-        return Foam(adjList, stencil, mutable_map, position, mass, color, opacity, 1.0f);
+        return Foam(adjList, stencil, mutable_map, position, voronoiVertices, mass, color, opacity, 1.0f);
     }
 
     SceneGraph createSampleSceneGraph() {
@@ -101,12 +101,12 @@ namespace DynamicFoam::Sim2D {
         std::unordered_map<int, bool> controller_map;
         std::unordered_map<int, bool> dynamic_map;
 
-        foams[0] = createFoamBar(1.0f, 0.5f, 10, 5, 1.0f, glm::vec3(0.0f, 0.5f, 1.0f));
+        foams[0] = generateFoamBar(1.0f, 0.5f, 10, 5, 1.0f, glm::vec3(0.0f, 0.5f, 1.0f));
         transforms[0] = glm::mat4(1.0f); // Identity transform
         controller_map[0] = false; // Not a controller
         dynamic_map[0] = true; // Dynamic foam
 
-        foams[1] = createFoamPointCursor();
+        foams[1] = generateFoamPointCursor();
         transforms[1] = glm::translate(glm::mat4(1.0f), glm::vec3(0.5f, 0.0f, 0.0f)); // Positioned to the right of the bar
         controller_map[1] = true; // Controller foam
         dynamic_map[1] = false; // Not dynamic

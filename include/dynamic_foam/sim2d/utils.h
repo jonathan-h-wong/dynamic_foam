@@ -8,61 +8,45 @@
 #include <glm/glm.hpp>
 #include <glm/mat3x3.hpp>
 
-#include "dynamic_foam/sim2d/adjacency_list.h"
+#include "dynamic_foam/sim2d/adjacency.h"
+
+// CGAL header-only setup with faster kernel
 #include <CGAL/Delaunay_triangulation_2.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 
 namespace DynamicFoam::Sim2D {
 
 // CGAL typedefs for use in function signatures
+// Using Exact_predicates_inexact_constructions_kernel for faster compilation
 using K = CGAL::Exact_predicates_inexact_constructions_kernel;
 using Delaunay_2 = CGAL::Delaunay_triangulation_2<K>;
 using Point_2 = K::Point_2;
 
 /**
- * @brief Triangulates a set of 2D particles using Delaunay triangulation.
+ * @brief Triangulate and compute Voronoi cell metadata (area, vertices).
  *
- * This function takes a set of 2D particle positions and their corresponding IDs,
- * and computes the Delaunay triangulation. It returns the adjacency list representing
- * the connectivity of the triangulation.
+ * For each particle, collects the ordered ring of circumcenters of incident
+ * Delaunay faces (= Voronoi cell vertices), then sums signed triangle areas
+ * formed with the generator point as the fan origin.
  *
- * @tparam T The type of the particle IDs.
- * @tparam Vec2 The type of the 2D position vectors (must have .x and .y members).
- * @param positions A vector of particle positions.
- * @param particleIds A vector of particle IDs.
- * @return AdjacencyList<T>: The graph of particle neighbors.
+ * Boundary particles (with infinite incident faces) are assigned area = -1
+ * to signal that their cell is unbounded. Clip to a domain first if you
+ * need areas for those.
+ *
+ * @param positions:   Particle positions (.x, .y)
+ * @param particleIds: Particle IDs (must be 1-to-1 with positions)
+ * @return Tuple of (AdjacencyList, area map, Voronoi vertex map).
+ *         Unbounded cells have area -1.
  */
 template <typename T, typename Vec2>
-AdjacencyList<T>
-triangulate(
+std::tuple<
+    AdjacencyList<T>,
+    std::unordered_map<T, float>,
+    std::unordered_map<T, std::vector<glm::vec2>>
+>
+triangulateWithMetadata(
     const std::vector<Vec2>& positions,
     const std::vector<T>& particleIds
-);
-
-/**
- * @brief Performs triangulation and calculates Voronoi cell areas using GPU-accelerated Monte Carlo integration.
- *
- * This function first triangulates the particles and then computes the area of each particle's
- * Voronoi cell. The area calculation is accelerated using a CUDA kernel that performs
- * Monte Carlo sampling.
- *
- * @tparam T The type of the particle IDs.
- * @tparam Vec2 The type of the 2D position vectors (must have .x and .y members).
- * @param positions A vector of particle positions.
- * @param particleIds A vector of particle IDs.
- * @param samplesPerCell The number of Monte Carlo samples to use for each cell's area calculation.
- * @param seed The random seed for the Monte Carlo simulation for reproducibility.
- * @return A pair containing:
- *         - AdjacencyList<T>: The graph of particle neighbors.
- *         - std::unordered_map<T, float>: A map from particle IDs to their Voronoi cell areas.
- */
-template <typename T, typename Vec2>
-std::pair<AdjacencyList<T>, std::unordered_map<T, float>>
-triangulateWithAreaIntegration(
-    const std::vector<Vec2>& positions,
-    const std::vector<T>& particleIds,
-    int samplesPerCell = 10000,
-    unsigned int seed = 42
 );
 
 /**
@@ -137,6 +121,26 @@ glm::mat3 calculateInertiaTensor(
  */
 std::pair<glm::vec3, glm::vec3> calculateAABB(
     const std::vector<glm::vec3>& positions
+);
+
+/**
+ * @brief Counts cycles in the air cell subgraph using cyclomatic complexity.
+ *
+ * This function computes the cyclomatic complexity (E - V + C) of the subgraph
+ * formed by air cells (vertices with opacity == 0 that are neighbors of surface cells).
+ * The number of edges counts only those connecting two air cells.
+ *
+ * @tparam T The type of the node IDs.
+ * @param adjList The adjacency list representing the graph.
+ * @param surfaceIds A vector of surface cell IDs.
+ * @param opacityMap A map from node IDs to their opacity values (0.0f to 1.0f).
+ * @return The cycle count (number of independent cycles in the air cell subgraph).
+ */
+template <typename T>
+int countCycles(
+    const AdjacencyList<T>& adjList,
+    const std::vector<T>& surfaceIds,
+    const std::unordered_map<T, float>& opacityMap
 );
 
 } // namespace DynamicFoam::Sim2D

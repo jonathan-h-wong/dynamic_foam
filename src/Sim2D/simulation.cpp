@@ -6,7 +6,6 @@
 namespace DynamicFoam::Sim2D {
     Simulation::Simulation(
         const SceneGraph& sceneGraph, 
-        const UserInput& input,
         const glm::ivec2& windowSize
     ) {
         // Creates rigid body and particle registries
@@ -14,16 +13,16 @@ namespace DynamicFoam::Sim2D {
         for (const auto& [foamId, foam] : sceneGraph.foams) {
             auto rigidBody = foamRegistry.create();
 
-            // Set rigid body's position from the scene graph
+            // Set RB position from the scene graph
             const auto& transform = sceneGraph.worldTransforms.at(foamId);
             foamRegistry.emplace<Position>(rigidBody, glm::vec3(transform[3]));
 
-            // Set default transient components
+            // Set RB transient components
             foamRegistry.emplace<Velocity>(rigidBody, glm::vec3(0.0f));
             foamRegistry.emplace<Orientation>(rigidBody, glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
             foamRegistry.emplace<AngularVelocity>(rigidBody, glm::vec3(0.0f));
 
-            // Set foam type
+            // Set RB foam type
             if (sceneGraph.isController.at(foamId)) {
                 foamRegistry.emplace<Controller>(rigidBody);
             } else if (sceneGraph.isDynamic.at(foamId)) {
@@ -32,26 +31,36 @@ namespace DynamicFoam::Sim2D {
                 foamRegistry.emplace<Static>(rigidBody);
             }
 
-            // Set density
+            // Set RB density
             foamRegistry.emplace<Density>(rigidBody, foam.density);
 
             std::unordered_map<int, entt::entity> particleMap;
+            for (const auto& [particleId, localPos] : foam.particlePosition) {
+                particleMap[particleId] = particleRegistry.create();
+            }
+
+            // Add RB to central Adjacency List registry
+            foamAdjacencyLists[static_cast<int>(rigidBody)] = AdjacencyList<entt::entity>(
+                foam.adjacencyList, 
+                [&](int p_id) { return particleMap.at(p_id); }
+            );
+
             std::vector<glm::vec3> world_positions;
             std::unordered_map<int, glm::vec3> local_positions;
             std::unordered_map<int, float> masses;
 
+            // Set Particle components 
             for (const auto& [particleId, localPos] : foam.particlePosition) {
-                auto particle = particleRegistry.create();
-                particleMap[particleId] = particle;
+                auto particle = particleMap.at(particleId);
 
                 particleRegistry.emplace<ParticleLocalPosition>(particle, localPos);
                 particleRegistry.emplace<ParticleColor>(particle, foam.particleColor.at(particleId));
                 particleRegistry.emplace<ParticleOpacity>(particle, foam.particleOpacity.at(particleId));
                 
-                // Assuming mass is stored in the x-component of particleMass
-                float mass = foam.particleMass.at(particleId).x;
+                float mass = foam.particleMass.at(particleId);
                 particleRegistry.emplace<ParticleMass>(particle, mass);
                 masses[particleId] = mass;
+                particleRegistry.emplace<ParticleVertices>(particle, foam.particleVertices.at(particleId));
 
                 glm::vec3 worldPos = glm::vec3(transform * glm::vec4(localPos, 1.0f));
                 particleRegistry.emplace<ParticleWorldPosition>(particle, worldPos);
@@ -67,7 +76,13 @@ namespace DynamicFoam::Sim2D {
                 }
             }
 
-            // Calculate and emplace CenterOfMass, InertiaTensor, and AABB
+            // Find and emplace surface particles
+            auto surface_cells = findSurfaceCells(foam.adjacencyList, foam.particleOpacity);
+            for(const auto& p_id : surface_cells){
+                particleRegistry.emplace<Surface>(particleMap.at(p_id));
+            }
+
+            // Set RB CenterOfMass, InertiaTensor (localspace)
             glm::vec3 com = calculateCenterOfMass(local_positions, masses);
             foamRegistry.emplace<CenterOfMass>(rigidBody, com);
 
@@ -78,14 +93,9 @@ namespace DynamicFoam::Sim2D {
             glm::mat3 inertia = calculateInertiaTensor(local_positions_com, masses);
             foamRegistry.emplace<InertiaTensor>(rigidBody, inertia);
 
+            // Set RB AABB (worldspace)
             auto [min, max] = calculateAABB(world_positions);
             foamRegistry.emplace<AABB>(rigidBody, min, max);
-
-            // Find and emplace surface particles
-            auto surface_cells = findSurfaceCells(foam.adjacencyList, foam.particleOpacity);
-            for(const auto& p_id : surface_cells){
-                particleRegistry.emplace<Surface>(particleMap.at(p_id));
-            }
         }
     }
 
@@ -93,22 +103,32 @@ namespace DynamicFoam::Sim2D {
         // Process user input and update simulation state accordingly
     }
 
-    void Simulation::updateTopology() {
+    void Simulation::updateTopology(
+        entt::registry& foamRegistry,
+        entt::registry& particleRegistry,
+        std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists
+    ) {
         topologySubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists);
     }
 
-    void Simulation::updatePhysics(float deltaTime) {
+    void Simulation::updatePhysics(
+        entt::registry& foamRegistry,
+        entt::registry& particleRegistry,
+        float deltaTime) {
         physicsSubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists, deltaTime);
     }
 
-    void Simulation::render() {
+    void Simulation::render(
+        entt::registry& foamRegistry,
+        entt::registry& particleRegistry
+    ) {
         renderSubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists);
     }
 
-    void Simulation::step(float deltaTime) {
-        handleUserInput(/* current user input */);
-        updateTopology();
-        updatePhysics(deltaTime);
-        render();
+    void Simulation::step(const UserInput& input, float deltaTime) {
+        handleUserInput(input);
+        updateTopology(foamRegistry, particleRegistry, foamAdjacencyLists);
+        updatePhysics(foamRegistry, particleRegistry, deltaTime);
+        render(foamRegistry, particleRegistry);
     }
 };

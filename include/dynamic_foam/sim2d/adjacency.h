@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -6,11 +7,23 @@
 namespace DynamicFoam::Sim2D {
   template <typename T> class AdjacencyList {
   public:
+
     // Constructor: initializes with a list of node IDs
     AdjacencyList(const std::vector<T> &nodeIds) {
       for (auto id : nodeIds) {
         adjList[id] = {};
       }
+    }
+
+    // Templated constructor for mapping from another adjacency list type
+    template <typename U, typename Func>
+    AdjacencyList(const AdjacencyList<U>& other, Func map_func) {
+        adj.resize(other.adj.size());
+        for (size_t i = 0; i < other.adj.size(); ++i) {
+            for (const auto& neighbor : other.adj[i]) {
+                adj[i].push_back(map_func(neighbor));
+            }
+        }
     }
 
     // Add Node: adds a node to the adjacency list
@@ -52,6 +65,21 @@ namespace DynamicFoam::Sim2D {
     // Accessor for adjacency list
     const std::unordered_map<T, std::unordered_set<T>> &getAdjList() const {
       return adjList;
+    }
+
+    // Templated copy constructor for type conversion
+    template <typename U>
+    AdjacencyList(const AdjacencyList<U>& other, const std::function<T(U)>& converter) {
+        const auto& otherAdjList = other.getAdjList();
+        for (const auto& [node, neighbors] : otherAdjList) {
+            T newNode = converter(node);
+            addNode(newNode);
+            std::vector<T> newNeighbors;
+            for (const auto& neighbor : neighbors) {
+                newNeighbors.push_back(converter(neighbor));
+            }
+            addNodeEdges(newNode, newNeighbors);
+        }
     }
 
   private:

@@ -13,12 +13,13 @@ namespace DynamicFoam::Sim2D {
         std::unordered_map<int, bool> isStencil;
         std::unordered_map<int, bool> isMutable;
 
-        // Local Space Position
+        // Local Space Geometry
         std::unordered_map<int, glm::vec3> particlePosition;
+        std::unordered_map<int, std::vector<glm::vec3>> particleVertices;
 
         // Physics
         float density;
-        std::unordered_map<int, glm::vec3> particleMass;
+        std::unordered_map<int, float> particleMass;
 
         // Rendering
         std::unordered_map<int, glm::vec3> particleColor;
@@ -29,7 +30,8 @@ namespace DynamicFoam::Sim2D {
             const std::unordered_map<int, bool>& stencil,
             const std::unordered_map<int, bool>& mutable_map,
             const std::unordered_map<int, glm::vec3>& position,
-            const std::unordered_map<int, glm::vec3>& mass,
+            const std::unordered_map<int, std::vector<glm::vec3>>& vertices,
+            const std::unordered_map<int, float>& mass,
             const std::unordered_map<int, glm::vec3>& color,
             const std::unordered_map<int, float>& opacity,
             float density = 1.0f
@@ -37,6 +39,7 @@ namespace DynamicFoam::Sim2D {
             isStencil(stencil),
             isMutable(mutable_map),
             particlePosition(position),
+            particleVertices(vertices),
             particleMass(mass),
             particleColor(color),
             particleOpacity(opacity),

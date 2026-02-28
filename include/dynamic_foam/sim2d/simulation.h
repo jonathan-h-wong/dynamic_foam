@@ -14,7 +14,6 @@ class Simulation {
     public:
         Simulation(
             const SceneGraph& sceneGraph, 
-            const UserInput& input,
             const glm::ivec2& windowSize
         );
         ~Simulation() = default;
@@ -33,7 +32,7 @@ class Simulation {
             entt::registry& foamRegistry,
             entt::registry& particleRegistry
         );
-        void step(float deltaTime);
+        void step(const UserInput& input, float deltaTime);
 
     private:
         entt::registry foamRegistry;

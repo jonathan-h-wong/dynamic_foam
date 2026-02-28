@@ -64,6 +64,9 @@ namespace DynamicFoam::Sim2D {
     struct ParticleMass {
         float value{1.0f};
     };
+    struct ParticleVertices {
+        std::vector<glm::vec3> value;
+    };
     struct Surface {};
 
     // Persistent Particle Types

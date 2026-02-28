@@ -8,332 +8,145 @@
 #include <glm/mat3x3.hpp>
 
 #include "dynamic_foam/sim2d/utils.h"
-#include "dynamic_foam/sim2d/adjacency_list.h"
+#include "dynamic_foam/sim2d/adjacency.h"
 
 namespace DynamicFoam::Sim2D {
 
-// CUDA kernel for Monte Carlo area integration
-__global__ void monteCarloAreaKernel(
-    const float* positions,           // [x0, y0, x1, y1, ...]
-    const float* bboxes,              // [minX, minY, maxX, maxY, ...] per particle
-    const int* neighborOffsets,       // Offset into neighbors array for each particle
-    const int* neighborCounts,        // Number of neighbors for each particle
-    const int* neighbors,             // Flattened neighbor indices
-    float* areas,                     // Output areas
-    int numParticles,
-    int samplesPerCell,
-    unsigned int seed
+/**
+ * Compute the signed area of a triangle in 2D
+ */
+inline float signedTriangleArea(
+    float ax, float ay,
+    float bx, float by,
+    float cx, float cy
 ) {
-    int particleIdx = blockIdx.x;
-    if (particleIdx >= numParticles) return;
-    
-    // Get particle generator position
-    float genX = positions[2 * particleIdx];
-    float genY = positions[2 * particleIdx + 1];
-    
-    // Get bounding box
-    float minX = bboxes[4 * particleIdx];
-    float minY = bboxes[4 * particleIdx + 1];
-    float maxX = bboxes[4 * particleIdx + 2];
-    float maxY = bboxes[4 * particleIdx + 3];
-    float bboxArea = (maxX - minX) * (maxY - minY);
-    
-    // Get neighbor info
-    int neighborOffset = neighborOffsets[particleIdx];
-    int neighborCount = neighborCounts[particleIdx];
-    
-    // Thread-local RNG (one per thread in block)
-    curandState state;
-    int tid = threadIdx.x;
-    curand_init(seed + particleIdx * 1024 + tid, 0, 0, &state);
-    
-    // Monte Carlo sampling (distributed across threads in block)
-    int insideCount = 0;
-    int samplesPerThread = (samplesPerCell + blockDim.x - 1) / blockDim.x;
-    
-    for (int s = 0; s < samplesPerThread; ++s) {
-        // Generate random point in bounding box
-        float x = minX + curand_uniform(&state) * (maxX - minX);
-        float y = minY + curand_uniform(&state) * (maxY - minY);
-        
-        // Check if point is in Voronoi cell
-        float dx = x - genX;
-        float dy = y - genY;
-        float minDist2 = dx*dx + dy*dy;
-        
-        bool isInside = true;
-        for (int n = 0; n < neighborCount; ++n) {
-            int neighborIdx = neighbors[neighborOffset + n];
-            float nX = positions[2 * neighborIdx];
-            float nY = positions[2 * neighborIdx + 1];
-            
-            float ndx = x - nX;
-            float ndy = y - nY;
-            float dist2 = ndx*ndx + ndy*ndy;
-            
-            if (dist2 < minDist2) {
-                isInside = false;
-                break;
-            }
-        }
-        
-        if (isInside) {
-            insideCount++;
-        }
-    }
-    
-    // Reduce across threads in block
-    __shared__ int blockCounts[256]; // Max 256 threads per block
-    blockCounts[tid] = insideCount;
-    __syncthreads();
-    
-    // Simple reduction
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            blockCounts[tid] += blockCounts[tid + stride];
-        }
-        __syncthreads();
-    }
-    
-    // Thread 0 writes result
-    if (tid == 0) {
-        int totalInside = blockCounts[0];
-        int totalSamples = samplesPerThread * blockDim.x;
-        areas[particleIdx] = bboxArea * (float(totalInside) / float(totalSamples));
-    }
+    return 0.5f * ((bx - ax) * (cy - ay) - (cx - ax) * (by - ay));
 }
 
-// Helper function to check CUDA errors
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error in %s:%d: %s\n", __FILE__, __LINE__, \
-                    cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
-
 /**
- * Triangulate a set of 2D particles using Delaunay triangulation
- * 
- * @param positions: Vector of particle positions (vec2 or similar with .x, .y)
- * @param particleIds: Vector of particle IDs
- * @return AdjacencyList representing vertex connectivity
+ * Triangulate with analytical Voronoi area integration via circumcenter fan
+ *
+ * For each particle, collects the ordered ring of circumcenters of incident
+ * Delaunay faces (= Voronoi cell vertices), then sums signed triangle areas
+ * formed with the generator point as the fan origin.
+ *
+ * Boundary particles (with infinite incident faces) are assigned area = -1
+ * to signal that their cell is unbounded. Clip to a domain first if you
+ * need areas for those.
+ *
+ * @param positions:   Particle positions (.x, .y)
+ * @param particleIds: Particle IDs (must be 1-to-1 with positions)
+ * @return Pair of (AdjacencyList, area map).
+ *         Unbounded cells have area -1.
  */
 template <typename T, typename Vec2>
-AdjacencyList<T> triangulate(
+std::tuple<
+    AdjacencyList<T>,
+    std::unordered_map<T, float>,
+    std::unordered_map<T, std::vector<glm::vec2>>
+>
+triangulateWithMetadata(
     const std::vector<Vec2>& positions,
-    const std::vector<T>& particleIds
+    const std::vector<T>&    particleIds
 ) {
     size_t numParticles = particleIds.size();
-    
-    // Build Delaunay triangulation
+
+    // ------------------------------------------------------------------ //
+    // 1. Build Delaunay triangulation, keep vertex handles                //
+    // ------------------------------------------------------------------ //
     Delaunay_2 dt;
-    std::vector<Point_2> points;
-    points.reserve(numParticles);
-    
+    std::unordered_map<Delaunay_2::Vertex_handle, size_t> vertexToIndex;
+
     for (size_t i = 0; i < numParticles; ++i) {
-        points.emplace_back(positions[i].x, positions[i].y);
+        auto vh = dt.insert(Point_2(positions[i].x, positions[i].y));
+        vertexToIndex[vh] = i;
     }
-    
-    // Insert points and track vertex handles
-    std::unordered_map<Delaunay_2::Vertex_handle, T> vertexToId;
-    for (size_t i = 0; i < numParticles; ++i) {
-        auto vh = dt.insert(points[i]);
-        vertexToId[vh] = particleIds[i];
-    }
-    
-    // Build adjacency list
+
+    // ------------------------------------------------------------------ //
+    // 2. Build adjacency list from finite Delaunay edges                  //
+    // ------------------------------------------------------------------ //
     AdjacencyList<T> adjList(particleIds);
-    
+
     for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
         auto face = eit->first;
-        int idx = eit->second;
-        
+        int  idx  = eit->second;
+
         auto v1 = face->vertex((idx + 1) % 3);
         auto v2 = face->vertex((idx + 2) % 3);
-        
-        T id1 = vertexToId[v1];
-        T id2 = vertexToId[v2];
-        
+
+        T id1 = particleIds[vertexToIndex[v1]];
+        T id2 = particleIds[vertexToIndex[v2]];
+
         adjList.addNodeEdges(id1, {id2});
     }
-    
-    return adjList;
-}
 
-/**
- * Triangulate with GPU-accelerated Monte Carlo area integration
- * 
- * @param positions: Vector of particle positions (vec2 or similar with .x, .y)
- * @param particleIds: Vector of particle IDs
- * @param samplesPerCell: Number of Monte Carlo samples per cell
- * @param seed: Random seed for reproducibility
- * @return Pair of (AdjacencyList, area map)
- */
-template <typename T, typename Vec2>
-std::pair<AdjacencyList<T>, std::unordered_map<T, float>> 
-triangulateWithAreaIntegration(
-    const std::vector<Vec2>& positions,
-    const std::vector<T>& particleIds,
-    int samplesPerCell = 10000,
-    unsigned int seed = 42
-) {
-    size_t numParticles = particleIds.size();
+    // ------------------------------------------------------------------ //
+    // 3. Analytical area per cell via circumcenter fan                    //
+    // ------------------------------------------------------------------ //
+    std::unordered_map<T, float> areaMap;
+    areaMap.reserve(numParticles);
+    std::unordered_map<T, std::vector<glm::vec2>> voronoiVertices;
+    voronoiVertices.reserve(numParticles);
 
-    // Perform Delaunay triangulation first
-    auto triangulationResult = triangulate(positions, particleIds);
-    AdjacencyList<T> adjList = triangulationResult.first;
-    Delaunay_2 dt = triangulationResult.second;
-    std::unordered_map<typename Delaunay_2::Vertex_handle, T> vertexToId = triangulationResult.third;
+    for (auto vit = dt.finite_vertices_begin();
+              vit != dt.finite_vertices_end(); ++vit)
+    {
+        size_t i  = vertexToIndex[vit];
+        T      id = particleIds[i];
 
-    // Create a reverse map from ID to vertex handle for convenience
-    std::unordered_map<T, typename Delaunay_2::Vertex_handle> idToVertex;
-    std::unordered_map<typename Delaunay_2::Vertex_handle, size_t> vertexToIndex;
-    std::unordered_map<T, size_t> idToIndex;
-    for(size_t i = 0; i < particleIds.size(); ++i) {
-        idToIndex[particleIds[i]] = i;
-    }
+        float genX = static_cast<float>(vit->point().x());
+        float genY = static_cast<float>(vit->point().y());
 
-    for(const auto& pair : vertexToId) {
-        idToVertex[pair.second] = pair.first;
-        vertexToIndex[pair.first] = idToIndex[pair.second];
-    }
-
-    // Build neighbor lists for GPU from adjacency list
-    std::vector<std::vector<int>> neighborLists(numParticles);
-    for (size_t i = 0; i < numParticles; ++i) {
-        T pId = particleIds[i];
-        const auto& neighbors = adjList.getNeighbors(pId);
-        for (const T& neighborId : neighbors) {
-            neighborLists[i].push_back(idToIndex[neighborId]);
-        }
-    }
-    
-    // Prepare data for GPU
-    std::vector<float> flatPositions(numParticles * 2);
-    std::vector<float> bboxes(numParticles * 4);
-    std::vector<int> neighborOffsets(numParticles);
-    std::vector<int> neighborCounts(numParticles);
-    std::vector<int> flatNeighbors;
-    
-    int currentOffset = 0;
-    for (size_t i = 0; i < numParticles; ++i) {
-        T id = particleIds[i];
-        auto vh = idToVertex[id];
-        
-        flatPositions[2*i] = positions[i].x;
-        flatPositions[2*i + 1] = positions[i].y;
-        
-        // Compute AABB from Voronoi vertices (circumcenters)
-        std::vector<Point_2> voronoiVertices;
-        auto fc = dt.incident_faces(vh);
-        
-        if (fc != nullptr) {
-            auto done = fc;
+        // Collect the ordered ring of incident faces and check for unbounded cells
+        Delaunay_2::Face_circulator fc = dt.incident_faces(vit), done = fc;
+        bool is_bounded = !dt.is_infinite(fc);
+        if (is_bounded) {
             do {
-                if (!dt.is_infinite(fc)) {
-                    voronoiVertices.push_back(dt.circumcenter(fc));
-                }
                 ++fc;
+                if (dt.is_infinite(fc)) {
+                    is_bounded = false;
+                    break;
+                }
             } while (fc != done);
         }
-        
-        if (!voronoiVertices.empty()) {
-            float minX = voronoiVertices[0].x();
-            float maxX = voronoiVertices[0].x();
-            float minY = voronoiVertices[0].y();
-            float maxY = voronoiVertices[0].y();
-            
-            for (const auto& v : voronoiVertices) {
-                minX = std::min(minX, static_cast<float>(v.x()));
-                maxX = std::max(maxX, static_cast<float>(v.x()));
-                minY = std::min(minY, static_cast<float>(v.y()));
-                maxY = std::max(maxY, static_cast<float>(v.y()));
-            }
-            
-            bboxes[4*i] = minX;
-            bboxes[4*i + 1] = minY;
-            bboxes[4*i + 2] = maxX;
-            bboxes[4*i + 3] = maxY;
-        } else {
-            // Fallback: small box around point
-            bboxes[4*i] = positions[i].x - 0.1f;
-            bboxes[4*i + 1] = positions[i].y - 0.1f;
-            bboxes[4*i + 2] = positions[i].x + 0.1f;
-            bboxes[4*i + 3] = positions[i].y + 0.1f;
+
+        if (!is_bounded) {
+            areaMap[id] = -1.0f;
+            voronoiVertices[id] = {}; // No vertices for unbounded cell
+            continue;
         }
-        
-        // Flatten neighbor list
-        neighborOffsets[i] = currentOffset;
-        neighborCounts[i] = neighborLists[i].size();
-        for (int neighbor : neighborLists[i]) {
-            flatNeighbors.push_back(neighbor);
-        }
-        currentOffset += neighborLists[i].size();
+
+        // Reset circulator for the main loop
+        fc = done;
+
+        // Sum signed areas of fan triangles:
+        //   fan origin = generator point
+        //   each triangle = (generator, circumcenter[k], circumcenter[k+1])
+        // Because incident_faces gives a cyclic order, adjacent circumcenters
+        // are already the correct consecutive Voronoi vertices.
+        float area = 0.0f;
+        std::vector<glm::vec2> vertices;
+        do {
+            Point_2 cc = dt.circumcenter(fc);
+            float   cx = static_cast<float>(cc.x());
+            float   cy = static_cast<float>(cc.y());
+            vertices.emplace_back(cx, cy);
+
+            // Peek at next face's circumcenter
+            auto next = fc; ++next;
+            Point_2 ccNext = dt.circumcenter(next);
+            float   nx     = static_cast<float>(ccNext.x());
+            float   ny     = static_cast<float>(ccNext.y());
+
+            area += signedTriangleArea(genX, genY, cx, cy, nx, ny);
+            ++fc;
+        } while (fc != done);
+
+        areaMap[id] = std::abs(area);
+        voronoiVertices[id] = vertices;
     }
-    
-    // Allocate GPU memory
-    float *d_positions, *d_bboxes, *d_areas;
-    int *d_neighborOffsets, *d_neighborCounts, *d_neighbors;
-    
-    CUDA_CHECK(cudaMalloc(&d_positions, flatPositions.size() * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_bboxes, bboxes.size() * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_areas, numParticles * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_neighborOffsets, neighborOffsets.size() * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_neighborCounts, neighborCounts.size() * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_neighbors, flatNeighbors.size() * sizeof(int)));
-    
-    // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(d_positions, flatPositions.data(), 
-                          flatPositions.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_bboxes, bboxes.data(), 
-                          bboxes.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_neighborOffsets, neighborOffsets.data(), 
-                          neighborOffsets.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_neighborCounts, neighborCounts.data(), 
-                          neighborCounts.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_neighbors, flatNeighbors.data(), 
-                          flatNeighbors.size() * sizeof(int), cudaMemcpyHostToDevice));
-    
-    // Launch kernel (one block per particle, 256 threads per block)
-    int threadsPerBlock = 256;
-    monteCarloAreaKernel<<<numParticles, threadsPerBlock>>>(
-        d_positions,
-        d_bboxes,
-        d_neighborOffsets,
-        d_neighborCounts,
-        d_neighbors,
-        d_areas,
-        numParticles,
-        samplesPerCell,
-        seed
-    );
-    
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // Copy results back
-    std::vector<float> areas(numParticles);
-    CUDA_CHECK(cudaMemcpy(areas.data(), d_areas, 
-                          numParticles * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    // Free GPU memory
-    CUDA_CHECK(cudaFree(d_positions));
-    CUDA_CHECK(cudaFree(d_bboxes));
-    CUDA_CHECK(cudaFree(d_areas));
-    CUDA_CHECK(cudaFree(d_neighborOffsets));
-    CUDA_CHECK(cudaFree(d_neighborCounts));
-    CUDA_CHECK(cudaFree(d_neighbors));
-    
-    // Build area map
-    std::unordered_map<T, float> areaMap;
-    for (size_t i = 0; i < numParticles; ++i) {
-        areaMap[particleIds[i]] = areas[i];
-    }
-    
-    return {adjList, areaMap};
+
+    return {adjList, areaMap, voronoiVertices};
 }
 
 // Find leaf nodes in the adjacency list
@@ -492,6 +305,64 @@ std::pair<glm::vec3, glm::vec3> calculateAABB(
     }
 
     return {min, max};
+}
+
+// Count cycles in the air cell subgraph
+template <typename T>
+int countCycles(
+    const AdjacencyList<T>& adjList,
+    const std::vector<T>& surfaceIds,
+    const std::unordered_map<T, float>& opacityMap
+) {
+    // Extract all air cells (neighbors of surface cells with opacity == 0)
+    std::unordered_set<T> airCells;
+    for (const T& surfaceId : surfaceIds) {
+        for (const T& neighborId : adjList.getNeighbors(surfaceId)) {
+            auto it = opacityMap.find(neighborId);
+            if (it != opacityMap.end() && it->second == 0.0f) {
+                airCells.insert(neighborId);
+            }
+        }
+    }
+
+    if (airCells.empty()) {
+        return 0;
+    }
+
+    int V = airCells.size();
+    int E = 0;
+    for (const T& airCell : airCells) {
+        for (const T& neighborId : adjList.getNeighbors(airCell)) {
+            if (airCells.count(neighborId) && airCell < neighborId) {
+                E++;
+            }
+        }
+    }
+
+    // Count connected components (C) in the air cell subgraph
+    // int C = 0;
+    // std::unordered_set<T> visited;
+    // for (const T& airCell : airCells) {
+    //     if (visited.find(airCell) == visited.end()) {
+    //         C++;
+    //         std::vector<T> stack;
+    //         stack.push_back(airCell);
+    //         visited.insert(airCell);
+    //         while (!stack.empty()) {
+    //             T current = stack.back();
+    //             stack.pop_back();
+    //             for (const T& neighbor : adjList.getNeighbors(current)) {
+    //                 if (airCells.count(neighbor) && visited.find(neighbor) == visited.end()) {
+    //                     visited.insert(neighbor);
+    //                     stack.push_back(neighbor);
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+    int C = 1; // Assuming all air cells are connected for simplicity
+
+    return E - V + C;
 }
 
 } // namespace DynamicFoam::Sim2D
