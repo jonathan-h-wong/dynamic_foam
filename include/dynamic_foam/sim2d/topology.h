@@ -13,5 +13,5 @@ namespace DynamicFoam::Sim2D {
             entt::registry& particleRegistry,
             std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists
         );
-    }
+    };
 }

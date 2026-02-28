@@ -1,5 +1,6 @@
 #pragma once
 #include <entt/entt.hpp>
+#include "dynamic_foam/sim2d/adjacency.h"
 
 namespace DynamicFoam::Sim2D {
 

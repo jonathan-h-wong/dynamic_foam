@@ -1,5 +1,6 @@
 #pragma once
 #include <entt/entt.hpp>
+#include "dynamic_foam/sim2d/adjacency.h"
 
 namespace DynamicFoam::Sim2D {
 
@@ -11,7 +12,7 @@ class Render {
         void update(
             entt::registry& foamRegistry,
             entt::registry& particleRegistry,
-            const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
+            const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists
         );
     };
 }
