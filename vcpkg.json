@@ -1,5 +1,6 @@
 {
   "dependencies": [
+    "cgal",
     "entt",
     "fmt",
     "glfw3",

@@ -7,6 +7,10 @@ find_package(EnTT CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 
+# Add CGAL header-only include directory
+set(CGAL_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/external/CGAL-6.0/include" CACHE PATH "CGAL header-only includes")
+set(BOOST_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/external/boost" CACHE PATH "Boost header-only includes")
+
 # Fetch ImGui backends from GitHub
 include(FetchContent)
 FetchContent_Declare(
@@ -28,6 +32,8 @@ add_library(dynamic_foam ${DYNAMIC_FOAM_SOURCES})
 target_include_directories(dynamic_foam 
     PUBLIC 
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CGAL_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${BOOST_INCLUDE_DIR}>
         $<BUILD_INTERFACE:${imgui_backends_SOURCE_DIR}>
         $<BUILD_INTERFACE:${imgui_backends_SOURCE_DIR}/backends>
         $<INSTALL_INTERFACE:include>
@@ -44,6 +50,9 @@ target_link_libraries(dynamic_foam
         fmt::fmt
         glm::glm
 )
+
+# CGAL header-only configuration
+target_compile_definitions(dynamic_foam PRIVATE CGAL_HEADER_ONLY=1)
 
 # CUDA settings
 set_target_properties(dynamic_foam PROPERTIES

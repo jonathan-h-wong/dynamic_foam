@@ -3,6 +3,7 @@
 /dist
 /bin
 /out
+/external
 
 # vcpkg installed packages (local, machine-specific)
 /vcpkg_installed
