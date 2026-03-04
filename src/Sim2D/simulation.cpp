@@ -50,7 +50,8 @@ namespace DynamicFoam::Sim2D {
             std::unordered_map<int, glm::vec3> local_positions;
             std::unordered_map<int, float> masses;
 
-            // Set Particle components 
+            // Set Particle components
+            std::vector<AABB> particleAABBs;
             for (const auto& [particleId, localPos] : foam.particlePosition) {
                 auto particle = particleMap.at(particleId);
 
@@ -61,7 +62,12 @@ namespace DynamicFoam::Sim2D {
                 float mass = foam.particleMass.at(particleId);
                 particleRegistry.emplace<ParticleMass>(particle, mass);
                 masses[particleId] = mass;
-                particleRegistry.emplace<ParticleVertices>(particle, foam.particleVertices.at(particleId));
+                const auto& p_verts = foam.particleVertices.at(particleId);
+                particleRegistry.emplace<ParticleVertices>(particle, p_verts);
+
+                auto [min, max] = calculateAABB(p_verts);
+                AABB particle_aabb(min, max);
+                particleAABBs[particleId] = particle_aabb;
 
                 glm::vec3 worldPos = glm::vec3(transform * glm::vec4(localPos, 1.0f));
                 particleRegistry.emplace<ParticleWorldPosition>(particle, worldPos);
@@ -77,15 +83,26 @@ namespace DynamicFoam::Sim2D {
                 }
             }
 
+            // Build BVH for the foam's particles
+            if (!particleAABBs.empty()) {
+                BVH bvh;
+                bvh.build(particleAABBs.data(), particleAABBs.size());
+                foamBVHs[static_cast<int>(rigidBody)] = std::move(bvh);
+            }
+
+            // Define worldspace AABB
+            if (!world_positions.empty()) {
+                auto [min, max] = calculateAABB(world_positions);
+                foamAABBs[static_cast<int>(rigidBody)] = AABB(min, max);
+            }
+
             // Find and emplace surface particles
             auto surface_cells = findSurfaceCells(foam.adjacencyList, foam.particleOpacity);
             for(const auto& p_id : surface_cells){
                 particleRegistry.emplace<Surface>(particleMap.at(p_id));
             }
 
-            // Set RB AABB (worldspace)
-            auto [min, max] = calculateAABB(world_positions);
-            foamRegistry.emplace<AABB>(rigidBody, min, max);
+
         }
     }
 

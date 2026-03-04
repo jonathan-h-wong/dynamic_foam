@@ -29,10 +29,6 @@ namespace DynamicFoam::Sim2D {
     struct AngularVelocity {
         glm::vec3 value{0.0f};
     };
-    struct AABB {
-        glm::vec3 min{0.0f};
-        glm::vec3 max{0.0f};
-    };
 
     // Persistent Foam Types
     struct Static {};

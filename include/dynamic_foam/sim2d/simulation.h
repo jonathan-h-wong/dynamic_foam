@@ -2,6 +2,7 @@
 #include <glm/glm.hpp>
 #include <entt/entt.hpp>
 #include "dynamic_foam/sim2d/adjacency.h"
+#include "dynamic_foam/sim2d/bvh.cuh"
 #include "dynamic_foam/sim2d/scenegraph.h"
 #include "dynamic_foam/sim2d/user_input.h"
 #include <dynamic_foam/sim2d/topology.h>
@@ -36,10 +37,16 @@ class Simulation {
 
     private:
         void applyForwardKinematics(entt::entity controllerFoam);
+        
         entt::registry foamRegistry;
         entt::registry particleRegistry;
         std::unordered_map<int, AdjacencyList<entt::entity>> foamAdjacencyLists;
+        std::unordered_map<int, BVH> foamBVHs;
+        std::unordered_map<int, AABB> foamAABBs;
+        std::unordered_map<int, AABB> particleAABBs;
+
         glm::ivec2 windowSize;
+        
         Topology topologySubsystem;
         Physics physicsSubsystem;
         Render renderSubsystem;
