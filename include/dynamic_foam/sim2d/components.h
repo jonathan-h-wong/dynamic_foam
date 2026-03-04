@@ -9,9 +9,6 @@ namespace DynamicFoam::Sim2D {
     // ============================================================================
 
     // Persistent Components
-    struct CenterOfMass {
-        glm::vec3 value{0.0f};
-    };
     struct InertiaTensor {
         glm::mat3 value{1.0f}; // Identity matrix by default
     };

@@ -7,7 +7,7 @@ namespace DynamicFoam::Sim2D {
     Simulation::Simulation(
         const SceneGraph& sceneGraph, 
         const glm::ivec2& windowSize
-    ) {
+    ) : windowSize(windowSize) {
         // Creates rigid body and particle registries
         // For each foam, this creates 1 rigid body and N particles, and populates registries
         for (const auto& [foamId, foam] : sceneGraph.foams) {
@@ -31,8 +31,9 @@ namespace DynamicFoam::Sim2D {
                 foamRegistry.emplace<Static>(rigidBody);
             }
 
-            // Set RB density
+            // Set RB density, intertiaTensor
             foamRegistry.emplace<Density>(rigidBody, foam.density);
+            foamRegistry.emplace<InertiaTensor>(rigidBody, foam.intertiaTensor);
 
             std::unordered_map<int, entt::entity> particleMap;
             for (const auto& [particleId, localPos] : foam.particlePosition) {
@@ -82,25 +83,40 @@ namespace DynamicFoam::Sim2D {
                 particleRegistry.emplace<Surface>(particleMap.at(p_id));
             }
 
-            // Set RB CenterOfMass, InertiaTensor (localspace)
-            glm::vec3 com = calculateCenterOfMass(local_positions, masses);
-            foamRegistry.emplace<CenterOfMass>(rigidBody, com);
-
-            std::unordered_map<int, glm::vec3> local_positions_com;
-            for(const auto& [id, pos] : local_positions){
-                local_positions_com[id] = pos - com;
-            }
-            glm::mat3 inertia = calculateInertiaTensor(local_positions_com, masses);
-            foamRegistry.emplace<InertiaTensor>(rigidBody, inertia);
-
             // Set RB AABB (worldspace)
             auto [min, max] = calculateAABB(world_positions);
             foamRegistry.emplace<AABB>(rigidBody, min, max);
         }
     }
 
+    void Simulation::applyForwardKinematics(entt::entity controllerFoam) {
+        const auto& pos = foamRegistry.get<Position>(controllerFoam);
+        const auto& orient = foamRegistry.get<Orientation>(controllerFoam);
+
+        glm::mat4 translationMatrix = glm::translate(glm::mat4(1.0f), pos.value);
+        glm::mat4 rotationMatrix = glm::mat4_cast(orient.value);
+        glm::mat4 transform = translationMatrix * rotationMatrix;
+
+        auto foamId = static_cast<int>(controllerFoam);
+        if (foamAdjacencyLists.count(foamId)) {
+            const auto& adjList = foamAdjacencyLists.at(foamId).getAdjList();
+            for (const auto& [particleEntity, neighbors] : adjList) {
+                auto& worldPos = particleRegistry.get<ParticleWorldPosition>(particleEntity);
+                const auto& localPos = particleRegistry.get<ParticleLocalPosition>(particleEntity);
+                worldPos.value = glm::vec3(transform * glm::vec4(localPos.value, 1.0f));
+            }
+        }
+    }
+
     void Simulation::handleUserInput(const UserInput& input) {
-        // Process user input and update simulation state accordingly
+        // Convert from ImGui screen coordinates (top-left origin) to world coordinates (center origin)
+        float world_x = input.mouse_pos.x - windowSize.x / 2.0f;
+        float world_y = -(input.mouse_pos.y - windowSize.y / 2.0f); // Flip y-axis
+
+        foamRegistry.view<Controller, Position>().each([&](auto entity, auto& pos) {
+            pos.value = glm::vec3(world_x, world_y, 0.0f);
+            applyForwardKinematics(entity);
+        });
     }
 
     void Simulation::updateTopology(

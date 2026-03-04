@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include "dynamic_foam/sim2d/adjacency.h"
+#include "dynamic_foam/sim2d/utils.h"
 
 namespace DynamicFoam::Sim2D {
     class Foam {
@@ -20,6 +21,7 @@ namespace DynamicFoam::Sim2D {
         // Physics
         float density;
         std::unordered_map<int, float> particleMass;
+        glm::mat3 intertiaTensor;
 
         // Rendering
         std::unordered_map<int, glm::vec3> particleColor;
@@ -45,9 +47,18 @@ namespace DynamicFoam::Sim2D {
             particleOpacity(opacity),
             density(density) {
             validate();
+            parentToCenterOfMass();
+            intertiaTensor = calculateInertiaTensor(particlePosition, particleMass);
         }
 
     private:
+        void parentToCenterOfMass() {
+            glm::vec3 com = calculateCenterOfMass(particlePosition, particleMass);
+            for (auto& [id, pos] : particlePosition) {
+                pos -= com;
+            }
+        }
+
         /*
         Validation logic for foam types based on their stencil and mutable properties:
         Stencil | Mutable

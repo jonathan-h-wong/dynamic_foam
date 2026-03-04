@@ -35,9 +35,11 @@ class Simulation {
         void step(const UserInput& input, float deltaTime);
 
     private:
+        void applyForwardKinematics(entt::entity controllerFoam);
         entt::registry foamRegistry;
         entt::registry particleRegistry;
         std::unordered_map<int, AdjacencyList<entt::entity>> foamAdjacencyLists;
+        glm::ivec2 windowSize;
         Topology topologySubsystem;
         Physics physicsSubsystem;
         Render renderSubsystem;
