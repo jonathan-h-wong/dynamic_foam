@@ -30,8 +30,10 @@ class Simulation {
             entt::registry& particleRegistry,
             float deltaTime);
         void render(
-            entt::registry& foamRegistry,
-            entt::registry& particleRegistry
+            entt::registry& particleRegistry, 
+            const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
+            const std::unordered_map<int, BVH>& foamBVHs,
+            const std::unordered_map<int, AABB>& foamAABBs
         );
         void step(const UserInput& input, float deltaTime);
 
@@ -44,8 +46,6 @@ class Simulation {
         std::unordered_map<int, BVH> foamBVHs;
         std::unordered_map<int, AABB> foamAABBs;
         std::unordered_map<int, AABB> particleAABBs;
-
-        glm::ivec2 windowSize;
         
         Topology topologySubsystem;
         Physics physicsSubsystem;

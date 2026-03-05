@@ -7,7 +7,7 @@ namespace DynamicFoam::Sim2D {
     Simulation::Simulation(
         const SceneGraph& sceneGraph, 
         const glm::ivec2& windowSize
-    ) : windowSize(windowSize) {
+    ) : renderSubsystem(windowSize) {
         // Creates rigid body and particle registries
         // For each foam, this creates 1 rigid body and N particles, and populates registries
         for (const auto& [foamId, foam] : sceneGraph.foams) {
@@ -152,16 +152,18 @@ namespace DynamicFoam::Sim2D {
     }
 
     void Simulation::render(
-        entt::registry& foamRegistry,
-        entt::registry& particleRegistry
+        const entt::registry& particleRegistry, 
+        const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
+        const std::unordered_map<int, BVH>& foamBVHs,
+        const std::unordered_map<int, AABB>& foamAABBs
     ) {
-        renderSubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists);
+        renderSubsystem.update(particleRegistry, foamAdjacencyLists, foamBVHs, foamAABBs);
     }
 
     void Simulation::step(const UserInput& input, float deltaTime) {
         handleUserInput(input);
         updateTopology(foamRegistry, particleRegistry, foamAdjacencyLists);
         updatePhysics(foamRegistry, particleRegistry, deltaTime);
-        render(foamRegistry, particleRegistry);
+        render(particleRegistry, foamAdjacencyLists, foamBVHs, foamAABBs);
     }
 };
