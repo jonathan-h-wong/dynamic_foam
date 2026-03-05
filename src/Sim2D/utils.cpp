@@ -13,40 +13,46 @@
 namespace DynamicFoam::Sim2D {
 
 /**
- * Compute the signed area of a triangle in 2D
+ * Compute the signed volume of a tetrahedron in 3D
  */
-inline float signedTriangleArea(
-    float ax, float ay,
-    float bx, float by,
-    float cx, float cy
+inline float signedTetrahedronVolume(
+    const glm::vec3& a, const glm::vec3& b, const glm::vec3& c, const glm::vec3& d
 ) {
-    return 0.5f * ((bx - ax) * (cy - ay) - (cx - ax) * (by - ay));
+    return (1.0f / 6.0f) * glm::determinant(glm::mat3(b - a, c - a, d - a));
 }
 
 /**
- * Triangulate with analytical Voronoi area integration via circumcenter fan
+ * Triangulate with analytical Voronoi volume integration via direct decomposition
  *
- * For each particle, collects the ordered ring of circumcenters of incident
- * Delaunay faces (= Voronoi cell vertices), then sums signed triangle areas
- * formed with the generator point as the fan origin.
+ * For each particle, this function computes the volume of its Voronoi cell.
+ * It leverages the duality between the Delaunay triangulation and the Voronoi
+ * diagram. The Voronoi cell's volume is calculated by decomposing it into a
+ * set of pyramids, where each pyramid's base is a Voronoi face and its apex
+ * is the generator particle.
  *
- * Boundary particles (with infinite incident faces) are assigned area = -1
- * to signal that their cell is unbounded. Clip to a domain first if you
- * need areas for those.
+ * This is achieved by iterating through the Delaunay edges incident to a
+ * generator. Each edge is dual to a Voronoi face. The vertices of this face
+ * are the circumcenters of the Delaunay cells sharing that edge. The face is
+ * triangulated, and each resulting triangle forms a tetrahedron with the
+ * generator point. The sum of the signed volumes of these tetrahedra gives
+ * the total volume of the Voronoi cell.
  *
- * @param positions:   Particle positions (.x, .y)
+ * Boundary particles (incident to infinite Delaunay cells) are assigned a
+ * volume of -1 to indicate that their Voronoi cell is unbounded.
+ *
+ * @param positions:   Particle positions (.x, .y, .z)
  * @param particleIds: Particle IDs (must be 1-to-1 with positions)
- * @return Pair of (AdjacencyList, area map).
- *         Unbounded cells have area -1.
+ * @return Tuple of (AdjacencyList, volume map, Voronoi vertex map).
+ *         Unbounded cells have volume -1.
  */
-template <typename T, typename Vec2>
+template <typename T, typename Vec3>
 std::tuple<
     AdjacencyList<T>,
     std::unordered_map<T, float>,
-    std::unordered_map<T, std::vector<glm::vec2>>
+    std::unordered_map<T, std::vector<glm::vec3>>
 >
 triangulateWithMetadata(
-    const std::vector<Vec2>& positions,
+    const std::vector<Vec3>& positions,
     const std::vector<T>&    particleIds
 ) {
     size_t numParticles = particleIds.size();
@@ -54,13 +60,29 @@ triangulateWithMetadata(
     // ------------------------------------------------------------------ //
     // 1. Build Delaunay triangulation, keep vertex handles                //
     // ------------------------------------------------------------------ //
-    Delaunay_2 dt;
-    std::unordered_map<Delaunay_2::Vertex_handle, size_t> vertexToIndex;
+    Delaunay_3 dt;
+    std::unordered_map<Delaunay_3::Vertex_handle, size_t> vertexToIndex;
 
+    std::vector<Point_3> points;
+    points.reserve(numParticles);
     for (size_t i = 0; i < numParticles; ++i) {
-        auto vh = dt.insert(Point_2(positions[i].x, positions[i].y));
-        vertexToIndex[vh] = i;
+        points.emplace_back(positions[i].x, positions[i].y, positions[i].z);
     }
+    dt.insert(points.begin(), points.end());
+
+    for(auto vh = dt.finite_vertices_begin(); vh != dt.finite_vertices_end(); ++vh) {
+        // This is a bit of a hack to associate points back to IDs,
+        // as the vertex handles change after the bulk insert.
+        // A more robust way would be to use a Point-to-ID map if positions are not unique.
+        const auto& p = vh->point();
+        for(size_t i = 0; i < numParticles; ++i) {
+            if (p.x() == positions[i].x && p.y() == positions[i].y && p.z() == positions[i].z) {
+                vertexToIndex[vh] = i;
+                break;
+            }
+        }
+    }
+
 
     // ------------------------------------------------------------------ //
     // 2. Build adjacency list from finite Delaunay edges                  //
@@ -68,85 +90,92 @@ triangulateWithMetadata(
     AdjacencyList<T> adjList(particleIds);
 
     for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
-        auto face = eit->first;
-        int  idx  = eit->second;
+        auto cell = eit->first;
+        auto v1 = cell->vertex(eit->second);
+        auto v2 = cell->vertex(eit->third);
 
-        auto v1 = face->vertex((idx + 1) % 3);
-        auto v2 = face->vertex((idx + 2) % 3);
-
-        T id1 = particleIds[vertexToIndex[v1]];
-        T id2 = particleIds[vertexToIndex[v2]];
-
-        adjList.addNodeEdges(id1, {id2});
+        if (vertexToIndex.count(v1) && vertexToIndex.count(v2)) {
+            T id1 = particleIds[vertexToIndex[v1]];
+            T id2 = particleIds[vertexToIndex[v2]];
+            adjList.addNodeEdges(id1, {id2});
+        }
     }
 
     // ------------------------------------------------------------------ //
-    // 3. Analytical area per cell via circumcenter fan                    //
+    // 3. Analytical volume per cell via direct decomposition            //
     // ------------------------------------------------------------------ //
-    std::unordered_map<T, float> areaMap;
-    areaMap.reserve(numParticles);
-    std::unordered_map<T, std::vector<glm::vec2>> voronoiVertices;
+    std::unordered_map<T, float> volumeMap;
+    volumeMap.reserve(numParticles);
+    std::unordered_map<T, std::vector<glm::vec3>> voronoiVertices;
     voronoiVertices.reserve(numParticles);
 
     for (auto vit = dt.finite_vertices_begin();
               vit != dt.finite_vertices_end(); ++vit)
     {
+        if (!vertexToIndex.count(vit)) continue;
         size_t i  = vertexToIndex[vit];
         T      id = particleIds[i];
 
-        float genX = static_cast<float>(vit->point().x());
-        float genY = static_cast<float>(vit->point().y());
+        glm::vec3 genPt(
+            static_cast<float>(vit->point().x()),
+            static_cast<float>(vit->point().y()),
+            static_cast<float>(vit->point().z())
+        );
 
-        // Collect the ordered ring of incident faces and check for unbounded cells
-        Delaunay_2::Face_circulator fc = dt.incident_faces(vit), done = fc;
-        bool is_bounded = !dt.is_infinite(fc);
-        if (is_bounded) {
-            do {
-                ++fc;
-                if (dt.is_infinite(fc)) {
-                    is_bounded = false;
-                    break;
-                }
-            } while (fc != done);
-        }
-
-        if (!is_bounded) {
-            areaMap[id] = -1.0f;
-            voronoiVertices[id] = {}; // No vertices for unbounded cell
+        // Check if the vertex is on the convex hull, which means its Voronoi cell is unbounded.
+        if (dt.is_infinite(vit)) {
+            volumeMap[id] = -1.0f;
+            voronoiVertices[id] = {};
             continue;
         }
 
-        // Reset circulator for the main loop
-        fc = done;
+        // Collect all circumcenters of incident cells to form the Voronoi vertices
+        std::vector<Delaunay_3::Cell_handle> incident_cells;
+        dt.incident_cells(vit, std::back_inserter(incident_cells));
+        std::vector<glm::vec3> v_vertices;
+        for (const auto& cell_handle : incident_cells) {
+            Point_3 cc = dt.dual(cell_handle);
+            v_vertices.emplace_back(static_cast<float>(cc.x()), static_cast<float>(cc.y()), static_cast<float>(cc.z()));
+        }
+        voronoiVertices[id] = v_vertices;
 
-        // Sum signed areas of fan triangles:
-        //   fan origin = generator point
-        //   each triangle = (generator, circumcenter[k], circumcenter[k+1])
-        // Because incident_faces gives a cyclic order, adjacent circumcenters
-        // are already the correct consecutive Voronoi vertices.
-        float area = 0.0f;
-        std::vector<glm::vec2> vertices;
-        do {
-            Point_2 cc = dt.circumcenter(fc);
-            float   cx = static_cast<float>(cc.x());
-            float   cy = static_cast<float>(cc.y());
-            vertices.emplace_back(cx, cy);
+        // Decompose Voronoi cell into pyramids and sum their volumes
+        float total_volume = 0.0f;
 
-            // Peek at next face's circumcenter
-            auto next = fc; ++next;
-            Point_2 ccNext = dt.circumcenter(next);
-            float   nx     = static_cast<float>(ccNext.x());
-            float   ny     = static_cast<float>(ccNext.y());
+        std::vector<Delaunay_3::Edge> incident_edges;
+        dt.incident_edges(vit, std::back_inserter(incident_edges));
 
-            area += signedTriangleArea(genX, genY, cx, cy, nx, ny);
-            ++fc;
-        } while (fc != done);
+        for (const auto& edge : incident_edges) {
+            Delaunay_3::Cell_circulator cc = dt.incident_cells(edge), done(cc);
+            if (cc == nullptr) continue;
 
-        areaMap[id] = std::abs(area);
-        voronoiVertices[id] = vertices;
+            std::vector<glm::vec3> face_points;
+            do {
+                if (!dt.is_infinite(cc)) {
+                    Point_3 dual_pt = dt.dual(cc);
+                    face_points.emplace_back(
+                        static_cast<float>(dual_pt.x()),
+                        static_cast<float>(dual_pt.y()),
+                        static_cast<float>(dual_pt.z())
+                    );
+                }
+                cc++;
+            } while (cc != done);
+
+            if (face_points.size() < 3) continue;
+
+            // Triangulate the Voronoi face (polygon) into a fan and sum tetrahedra volumes
+            const glm::vec3& p0 = face_points[0];
+            for (size_t j = 1; j < face_points.size() - 1; ++j) {
+                const glm::vec3& p1 = face_points[j];
+                const glm::vec3& p2 = face_points[j + 1];
+                total_volume += signedTetrahedronVolume(genPt, p0, p1, p2);
+            }
+        }
+        volumeMap[id] = std::abs(total_volume);
     }
 
-    return {adjList, areaMap, voronoiVertices};
+    return {adjList, volumeMap, voronoiVertices};
 }
 
 // Find leaf nodes in the adjacency list
