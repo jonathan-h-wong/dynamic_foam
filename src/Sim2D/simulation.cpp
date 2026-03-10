@@ -157,7 +157,13 @@ namespace DynamicFoam::Sim2D {
         const std::unordered_map<int, BVH>& foamBVHs,
         const std::unordered_map<int, AABB>& foamAABBs
     ) {
-        renderSubsystem.update(particleRegistry, foamAdjacencyLists, foamBVHs, foamAABBs);
+        OrthographicCamera camera;
+        camera.origin = glm::vec3(0.0f, 0.0f, -5.0f);
+        camera.lookAt = glm::vec3(0.0f, 0.0f, 0.0f);
+        camera.up = glm::vec3(0.0f, 1.0f, 0.0f);
+        camera.width = windowSize.x;
+        camera.height = windowSize.y;
+        renderSubsystem.update(particleRegistry, foamAdjacencyLists, foamBVHs, foamAABBs, camera, windowSize);
     }
 
     void Simulation::step(const UserInput& input, float deltaTime) {

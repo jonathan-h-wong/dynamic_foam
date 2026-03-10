@@ -11,7 +11,7 @@
 #include "dynamic_foam/sim2d/adjacency.h"
 
 // CGAL header-only setup with faster kernel
-#include <CGAL/Delaunay_triangulation_2.h>
+#include <CGAL/Delaunay_triangulation_3.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 
 namespace DynamicFoam::Sim2D {
@@ -19,33 +19,33 @@ namespace DynamicFoam::Sim2D {
 // CGAL typedefs for use in function signatures
 // Using Exact_predicates_inexact_constructions_kernel for faster compilation
 using K = CGAL::Exact_predicates_inexact_constructions_kernel;
-using Delaunay_2 = CGAL::Delaunay_triangulation_2<K>;
-using Point_2 = K::Point_2;
+using Delaunay_3 = CGAL::Delaunay_triangulation_3<K>;
+using Point_3 = K::Point_3;
 
 /**
- * @brief Triangulate and compute Voronoi cell metadata (area, vertices).
+ * @brief Triangulate and compute Voronoi cell metadata (volume, vertices).
  *
- * For each particle, collects the ordered ring of circumcenters of incident
- * Delaunay faces (= Voronoi cell vertices), then sums signed triangle areas
- * formed with the generator point as the fan origin.
+ * For each particle, this function computes the vertices of its Voronoi cell,
+ * which are the circumcenters of the incident Delaunay tetrahedra. The volume
+ * of the convex Voronoi cell is then calculated by decomposing it into a fan
+ * of tetrahedra originating from the particle's position.
  *
- * Boundary particles (with infinite incident faces) are assigned area = -1
- * to signal that their cell is unbounded. Clip to a domain first if you
- * need areas for those.
+ * Boundary particles (incident to infinite Delaunay cells) are assigned a
+ * volume of -1 to indicate that their Voronoi cell is unbounded.
  *
- * @param positions:   Particle positions (.x, .y)
+ * @param positions:   Particle positions (.x, .y, .z)
  * @param particleIds: Particle IDs (must be 1-to-1 with positions)
- * @return Tuple of (AdjacencyList, area map, Voronoi vertex map).
- *         Unbounded cells have area -1.
+ * @return Tuple of (AdjacencyList, volume map, Voronoi vertex map).
+ *         Unbounded cells have volume -1.
  */
-template <typename T, typename Vec2>
+template <typename T, typename Vec3>
 std::tuple<
     AdjacencyList<T>,
     std::unordered_map<T, float>,
-    std::unordered_map<T, std::vector<glm::vec2>>
+    std::unordered_map<T, std::vector<glm::vec3>>
 >
 triangulateWithMetadata(
-    const std::vector<Vec2>& positions,
+    const std::vector<Vec3>& positions,
     const std::vector<T>& particleIds
 );
 

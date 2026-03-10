@@ -1,6 +1,6 @@
 // =============================================================================
 // bvh.cu
-// GPU kernel and KarrasBVH_GPU method implementations.
+// GPU kernel and BVH method implementations.
 //
 // Reference: "Maximizing Parallelism in the Construction of BVHs, Octrees,
 //             and k-d Trees" — Tero Karras, HPG 2012
@@ -8,7 +8,7 @@
 // See bvh.cuh for struct definitions and declarations.
 // =============================================================================
 
-#include "dynamic_foam/Sim2D/bvh.cuh"
+#include "dynamic_foam/sim2d/bvh.cuh"
 
 #include <cassert>
 
@@ -85,7 +85,7 @@ __global__ void k_build_topology(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n - 1) return;
 
-    // Determine the range [first, last] this internal node covers
+    // Determine direction: which neighbour shares a longer common prefix?
     const int d = (delta(morton_codes, i, i + 1, n) -
                    delta(morton_codes, i, i - 1, n)) >= 0 ? 1 : -1;
 
@@ -118,7 +118,6 @@ __global__ void k_build_topology(
             split = mid;
     } while (step > 1);
 
-    // Assign children
     const int left_child  = (split     == first) ? (n - 1 + split)     : split;
     const int right_child = (split + 1 == last)  ? (n - 1 + split + 1) : (split + 1);
 
@@ -131,10 +130,6 @@ __global__ void k_build_topology(
 
 // -----------------------------------------------------------------------------
 // Kernel 4: bottom-up bounding box propagation (one thread per leaf)
-//
-// Each leaf thread walks up the tree. An atomic flag per internal node
-// ensures both children are complete before the node is processed —
-// the first thread to arrive exits; the second merges bboxes and continues.
 // -----------------------------------------------------------------------------
 
 __global__ void k_propagate_bboxes(
@@ -149,8 +144,6 @@ __global__ void k_propagate_bboxes(
     int parent = nodes[idx].parent;
 
     while (parent != -1) {
-        // First child to arrive (old == 0) exits; sibling not yet done.
-        // Second child to arrive (old == 1) merges and continues upward.
         const int old = atomicAdd(&flags[parent], 1);
         if (old == 0) return;
 
@@ -158,7 +151,6 @@ __global__ void k_propagate_bboxes(
         const AABB right_bbox = nodes[nodes[parent].right].bbox;
         nodes[parent].bbox = left_bbox.merge(right_bbox);
 
-        // Ensure the merged bbox is visible to threads continuing upward.
         __threadfence();
 
         idx    = parent;
@@ -167,54 +159,7 @@ __global__ void k_propagate_bboxes(
 }
 
 // -----------------------------------------------------------------------------
-// Kernel 5: ray traversal (one thread per ray, explicit stack)
-// -----------------------------------------------------------------------------
-
-__global__ void k_traverse(
-    const BVHNode*   __restrict__ nodes,
-    const glm::vec3* __restrict__ ray_origins,
-    const glm::vec3* __restrict__ ray_inv_dirs,
-    float t_min, float t_max,
-    RayHit* __restrict__ hits,
-    int num_rays,
-    int root)
-{
-    const int ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ray_idx >= num_rays) return;
-
-    const glm::vec3 origin  = ray_origins[ray_idx];
-    const glm::vec3 inv_dir = ray_inv_dirs[ray_idx];
-
-    RayHit& hit = hits[ray_idx];
-    hit.count = 0;
-
-    int stack[64];
-    int stack_ptr = 0;
-    stack[stack_ptr++] = root;
-
-    while (stack_ptr > 0) {
-        const int idx        = stack[--stack_ptr];
-        const BVHNode& node  = nodes[idx];
-
-        if (!node.bbox.intersect(origin, inv_dir, t_min, t_max))
-            continue;
-
-        if (node.prim_idx >= 0) {
-            // Leaf node
-            if (hit.count < 32)
-                hit.prim_ids[hit.count++] = node.prim_idx;
-        } else {
-            // Internal node — push children (right first so left is popped first)
-            if (stack_ptr < 62) {
-                stack[stack_ptr++] = node.right;
-                stack[stack_ptr++] = node.left;
-            }
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// BVH: host-side manager method implementations
+// BVH host-side method implementations
 // -----------------------------------------------------------------------------
 
 BVH::~BVH() {
@@ -231,20 +176,12 @@ void BVH::build(const AABB* primitives_host, int n) {
     CUDA_CHECK(cudaMemcpy(d_primitives_, primitives_host,
                           n * sizeof(AABB), cudaMemcpyHostToDevice));
 
-    const int block  = 256;
-    const int grid_n = (n + block - 1) / block;
+    const int block = 256;
 
-    // Step 1: reduce all primitive AABBs to a single scene AABB (CUB)
-    AABB   identity{};
-    void*  d_temp  = nullptr;
-    size_t temp_sz = 0;
-
-    CUDA_CHECK(cub::DeviceReduce::Reduce(
-        d_temp, temp_sz, d_primitives_, d_scene_bbox_, n, AABBUnion{}, identity));
-    CUDA_CHECK(cudaMalloc(&d_temp, temp_sz));
-    CUDA_CHECK(cub::DeviceReduce::Reduce(
-        d_temp, temp_sz, d_primitives_, d_scene_bbox_, n, AABBUnion{}, identity));
-    CUDA_CHECK(cudaFree(d_temp));
+    // Step 1: reduce all primitive AABBs to a single scene AABB
+    AABB identity{};
+    CUB_CALL(cub::DeviceReduce::Reduce,
+             d_primitives_, d_scene_bbox_, n, AABBUnion{}, identity);
 
     AABB scene_bbox;
     CUDA_CHECK(cudaMemcpy(&scene_bbox, d_scene_bbox_,
@@ -258,66 +195,40 @@ void BVH::build(const AABB* primitives_host, int n) {
     };
 
     // Step 2: compute Morton codes
-    k_compute_morton<<<grid_n, block>>>(
+    k_compute_morton<<<grid_size(n, block), block>>>(
         d_primitives_, d_morton_codes_, d_indices_, n,
         scene_bbox.min_pt, extent_inv);
     CUDA_CHECK(cudaGetLastError());
 
-    // Step 3: sort by Morton code (CUB radix sort, key=morton, value=index)
-    d_temp  = nullptr;
-    temp_sz = 0;
-
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        d_temp, temp_sz,
-        d_morton_codes_, d_morton_sorted_,
-        d_indices_,      d_indices_sorted_,
-        n));
-    CUDA_CHECK(cudaMalloc(&d_temp, temp_sz));
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        d_temp, temp_sz,
-        d_morton_codes_, d_morton_sorted_,
-        d_indices_,      d_indices_sorted_,
-        n));
-    CUDA_CHECK(cudaFree(d_temp));
+    // Step 3: sort by Morton code
+    CUB_CALL(cub::DeviceRadixSort::SortPairs,
+             d_morton_codes_, d_morton_sorted_,
+             d_indices_,      d_indices_sorted_,
+             n);
 
     // Step 4: initialize leaf nodes
-    k_init_leaves<<<grid_n, block>>>(
+    k_init_leaves<<<grid_size(n, block), block>>>(
         d_primitives_, d_indices_sorted_, d_nodes_, n);
     CUDA_CHECK(cudaGetLastError());
 
     if (n > 1) {
         // Step 5: build tree topology
-        const int grid_internal = (n - 1 + block - 1) / block;
-        k_build_topology<<<grid_internal, block>>>(
+        k_build_topology<<<grid_size(n - 1, block), block>>>(
             d_morton_sorted_, d_nodes_, n);
         CUDA_CHECK(cudaGetLastError());
 
         // Step 6: propagate bounding boxes bottom-up
         CUDA_CHECK(cudaMemset(d_flags_, 0, (n - 1) * sizeof(int)));
-        k_propagate_bboxes<<<grid_n, block>>>(d_nodes_, d_flags_, n);
+        k_propagate_bboxes<<<grid_size(n, block), block>>>(
+            d_nodes_, d_flags_, n);
         CUDA_CHECK(cudaGetLastError());
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-RayHit* BVH::traverse_rays(
-    const glm::vec3* d_origins, const glm::vec3* d_inv_dirs,
-    int num_rays, float t_min, float t_max)
-{
-    RayHit* d_hits;
-    CUDA_CHECK(cudaMalloc(&d_hits, num_rays * sizeof(RayHit)));
-
-    const int block = 128;
-    const int grid  = (num_rays + block - 1) / block;
-
-    k_traverse<<<grid, block>>>(
-        d_nodes_, d_origins, d_inv_dirs,
-        t_min, t_max, d_hits, num_rays, /*root=*/0);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    return d_hits;
+BVHNode* BVH::export_nodes() const {
+    return d_nodes_;
 }
 
 void BVH::alloc_device(int n) {
