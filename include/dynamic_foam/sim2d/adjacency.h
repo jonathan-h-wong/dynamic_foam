@@ -82,7 +82,43 @@ namespace DynamicFoam::Sim2D {
         }
     }
 
+    // Export to GPU-friendly format
+    AdjacencyListGPU<T> exportToGPU() const {
+        AdjacencyListGPU<T> gpuList;
+        gpuList.num_nodes = adjList.size();
+        
+        std::vector<T> connections;
+        std::vector<int> offsets;
+        offsets.push_back(0);
+
+        for (const auto& pair : adjList) {
+            for (const auto& neighbor : pair.second) {
+                connections.push_back(neighbor);
+            }
+            offsets.push_back(connections.size());
+        }
+
+        gpuList.num_connections = connections.size();
+
+        cudaMalloc(&gpuList.d_connections, gpuList.num_connections * sizeof(T));
+        cudaMemcpy(gpuList.d_connections, connections.data(), gpuList.num_connections * sizeof(T), cudaMemcpyHostToDevice);
+
+        cudaMalloc(&gpuList.d_offsets, (gpuList.num_nodes + 1) * sizeof(int));
+        cudaMemcpy(gpuList.d_offsets, offsets.data(), (gpuList.num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice);
+
+        return gpuList;
+    }
+
   private:
     std::unordered_map<T, std::unordered_set<T>> adjList;
+  };
+
+  // GPU-friendly representation of the adjacency list
+  template <typename T>
+  struct AdjacencyListGPU {
+      T* d_connections;
+      int* d_offsets;
+      int num_nodes;
+      int num_connections;
   };
 }
