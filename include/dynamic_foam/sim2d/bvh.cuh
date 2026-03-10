@@ -28,19 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 
-// -----------------------------------------------------------------------------
-// Error checking
-// -----------------------------------------------------------------------------
-
-#define CUDA_CHECK(call)                                                       \
-    do {                                                                       \
-        cudaError_t err = (call);                                              \
-        if (err != cudaSuccess) {                                              \
-            fprintf(stderr, "CUDA error at %s:%d — %s\n",                     \
-                    __FILE__, __LINE__, cudaGetErrorString(err));              \
-            exit(1);                                                           \
-        }                                                                      \
-    } while(0)
+#include "dynamic_foam/cuda_utils.cuh"
 
 // -----------------------------------------------------------------------------
 // AABB (device-compatible)
@@ -68,15 +56,20 @@ struct AABB {
     }
 
     __device__ bool intersect(const glm::vec3& origin, const glm::vec3& inv_dir,
-                              float t_min, float t_max) const
-    {
+                              float t_min, float t_max, float& t_hit) const {
         glm::vec3 t0 = (min_pt - origin) * inv_dir;
         glm::vec3 t1 = (max_pt - origin) * inv_dir;
 
-        t_min = fmaxf(t_min, fmaxf(fminf(t0.x, t1.x), fmaxf(fminf(t0.y, t1.y), fminf(t0.z, t1.z))));
-        t_max = fminf(t_max, fminf(fmaxf(t0.x, t1.x), fminf(fmaxf(t0.y, t1.y), fmaxf(t0.z, t1.z))));
+        float t_entry = fmaxf(t_min, fmaxf(fminf(t0.x, t1.x),
+                                     fmaxf(fminf(t0.y, t1.y), fminf(t0.z, t1.z))));
+        float t_exit  = fminf(t_max, fminf(fmaxf(t0.x, t1.x),
+                                     fminf(fmaxf(t0.y, t1.y), fmaxf(t0.z, t1.z))));
 
-        return t_min <= t_max;
+        if (t_entry <= t_exit) {
+            t_hit = t_entry;
+            return true;
+        }
+        return false;
     }
 };
 
@@ -97,15 +90,6 @@ struct BVHNode {
     int  right    = -1;
     int  parent   = -1;
     int  prim_idx = -1;  // >= 0 → leaf
-};
-
-// -----------------------------------------------------------------------------
-// Ray traversal output
-// -----------------------------------------------------------------------------
-
-struct RayHit {
-    int prim_ids[32];  // hit primitive IDs (capacity capped at 32)
-    int count;         // number of hits recorded
 };
 
 // -----------------------------------------------------------------------------
@@ -158,15 +142,6 @@ __global__ void k_propagate_bboxes(
     int*     __restrict__ flags,
     int n);
 
-__global__ void k_traverse(
-    const BVHNode*   __restrict__ nodes,
-    const glm::vec3* __restrict__ ray_origins,
-    const glm::vec3* __restrict__ ray_inv_dirs,
-    float t_min, float t_max,
-    RayHit* __restrict__ hits,
-    int num_rays,
-    int root);
-
 // -----------------------------------------------------------------------------
 // BVH: host-side manager
 // -----------------------------------------------------------------------------
@@ -179,10 +154,9 @@ public:
     // Upload primitives and build the BVH entirely on the GPU.
     void build(const AABB* primitives_host, int n);
 
-    // Launch ray traversal on the GPU.
-    // Returns a device-side RayHit array; the caller is responsible for freeing it.
-    RayHit* traverse_rays(const glm::vec3* d_origins, const glm::vec3* d_inv_dirs,
-                          int num_rays, float t_min = 0.f, float t_max = 1e30f);
+    // Returns the raw device pointer to the node array.
+    // Caller must not free this pointer; lifetime is managed by BVH.
+    BVHNode* export_nodes() const;
 
     int num_primitives() const { return n_; }
 
