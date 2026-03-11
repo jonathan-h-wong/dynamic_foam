@@ -61,15 +61,19 @@ __global__ void k_broadphase_collision(
     int                 num_foams
 );
 
+// surface_mask is a per-particle boolean array (uint8_t, 1 = surface).
+// Leaf hits against interior particles (mask == 0) are discarded, so only
+// surface particles reach the exact collision stage.
 __global__ void k_narrowphase_collision(
-    const glm::vec3*    ray_origins,
-    const glm::vec3*    ray_dirs,
+    const glm::vec3*     ray_origins,
+    const glm::vec3*     ray_dirs,
     const BroadphaseHit* broadphase_hits,
-    int                 num_broadphase_hits,
-    const BVHNode*      bvh_nodes,
-    const int*          bvh_offsets,
-    NarrowphaseHit*     narrowphase_hits,
-    int*                hit_counter
+    int                  num_broadphase_hits,
+    const BVHNode*       bvh_nodes,
+    const int*           bvh_offsets,
+    const uint8_t*       surface_mask,
+    NarrowphaseHit*      narrowphase_hits,
+    int*                 hit_counter
 );
 
 __global__ void k_pack_sort_key(
@@ -84,17 +88,11 @@ __global__ void k_extract_ray_idx(
     int             n
 );
 
-__global__ void k_scatter_counts(
-    int*       ray_hit_counts,
-    const int* unique_ray_ids,
-    const int* rle_counts,
-    int        num_unique
-);
-
-// Operates over only the num_unique rays that received hits.
-// unique_ray_ids maps thread index → actual ray index.
-// ray_hit_offsets and ray_hit_counts are compact arrays of length num_unique,
-// indexed by thread index (not ray index).
+// One thread per ray that received narrowphase hits.
+// Performs a generalized slab test against each candidate particle's Voronoi
+// cell, defined by the half-planes between the particle and its neighbours.
+// unique_ray_ids, ray_hit_offsets, and ray_hit_counts are all compact arrays
+// of length num_unique, indexed by thread index rather than ray index.
 __global__ void k_exact_collision(
     const glm::vec3*                      ray_origins,
     const glm::vec3*                      ray_dirs,
@@ -120,12 +118,12 @@ public:
     ~Render();
 
     void update(
-        const entt::registry&                                    particleRegistry,
+        const entt::registry&                                       particleRegistry,
         const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-        const std::unordered_map<int, BVH>&                      foamBVHs,
-        const std::unordered_map<int, AABB>&                     foamAABBs,
-        const OrthographicCamera&                                camera,
-        const glm::ivec2&                                        windowSize
+        const std::unordered_map<int, BVH>&                         foamBVHs,
+        const std::unordered_map<int, AABB>&                        foamAABBs,
+        const OrthographicCamera&                                   camera,
+        const glm::ivec2&                                           windowSize
     );
 
 private:
@@ -136,21 +134,27 @@ private:
     // Capacities track current allocation size for realloc-if-needed.
     // ------------------------------------------------------------------
 
-    // Ray buffers (capacity = max pixels)
-    glm::vec3* d_ray_origins_  = nullptr;
-    glm::vec3* d_ray_dirs_     = nullptr;
-    size_t     cap_rays_       = 0;
+    // Ray buffers
+    glm::vec3* d_ray_origins_ = nullptr;
+    glm::vec3* d_ray_dirs_    = nullptr;
+    size_t     cap_rays_      = 0;
 
-    // Foam AABB buffers (capacity = max foam count)
-    AABB* d_foam_aabbs_ = nullptr;
-    int*  d_foam_ids_   = nullptr;
-    size_t cap_foams_   = 0;
+    // Foam AABB buffers
+    AABB*  d_foam_aabbs_ = nullptr;
+    int*   d_foam_ids_   = nullptr;
+    size_t cap_foams_    = 0;
 
-    // BVH node/offset buffers (capacity = total nodes across all foams)
-    BVHNode* d_bvh_nodes_   = nullptr;
-    int*     d_bvh_offsets_ = nullptr;
+    // BVH node/offset buffers
+    BVHNode* d_bvh_nodes_     = nullptr;
+    int*     d_bvh_offsets_   = nullptr;
     size_t   cap_bvh_nodes_   = 0;
     size_t   cap_bvh_offsets_ = 0;
+
+    // Surface mask — one uint8_t per particle: 1 = surface, 0 = interior.
+    // Built from entt Surface tag each frame and used in k_narrowphase_collision
+    // to skip interior particles before they reach exact collision.
+    uint8_t* d_surface_mask_   = nullptr;
+    size_t   cap_surface_mask_ = 0;
 
     // Broadphase hit buffer + atomic counter
     BroadphaseHit* d_broadphase_hits_        = nullptr;
@@ -167,27 +171,30 @@ private:
     uint64_t* d_sort_keys_out_ = nullptr;
     size_t    cap_sort_keys_   = 0;
 
-    NarrowphaseHit* d_hits_sorted_ = nullptr;
+    NarrowphaseHit* d_hits_sorted_   = nullptr;
     size_t          cap_hits_sorted_ = 0;
 
     int*   d_ray_idx_keys_   = nullptr;
     int*   d_unique_ray_ids_ = nullptr;
     int*   d_rle_counts_     = nullptr;
-    int*   d_num_unique_     = nullptr;    // single int on device
+    int*   d_num_unique_     = nullptr;   // single int on device
     size_t cap_rle_          = 0;
 
-    // Per-ray compact offset array (length = num_unique each frame)
-    int*   d_ray_hit_offsets_ = nullptr;
+    // Compact per-ray offsets into the sorted hit buffer (length = num_unique)
+    int*   d_ray_hit_offsets_   = nullptr;
     size_t cap_ray_hit_offsets_ = 0;
 
-    // Adjacency list / particle data (uploaded once when sim state changes)
+    // Particle data buffers — uploaded each frame from the entt registry
+    glm::vec3* d_particle_positions_ = nullptr;
+    glm::vec4* d_particle_colors_    = nullptr;
+    size_t     cap_particles_        = 0;
+
+    // Adjacency list buffers — Voronoi neighbour data for exact collision
     AdjacencyListGPU<entt::entity>* d_adj_lists_        = nullptr;
     int*                            d_adj_list_offsets_ = nullptr;
-    glm::vec3*                      d_particle_positions_ = nullptr;
-    glm::vec4*                      d_particle_colors_    = nullptr;
 
     // Final pixel output
-    glm::vec4* d_output_buffer_  = nullptr;
+    glm::vec4* d_output_buffer_   = nullptr;
     size_t     cap_output_buffer_ = 0;
 };
 
