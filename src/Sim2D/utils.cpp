@@ -7,8 +7,8 @@
 #include <glm/glm.hpp>
 #include <glm/mat3x3.hpp>
 
-#include "dynamic_foam/sim2d/utils.h"
-#include "dynamic_foam/sim2d/adjacency.h"
+#include "dynamic_foam/Sim2D/utils.h"
+#include "dynamic_foam/Sim2D/adjacency.h"
 
 namespace DynamicFoam::Sim2D {
 

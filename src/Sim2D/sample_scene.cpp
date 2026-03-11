@@ -1,5 +1,5 @@
-#include "dynamic_foam/sim2d/sample_scene.h"
-#include "dynamic_foam/sim2d/utils.h"
+#include "dynamic_foam/Sim2D/sample_scene.h"
+#include "dynamic_foam/Sim2D/utils.h"
 
 namespace DynamicFoam::Sim2D {
     Foam generateFoamBar(

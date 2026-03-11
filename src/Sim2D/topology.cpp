@@ -1,4 +1,4 @@
-#include "dynamic_foam/sim2d/topology.h"
+#include "dynamic_foam/Sim2D/topology.h"
 
 namespace DynamicFoam::Sim2D {
     void Topology::update(

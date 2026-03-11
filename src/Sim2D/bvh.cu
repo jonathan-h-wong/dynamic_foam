@@ -8,7 +8,7 @@
 // See bvh.cuh for struct definitions and declarations.
 // =============================================================================
 
-#include "dynamic_foam/sim2d/bvh.cuh"
+#include "dynamic_foam/Sim2D/bvh.cuh"
 
 #include <cassert>
 

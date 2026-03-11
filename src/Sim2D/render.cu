@@ -11,9 +11,9 @@
 // =============================================================================
 
 #include <cub/cub.cuh>
-#include "dynamic_foam/sim2d/render.cuh"
-#include "dynamic_foam/sim2d/components.h"
-#include "dynamic_foam/cuda_utils.cuh"
+#include "dynamic_foam/Sim2D/render.cuh"
+#include "dynamic_foam/Sim2D/components.h"
+#include "dynamic_foam/Sim2D/cuda_utils.cuh"
 
 namespace DynamicFoam::Sim2D {
 

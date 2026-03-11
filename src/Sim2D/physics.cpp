@@ -1,4 +1,4 @@
-#include "dynamic_foam/sim2d/physics.h"
+#include "dynamic_foam/Sim2D/physics.h"
 
 namespace DynamicFoam::Sim2D {
     void Physics::update(

@@ -1,4 +1,4 @@
-#include "dynamic_foam/sim2d/user_input.h"
+#include "dynamic_foam/Sim2D/user_input.h"
 
 namespace DynamicFoam {
     namespace Sim2D {

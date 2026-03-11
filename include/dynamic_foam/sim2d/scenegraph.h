@@ -1,7 +1,7 @@
 #pragma once
 #include <unordered_map>
 #include <stdexcept>
-#include "dynamic_foam/sim2d/foam.h"
+#include "dynamic_foam/Sim2D/foam.h"
 
 namespace DynamicFoam::Sim2D {
     class SceneGraph {

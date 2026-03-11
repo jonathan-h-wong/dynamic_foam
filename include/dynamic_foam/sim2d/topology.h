@@ -1,6 +1,6 @@
 #pragma once
 #include <entt/entt.hpp>
-#include "dynamic_foam/sim2d/adjacency.h"
+#include "dynamic_foam/Sim2D/adjacency.h"
 
 namespace DynamicFoam::Sim2D {
     class Topology {

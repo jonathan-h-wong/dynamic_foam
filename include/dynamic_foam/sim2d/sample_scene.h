@@ -4,8 +4,8 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-#include "dynamic_foam/sim2d/foam.h"
-#include "dynamic_foam/sim2d/scenegraph.h"
+#include "dynamic_foam/Sim2D/foam.h"
+#include "dynamic_foam/Sim2D/scenegraph.h"
 
 namespace DynamicFoam::Sim2D {
     Foam generateFoamBar(

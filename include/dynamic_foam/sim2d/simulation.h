@@ -1,13 +1,13 @@
 #pragma once
 #include <glm/glm.hpp>
 #include <entt/entt.hpp>
-#include "dynamic_foam/sim2d/adjacency.h"
-#include "dynamic_foam/sim2d/bvh.cuh"
-#include "dynamic_foam/sim2d/scenegraph.h"
-#include "dynamic_foam/sim2d/user_input.h"
-#include <dynamic_foam/sim2d/topology.h>
-#include <dynamic_foam/sim2d/physics.h>
-#include <dynamic_foam/sim2d/render.h>
+#include "dynamic_foam/Sim2D/adjacency.h"
+#include "dynamic_foam/Sim2D/bvh.cuh"
+#include "dynamic_foam/Sim2D/scenegraph.h"
+#include "dynamic_foam/Sim2D/user_input.h"
+#include "dynamic_foam/Sim2D/topology.h"
+#include "dynamic_foam/Sim2D/physics.h"
+#include "dynamic_foam/Sim2D/render.h"
 
 namespace DynamicFoam::Sim2D {
 
