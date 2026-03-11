@@ -28,7 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 
-#include "dynamic_foam/cuda_utils.cuh"
+#include "dynamic_foam/Sim2D/cuda_utils.cuh"
 
 // -----------------------------------------------------------------------------
 // AABB (device-compatible)

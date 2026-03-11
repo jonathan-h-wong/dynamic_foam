@@ -24,6 +24,7 @@ FetchContent_MakeAvailable(imgui_backends)
 set (DYNAMIC_FOAM_SOURCES
     kernels.cu
     Sim2D/bvh.cu
+    Sim2D/render.cu
     ${imgui_backends_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_backends_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )

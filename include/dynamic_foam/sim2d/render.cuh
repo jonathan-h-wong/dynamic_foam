@@ -14,7 +14,7 @@
 
 #include "dynamic_foam/sim2d/adjacency.h"
 #include "dynamic_foam/sim2d/bvh.cuh"
-#include "dynamic_foam/cuda_utils.cuh"
+#include "dynamic_foam/Sim2D/cuda_utils.cuh"
 
 namespace DynamicFoam::Sim2D {
 
