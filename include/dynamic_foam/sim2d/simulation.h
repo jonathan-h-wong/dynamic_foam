@@ -7,7 +7,7 @@
 #include "dynamic_foam/Sim2D/user_input.h"
 #include "dynamic_foam/Sim2D/topology.h"
 #include "dynamic_foam/Sim2D/physics.h"
-#include "dynamic_foam/Sim2D/render.h"
+#include "dynamic_foam/Sim2D/render.cuh"
 
 namespace DynamicFoam::Sim2D {
 
