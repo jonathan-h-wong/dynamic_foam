@@ -205,14 +205,14 @@ std::unordered_map<T, int> findConnectedComponents(
                 T currentNode = stack.back();
                 stack.pop_back();
 
-                for (const auto& neighbor : adjList.getNeighbors(currentNode)) {
+                adjList.forEachNeighbor(currentNode, [&](const T& neighbor) {
                     auto it = opacityMap.find(neighbor);
                     if (it != opacityMap.end() && it->second > 0.0f && visited.find(neighbor) == visited.end()) {
                         visited.insert(neighbor);
                         componentLabels[neighbor] = componentId;
                         stack.push_back(neighbor);
                     }
-                }
+                });
             }
         }
     }
@@ -233,13 +233,12 @@ std::vector<T> findSurfaceCells(
 
         if (opacity > 0.0f) {
             bool isSurfaceCell = false;
-            for (const auto& neighborId : adjList.getNeighbors(nodeId)) {
+            adjList.forEachNeighbor(nodeId, [&](const T& neighborId) {
                 auto it = opacityMap.find(neighborId);
                 if (it == opacityMap.end() || it->second == 0.0f) {
                     isSurfaceCell = true;
-                    break;
                 }
-            }
+            });
             if (isSurfaceCell) {
                 surfaceCells.push_back(nodeId);
             }
@@ -346,12 +345,12 @@ int countCycles(
     // Extract all air cells (neighbors of surface cells with opacity == 0)
     std::unordered_set<T> airCells;
     for (const T& surfaceId : surfaceIds) {
-        for (const T& neighborId : adjList.getNeighbors(surfaceId)) {
+        adjList.forEachNeighbor(surfaceId, [&](const T& neighborId) {
             auto it = opacityMap.find(neighborId);
             if (it != opacityMap.end() && it->second == 0.0f) {
                 airCells.insert(neighborId);
             }
-        }
+        });
     }
 
     if (airCells.empty()) {
@@ -361,11 +360,11 @@ int countCycles(
     int V = airCells.size();
     int E = 0;
     for (const T& airCell : airCells) {
-        for (const T& neighborId : adjList.getNeighbors(airCell)) {
+        adjList.forEachNeighbor(airCell, [&](const T& neighborId) {
             if (airCells.count(neighborId) && airCell < neighborId) {
                 E++;
             }
-        }
+        });
     }
 
     // Count connected components (C) in the air cell subgraph
