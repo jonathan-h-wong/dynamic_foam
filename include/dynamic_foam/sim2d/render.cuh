@@ -11,6 +11,7 @@
 #include <entt/entt.hpp>
 #include <glm/glm.hpp>
 #include <cuda_runtime.h>
+#include <unordered_map>
 
 #include "dynamic_foam/Sim2D/adjacency.h"
 #include "dynamic_foam/Sim2D/bvh.cuh"
@@ -40,9 +41,12 @@ struct BroadphaseHit {
     float t;
 };
 
+// foam_id carried through from broadphase so k_exact_collision can index
+// the correct per-foam CSR adjacency buffers.
 struct NarrowphaseHit {
     int   ray_idx;
     int   particle_id;
+    int   foam_id;
     float t;
 };
 
@@ -89,23 +93,30 @@ __global__ void k_extract_ray_idx(
 );
 
 // One thread per ray that received narrowphase hits.
-// Performs a generalized slab test against each candidate particle's Voronoi
-// cell, defined by the half-planes between the particle and its neighbours.
-// unique_ray_ids, ray_hit_offsets, and ray_hit_counts are all compact arrays
-// of length num_unique, indexed by thread index rather than ray index.
+// Performs a generalized Voronoi slab test against each candidate particle,
+// using per-foam CSR adjacency buffers passed as device pointer tables.
+//
+// foam_node_offsets   Device array of per-foam node_offsets pointers.
+//                     foam_node_offsets[foam_id][i] is the start of node i's
+//                     neighbor run in foam_nbrs[foam_id].
+// foam_nbrs           Device array of per-foam neighbor index arrays.
+//                     Indices are global dense particle IDs.
+// particle_to_sorted  Maps global dense particle index -> local sorted
+//                     position within that particle's foam CSR.
 __global__ void k_exact_collision(
-    const glm::vec3*                      ray_origins,
-    const glm::vec3*                      ray_dirs,
-    const NarrowphaseHit*                 narrowphase_hits,
-    const int*                            unique_ray_ids,
-    const int*                            ray_hit_offsets,
-    const int*                            ray_hit_counts,
-    const AdjacencyListGPU<entt::entity>* adj_lists,
-    const int*                            adj_list_offsets,
-    const glm::vec3*                      particle_positions,
-    const glm::vec4*                      particle_colors,
-    glm::vec4*                            output_buffer,
-    int                                   num_unique
+    const glm::vec3*      ray_origins,
+    const glm::vec3*      ray_dirs,
+    const NarrowphaseHit* narrowphase_hits,
+    const int*            unique_ray_ids,
+    const int*            ray_hit_offsets,
+    const int*            ray_hit_counts,
+    const uint32_t**      foam_node_offsets,
+    const uint32_t**      foam_nbrs,
+    const int*            particle_to_sorted,
+    const glm::vec3*      particle_positions,
+    const glm::vec4*      particle_colors,
+    glm::vec4*            output_buffer,
+    int                   num_unique
 );
 
 // -----------------------------------------------------------------------------
@@ -117,13 +128,15 @@ public:
     Render();
     ~Render();
 
+    // foamAdjacencyLists is non-const: dirty flags are cleared after each
+    // GPU rebuild via adj.clearDirty().
     void update(
-        const entt::registry&                                       particleRegistry,
-        const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-        const std::unordered_map<int, BVH>&                         foamBVHs,
-        const std::unordered_map<int, AABB>&                        foamAABBs,
-        const OrthographicCamera&                                   camera,
-        const glm::ivec2&                                           windowSize
+        const entt::registry&                                  particleRegistry,
+        std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
+        const std::unordered_map<int, BVH>&                   foamBVHs,
+        const std::unordered_map<int, AABB>&                  foamAABBs,
+        const OrthographicCamera&                             camera,
+        const glm::ivec2&                                     windowSize
     );
 
 private:
@@ -177,7 +190,7 @@ private:
     int*   d_ray_idx_keys_   = nullptr;
     int*   d_unique_ray_ids_ = nullptr;
     int*   d_rle_counts_     = nullptr;
-    int*   d_num_unique_     = nullptr;   // single int on device
+    int*   d_num_unique_     = nullptr;  // single int on device
     size_t cap_rle_          = 0;
 
     // Compact per-ray offsets into the sorted hit buffer (length = num_unique)
@@ -189,9 +202,21 @@ private:
     glm::vec4* d_particle_colors_    = nullptr;
     size_t     cap_particles_        = 0;
 
-    // Adjacency list buffers — Voronoi neighbour data for exact collision
-    AdjacencyListGPU<entt::entity>* d_adj_lists_        = nullptr;
-    int*                            d_adj_list_offsets_ = nullptr;
+    // Per-foam GPU adjacency lists — persistent across frames, rebuilt only
+    // when a foam's topology changes (isCOODirty()).
+    std::unordered_map<int, AdjacencyListGPU<entt::entity>> foam_gpu_adj_;
+
+    // Device pointer tables — one entry per foam, pointing into the
+    // corresponding foam's AdjacencyListGPU buffers.
+    // Uploaded whenever foam_gpu_adj_ changes.
+    uint32_t** d_foam_node_offsets_ptrs_ = nullptr;
+    uint32_t** d_foam_nbrs_ptrs_         = nullptr;
+    size_t     cap_foam_ptr_table_       = 0;
+
+    // Maps global dense particle index -> local sorted position in its foam's
+    // CSR. Rebuilt whenever any foam adjacency list is dirty.
+    int*   d_particle_to_sorted_   = nullptr;
+    size_t cap_particle_to_sorted_ = 0;
 
     // Final pixel output
     glm::vec4* d_output_buffer_   = nullptr;

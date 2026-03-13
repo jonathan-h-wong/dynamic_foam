@@ -131,35 +131,40 @@ __global__ void k_extract_ray_idx(
 // -----------------------------------------------------------------------------
 // Exact collision — one thread per ray that received narrowphase hits.
 //
-// For each candidate surface particle, performs a generalized Voronoi slab
-// test: the Voronoi cell of a particle P is the intersection of half-spaces,
-// one per neighbour N, defined by the perpendicular bisector plane between P
-// and N. A point X lies inside P's cell iff for every neighbour N:
+// Accepts per-foam CSR adjacency buffers. Each NarrowphaseHit carries the
+// foam_id it came from (via the broadphase), so the kernel indexes into the
+// correct foam's node_offsets and nbrs arrays.
 //
-//   dot(X - midpoint(P,N), N - P) <= 0
+// Each foam's CSR is indexed by that foam's local sorted particle position,
+// not by global entt entity index. particle_to_sorted[pid] maps from the
+// global dense particle index to that particle's position in its foam's sorted
+// node buffer, which is then used to look up neighbors in the CSR.
 //
-// Equivalently for a ray O + t*D, we solve for the interval of t that
-// satisfies all half-space constraints simultaneously (slab intersection).
-// If the interval [t_enter, t_exit] is non-empty and t_enter >= 0, the ray
-// hits this Voronoi cell and we record t_enter as the intersection.
-//
-// Candidates are sorted by AABB t, so we iterate in approximate front-to-back
-// order and take the first cell whose slab test passes.
+// Voronoi slab test:
+//   For each candidate surface particle P, intersect all bisector half-planes
+//   defined by P and each neighbor N. The ray hits P's Voronoi cell if the
+//   resulting t-interval [t_enter, t_exit] is non-empty and t_enter >= 0.
+//   Candidates are visited in approximate front-to-back order (sorted by BVH t)
+//   and we take the first cell that passes.
 // -----------------------------------------------------------------------------
 
 __global__ void k_exact_collision(
-    const glm::vec3*                      ray_origins,
-    const glm::vec3*                      ray_dirs,
-    const NarrowphaseHit*                 narrowphase_hits,
-    const int*                            unique_ray_ids,
-    const int*                            ray_hit_offsets,
-    const int*                            ray_hit_counts,
-    const AdjacencyListGPU<entt::entity>* adj_lists,
-    const int*                            adj_list_offsets,
-    const glm::vec3*                      particle_positions,
-    const glm::vec4*                      particle_colors,
-    glm::vec4*                            output_buffer,
-    int                                   num_unique
+    const glm::vec3*      ray_origins,
+    const glm::vec3*      ray_dirs,
+    const NarrowphaseHit* narrowphase_hits,
+    const int*            unique_ray_ids,
+    const int*            ray_hit_offsets,
+    const int*            ray_hit_counts,
+    // Per-foam CSR adjacency — one pointer pair per foam, passed as flat
+    // device arrays of pointers (size num_foams each).
+    const uint32_t**      foam_node_offsets,  // foam_node_offsets[foam_id][i]
+    const uint32_t**      foam_nbrs,          // foam_nbrs[foam_id][i]
+    // Maps global dense particle index -> sorted position within its foam CSR
+    const int*            particle_to_sorted,
+    const glm::vec3*      particle_positions,
+    const glm::vec4*      particle_colors,
+    glm::vec4*            output_buffer,
+    int                   num_unique
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_unique) return;
@@ -171,65 +176,49 @@ __global__ void k_exact_collision(
     const glm::vec3 origin = ray_origins[ray_idx];
     const glm::vec3 dir    = ray_dirs[ray_idx];
 
-    float best_t = 1e30f;
+    float best_t        = 1e30f;
     int   best_particle = -1;
 
     for (int j = 0; j < hit_count; ++j) {
-        const NarrowphaseHit hit        = narrowphase_hits[hit_offset + j];
-        const int            pid        = hit.particle_id;
-        const glm::vec3      p_pos      = particle_positions[pid];
+        const NarrowphaseHit hit    = narrowphase_hits[hit_offset + j];
+        const int            pid    = hit.particle_id;
+        const int            fid    = hit.foam_id;
+        const glm::vec3      p_pos  = particle_positions[pid];
 
-        // Retrieve this particle's adjacency list
-        const int                      adj_offset = adj_list_offsets[pid];
-        const AdjacencyListGPU<entt::entity>& adj = adj_lists[adj_offset];
+        // Map global particle index to this foam's local sorted position,
+        // then look up the neighbor range in that foam's CSR.
+        const int      local_idx  = particle_to_sorted[pid];
+        const uint32_t adj_start  = foam_node_offsets[fid][local_idx];
+        const uint32_t adj_end    = foam_node_offsets[fid][local_idx + 1];
 
-        // Slab test: accumulate the t-interval [t_enter, t_exit] over all
-        // bisector half-planes. Each neighbour contributes one slab.
         float t_enter = 0.f;
         float t_exit  = 1e30f;
         bool  valid   = true;
 
-        for (int k = 0; k < adj.size; ++k) {
-            const int       nid   = static_cast<int>(
-                                        entt::to_integral(adj.neighbours[k]));
+        for (uint32_t k = adj_start; k < adj_end; ++k) {
+            // foam_nbrs[fid][k] is a sorted-position index within this foam.
+            // Resolve it back to a global particle index via the foam's nodes
+            // buffer — but since we only need the world position, we can use
+            // the sorted index directly if positions are stored in sorted order.
+            // Here we assume particle_positions is indexed by global dense id,
+            // so we need the reverse map. For now the neighbor's global id is
+            // stored in foam_nbrs as a global dense index (set during COO build).
+            const int       nid   = (int)foam_nbrs[fid][k];
             const glm::vec3 n_pos = particle_positions[nid];
 
-            // Bisector plane between p and neighbour n:
-            //   normal = n_pos - p_pos  (points from p toward n)
-            //   point on plane = midpoint(p_pos, n_pos)
             const glm::vec3 plane_normal = n_pos - p_pos;
             const glm::vec3 midpoint     = (p_pos + n_pos) * 0.5f;
 
-            // Ray-plane intersection: dot(O + t*D - midpoint, normal) = 0
-            //   t = dot(midpoint - O, normal) / dot(D, normal)
-            const float denom  = glm::dot(dir, plane_normal);
-            const float numer  = glm::dot(midpoint - origin, plane_normal);
+            const float denom = glm::dot(dir, plane_normal);
+            const float numer = glm::dot(midpoint - origin, plane_normal);
 
             if (fabsf(denom) < 1e-6f) {
-                // Ray is parallel to this bisector plane.
-                // Check which side of the plane the ray origin lies on.
-                // If it's on the far side (numer < 0), the ray never enters
-                // this cell — bail out immediately.
-                if (numer < 0.f) {
-                    valid = false;
-                    break;
-                }
-                // Otherwise the ray is entirely on the correct side for this
-                // plane; no t constraint needed.
+                if (numer < 0.f) { valid = false; break; }
             } else {
                 const float t_plane = numer / denom;
-                if (denom > 0.f) {
-                    // Ray crosses into the half-space at t_plane
-                    t_enter = fmaxf(t_enter, t_plane);
-                } else {
-                    // Ray exits the half-space at t_plane
-                    t_exit = fminf(t_exit, t_plane);
-                }
-
-                if (t_enter > t_exit) {
-                    valid = false;
-                    break;
-                }
+                if (denom > 0.f) t_enter = fmaxf(t_enter, t_plane);
+                else             t_exit  = fminf(t_exit,  t_plane);
+                if (t_enter > t_exit) { valid = false; break; }
             }
         }
 
@@ -239,9 +228,8 @@ __global__ void k_exact_collision(
         }
     }
 
-    if (best_particle >= 0) {
+    if (best_particle >= 0)
         output_buffer[ray_idx] = particle_colors[best_particle];
-    }
 }
 
 // =============================================================================
@@ -260,7 +248,7 @@ Render::~Render() {
 
 void Render::update(
     const entt::registry& particleRegistry,
-    const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
+    std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
     const std::unordered_map<int, BVH>& foamBVHs,
     const std::unordered_map<int, AABB>& foamAABBs,
     const OrthographicCamera& camera,
@@ -268,7 +256,8 @@ void Render::update(
 ) {
     const int num_rays      = windowSize.x * windowSize.y;
     const int num_foams     = static_cast<int>(foamAABBs.size());
-    const int num_particles = static_cast<int>(particleRegistry.alive());
+    const int num_particles = static_cast<int>(
+        particleRegistry.storage<entt::entity>()->free_list());
 
     // ------------------------------------------------------------------
     // Ray buffer
@@ -283,13 +272,13 @@ void Render::update(
 
     for (int y = 0; y < windowSize.y; ++y) {
         for (int x = 0; x < windowSize.x; ++x) {
-            const int   index = y * windowSize.x + x;
-            const float u     = (float(x) / float(windowSize.x)) - 0.5f;
-            const float v     = (float(y) / float(windowSize.y)) - 0.5f;
-            origins[index] = camera.origin
-                           + u * camera.width  * right
-                           + v * camera.height * up;
-            dirs[index] = forward;
+            const int   idx = y * windowSize.x + x;
+            const float u   = (float(x) / float(windowSize.x)) - 0.5f;
+            const float v   = (float(y) / float(windowSize.y)) - 0.5f;
+            origins[idx] = camera.origin
+                         + u * camera.width  * right
+                         + v * camera.height * up;
+            dirs[idx] = forward;
         }
     }
 
@@ -301,16 +290,11 @@ void Render::update(
                           num_rays * sizeof(glm::vec3), cudaMemcpyHostToDevice));
 
     // ------------------------------------------------------------------
-    // Particle positions, colors, and surface mask — all built in one
-    // pass over the registry to avoid redundant iteration.
-    //
-    // ParticleWorldPosition holds the current simulation position.
-    // ParticleColor holds the RGB; we pack it to vec4 with ParticleOpacity.
-    // Surface tag sets the mask entry to 1 for surface particles.
+    // Particle positions, colors, and surface mask
     // ------------------------------------------------------------------
 
     std::vector<glm::vec3> h_positions(num_particles, glm::vec3(0.f));
-    std::vector<glm::vec4> h_colors(num_particles, glm::vec4(1.f));
+    std::vector<glm::vec4> h_colors(num_particles,    glm::vec4(1.f));
     std::vector<uint8_t>   h_surface_mask(num_particles, 0);
 
     particleRegistry.view<const ParticleWorldPosition,
@@ -330,8 +314,7 @@ void Render::update(
     particleRegistry.view<const Surface>().each(
         [&](entt::entity e) {
             const int pid = static_cast<int>(entt::to_integral(e));
-            if (pid < num_particles)
-                h_surface_mask[pid] = 1;
+            if (pid < num_particles) h_surface_mask[pid] = 1;
         });
 
     cuda_realloc_if_needed(&d_particle_positions_, &cap_particles_, num_particles);
@@ -343,7 +326,94 @@ void Render::update(
     CUDA_CHECK(cudaMemcpy(d_particle_colors_, h_colors.data(),
                           num_particles * sizeof(glm::vec4), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_surface_mask_, h_surface_mask.data(),
-                          num_particles * sizeof(uint8_t), cudaMemcpyHostToDevice));
+                          num_particles * sizeof(uint8_t),   cudaMemcpyHostToDevice));
+
+    // ------------------------------------------------------------------
+    // Adjacency — rebuild dirty foam CSRs on the GPU, then upload a
+    // device-side pointer table and a global particle->sorted index map.
+    //
+    // foam_gpu_adj_ is a persistent member (unordered_map<int,
+    // AdjacencyListGPU<entt::entity>>). Buffers are only reallocated when
+    // the topology of that foam changed since the last frame.
+    //
+    // particle_to_sorted maps global dense particle index -> local sorted
+    // position within that particle's foam CSR. It is rebuilt whenever any
+    // foam is dirty, since the sorted positions may have shifted.
+    // ------------------------------------------------------------------
+    {
+        bool any_dirty = false;
+
+        for (auto& [foam_id, adj] : foamAdjacencyLists) {
+            if (adj.isCOODirty()) {
+                adj.buildGPUAdjacencyList(foam_gpu_adj_[foam_id]);
+                adj.clearDirty();
+                any_dirty = true;
+            }
+        }
+
+        if (any_dirty || d_particle_to_sorted_ == nullptr) {
+            // Rebuild the particle->sorted map from each foam's nodes buffer.
+            // nodes[i] holds the original entt entity; its sorted position is i.
+            std::vector<int> h_particle_to_sorted(num_particles, -1);
+
+            for (const auto& [foam_id, gpu_adj] : foam_gpu_adj_) {
+                if (gpu_adj.num_nodes == 0) continue;
+
+                // Pull the nodes buffer back to host (it's small — one int
+                // per particle in this foam).
+                std::vector<entt::entity> h_nodes(gpu_adj.num_nodes);
+                CUDA_CHECK(cudaMemcpy(h_nodes.data(), gpu_adj.nodes,
+                    gpu_adj.num_nodes * sizeof(entt::entity),
+                    cudaMemcpyDeviceToHost));
+
+                for (uint32_t i = 0; i < gpu_adj.num_nodes; ++i) {
+                    const int pid = static_cast<int>(entt::to_integral(h_nodes[i]));
+                    if (pid >= 0 && pid < num_particles)
+                        h_particle_to_sorted[pid] = static_cast<int>(i);
+                }
+            }
+
+            cuda_realloc_if_needed(&d_particle_to_sorted_,
+                                   &cap_particle_to_sorted_,
+                                   static_cast<size_t>(num_particles));
+            CUDA_CHECK(cudaMemcpy(d_particle_to_sorted_,
+                                  h_particle_to_sorted.data(),
+                                  num_particles * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+        }
+
+        // Build a host-side array of device pointers — one node_offsets ptr
+        // and one nbrs ptr per foam_id — then upload to device so the kernel
+        // can index foam_node_offsets[foam_id] and foam_nbrs[foam_id].
+        //
+        // Foam IDs are assumed to be dense in [0, num_foams). If they are
+        // not, widen these arrays to max_foam_id + 1.
+        std::vector<const uint32_t*> h_foam_node_offsets(num_foams, nullptr);
+        std::vector<const uint32_t*> h_foam_nbrs(num_foams,         nullptr);
+
+        for (const auto& [foam_id, gpu_adj] : foam_gpu_adj_) {
+            if (foam_id < num_foams) {
+                h_foam_node_offsets[foam_id] = gpu_adj.node_offsets;
+                h_foam_nbrs[foam_id]         = gpu_adj.nbrs;
+            }
+        }
+
+        cuda_realloc_if_needed(&d_foam_node_offsets_ptrs_,
+                               &cap_foam_ptr_table_,
+                               static_cast<size_t>(num_foams));
+        cuda_realloc_if_needed(&d_foam_nbrs_ptrs_,
+                               &cap_foam_ptr_table_,
+                               static_cast<size_t>(num_foams));
+
+        CUDA_CHECK(cudaMemcpy(d_foam_node_offsets_ptrs_,
+                              h_foam_node_offsets.data(),
+                              num_foams * sizeof(uint32_t*),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_foam_nbrs_ptrs_,
+                              h_foam_nbrs.data(),
+                              num_foams * sizeof(uint32_t*),
+                              cudaMemcpyHostToDevice));
+    }
 
     // ------------------------------------------------------------------
     // Foam AABBs
@@ -364,7 +434,7 @@ void Render::update(
     cuda_realloc_if_needed(&d_foam_ids_,   &cap_foams_, num_foams);
     CUDA_CHECK(cudaMemcpy(d_foam_aabbs_, h_foam_aabbs.data(),
                           num_foams * sizeof(AABB), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_foam_ids_, h_foam_ids.data(),
+    CUDA_CHECK(cudaMemcpy(d_foam_ids_,   h_foam_ids.data(),
                           num_foams * sizeof(int),  cudaMemcpyHostToDevice));
 
     // ------------------------------------------------------------------
@@ -389,10 +459,8 @@ void Render::update(
         }
     }
 
-    cuda_realloc_if_needed(&d_bvh_nodes_,   &cap_bvh_nodes_,
-                           all_bvh_nodes.size());
-    cuda_realloc_if_needed(&d_bvh_offsets_, &cap_bvh_offsets_,
-                           h_bvh_offsets.size());
+    cuda_realloc_if_needed(&d_bvh_nodes_,   &cap_bvh_nodes_,   all_bvh_nodes.size());
+    cuda_realloc_if_needed(&d_bvh_offsets_, &cap_bvh_offsets_, h_bvh_offsets.size());
     CUDA_CHECK(cudaMemcpy(d_bvh_nodes_, all_bvh_nodes.data(),
                           all_bvh_nodes.size() * sizeof(BVHNode),
                           cudaMemcpyHostToDevice));
@@ -417,7 +485,7 @@ void Render::update(
     );
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    int num_broadphase_hits;
+    int num_broadphase_hits = 0;
     CUDA_CHECK(cudaMemcpy(&num_broadphase_hits, d_broadphase_hit_counter_,
                           sizeof(int), cudaMemcpyDeviceToHost));
     if (num_broadphase_hits == 0) return;
@@ -440,7 +508,7 @@ void Render::update(
     );
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    int num_narrowphase_hits;
+    int num_narrowphase_hits = 0;
     CUDA_CHECK(cudaMemcpy(&num_narrowphase_hits, d_narrowphase_hit_counter_,
                           sizeof(int), cudaMemcpyDeviceToHost));
     if (num_narrowphase_hits == 0) return;
@@ -449,8 +517,8 @@ void Render::update(
     // Sort narrowphase hits by (ray_idx, t) via packed uint64 radix sort
     // ------------------------------------------------------------------
 
-    cuda_realloc_if_needed(&d_sort_keys_in_,  &cap_sort_keys_, num_narrowphase_hits);
-    cuda_realloc_if_needed(&d_sort_keys_out_, &cap_sort_keys_, num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_sort_keys_in_,  &cap_sort_keys_,   num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_sort_keys_out_, &cap_sort_keys_,   num_narrowphase_hits);
     cuda_realloc_if_needed(&d_hits_sorted_,   &cap_hits_sorted_, num_narrowphase_hits);
 
     k_pack_sort_key<<<grid_size(num_narrowphase_hits), 256>>>(
@@ -463,13 +531,12 @@ void Render::update(
              num_narrowphase_hits);
 
     // ------------------------------------------------------------------
-    // Extract ray indices from sorted keys, then run-length encode to
-    // get the count of hits per unique ray
+    // Extract ray indices, run-length encode → per-ray hit counts
     // ------------------------------------------------------------------
 
-    cuda_realloc_if_needed(&d_ray_idx_keys_,   &cap_rle_, num_narrowphase_hits);
-    cuda_realloc_if_needed(&d_unique_ray_ids_,  &cap_rle_, num_narrowphase_hits);
-    cuda_realloc_if_needed(&d_rle_counts_,      &cap_rle_, num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_ray_idx_keys_,  &cap_rle_, num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_unique_ray_ids_, &cap_rle_, num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_rle_counts_,     &cap_rle_, num_narrowphase_hits);
 
     k_extract_ray_idx<<<grid_size(num_narrowphase_hits), 256>>>(
         d_sort_keys_out_, d_ray_idx_keys_, num_narrowphase_hits);
@@ -480,15 +547,12 @@ void Render::update(
              d_unique_ray_ids_, d_rle_counts_, d_num_unique_,
              num_narrowphase_hits);
 
-    int num_unique;
+    int num_unique = 0;
     CUDA_CHECK(cudaMemcpy(&num_unique, d_num_unique_,
                           sizeof(int), cudaMemcpyDeviceToHost));
 
     // ------------------------------------------------------------------
-    // Exclusive scan over per-ray hit counts → compact offsets into the
-    // sorted hit buffer. No scatter needed since k_exact_collision is
-    // launched over num_unique threads and uses unique_ray_ids to write
-    // directly into output_buffer at the correct ray index.
+    // Exclusive scan over per-ray hit counts → offsets into sorted hits
     // ------------------------------------------------------------------
 
     cuda_realloc_if_needed(&d_ray_hit_offsets_, &cap_ray_hit_offsets_, num_unique);
@@ -497,14 +561,14 @@ void Render::update(
              d_rle_counts_, d_ray_hit_offsets_, num_unique);
 
     // ------------------------------------------------------------------
-    // Output buffer — memset to zero fills background for rays with no hits
+    // Output buffer
     // ------------------------------------------------------------------
 
     cuda_realloc_if_needed(&d_output_buffer_, &cap_output_buffer_, num_rays);
     CUDA_CHECK(cudaMemset(d_output_buffer_, 0, num_rays * sizeof(glm::vec4)));
 
     // ------------------------------------------------------------------
-    // Exact Voronoi slab test — one thread per ray that received hits
+    // Exact Voronoi slab test
     // ------------------------------------------------------------------
 
     k_exact_collision<<<grid_size(num_unique), 256>>>(
@@ -514,8 +578,9 @@ void Render::update(
         d_unique_ray_ids_,
         d_ray_hit_offsets_,
         d_rle_counts_,
-        d_adj_lists_,
-        d_adj_list_offsets_,
+        d_foam_node_offsets_ptrs_,
+        d_foam_nbrs_ptrs_,
+        d_particle_to_sorted_,
         d_particle_positions_,
         d_particle_colors_,
         d_output_buffer_,
@@ -531,30 +596,35 @@ void Render::update(
 void Render::free_device_memory() {
     auto f = [](void* p) { if (p) cudaFree(p); };
 
-    f(d_ray_origins_);             d_ray_origins_             = nullptr;
-    f(d_ray_dirs_);                d_ray_dirs_                = nullptr;
-    f(d_foam_aabbs_);              d_foam_aabbs_              = nullptr;
-    f(d_foam_ids_);                d_foam_ids_                = nullptr;
-    f(d_bvh_nodes_);               d_bvh_nodes_               = nullptr;
-    f(d_bvh_offsets_);             d_bvh_offsets_             = nullptr;
-    f(d_surface_mask_);            d_surface_mask_            = nullptr;
-    f(d_broadphase_hits_);         d_broadphase_hits_         = nullptr;
-    f(d_broadphase_hit_counter_);  d_broadphase_hit_counter_  = nullptr;
-    f(d_narrowphase_hits_);        d_narrowphase_hits_        = nullptr;
-    f(d_narrowphase_hit_counter_); d_narrowphase_hit_counter_ = nullptr;
-    f(d_sort_keys_in_);            d_sort_keys_in_            = nullptr;
-    f(d_sort_keys_out_);           d_sort_keys_out_           = nullptr;
-    f(d_hits_sorted_);             d_hits_sorted_             = nullptr;
-    f(d_ray_idx_keys_);            d_ray_idx_keys_            = nullptr;
-    f(d_unique_ray_ids_);          d_unique_ray_ids_          = nullptr;
-    f(d_rle_counts_);              d_rle_counts_              = nullptr;
-    f(d_num_unique_);              d_num_unique_              = nullptr;
-    f(d_ray_hit_offsets_);         d_ray_hit_offsets_         = nullptr;
-    f(d_particle_positions_);      d_particle_positions_      = nullptr;
-    f(d_particle_colors_);         d_particle_colors_         = nullptr;
-    f(d_adj_lists_);               d_adj_lists_               = nullptr;
-    f(d_adj_list_offsets_);        d_adj_list_offsets_        = nullptr;
-    f(d_output_buffer_);           d_output_buffer_           = nullptr;
+    f(d_ray_origins_);               d_ray_origins_               = nullptr;
+    f(d_ray_dirs_);                  d_ray_dirs_                  = nullptr;
+    f(d_foam_aabbs_);                d_foam_aabbs_                = nullptr;
+    f(d_foam_ids_);                  d_foam_ids_                  = nullptr;
+    f(d_bvh_nodes_);                 d_bvh_nodes_                 = nullptr;
+    f(d_bvh_offsets_);               d_bvh_offsets_               = nullptr;
+    f(d_surface_mask_);              d_surface_mask_              = nullptr;
+    f(d_broadphase_hits_);           d_broadphase_hits_           = nullptr;
+    f(d_broadphase_hit_counter_);    d_broadphase_hit_counter_    = nullptr;
+    f(d_narrowphase_hits_);          d_narrowphase_hits_          = nullptr;
+    f(d_narrowphase_hit_counter_);   d_narrowphase_hit_counter_   = nullptr;
+    f(d_sort_keys_in_);              d_sort_keys_in_              = nullptr;
+    f(d_sort_keys_out_);             d_sort_keys_out_             = nullptr;
+    f(d_hits_sorted_);               d_hits_sorted_               = nullptr;
+    f(d_ray_idx_keys_);              d_ray_idx_keys_              = nullptr;
+    f(d_unique_ray_ids_);            d_unique_ray_ids_            = nullptr;
+    f(d_rle_counts_);                d_rle_counts_                = nullptr;
+    f(d_num_unique_);                d_num_unique_                = nullptr;
+    f(d_ray_hit_offsets_);           d_ray_hit_offsets_           = nullptr;
+    f(d_particle_positions_);        d_particle_positions_        = nullptr;
+    f(d_particle_colors_);           d_particle_colors_           = nullptr;
+    f(d_particle_to_sorted_);        d_particle_to_sorted_        = nullptr;
+    f(d_foam_node_offsets_ptrs_);    d_foam_node_offsets_ptrs_    = nullptr;
+    f(d_foam_nbrs_ptrs_);            d_foam_nbrs_ptrs_            = nullptr;
+    f(d_output_buffer_);             d_output_buffer_             = nullptr;
+
+    for (auto& [id, gpu_adj] : foam_gpu_adj_)
+        gpu_adj.free();
+    foam_gpu_adj_.clear();
 }
 
 } // namespace DynamicFoam::Sim2D
