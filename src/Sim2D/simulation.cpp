@@ -157,13 +157,24 @@ namespace DynamicFoam::Sim2D {
         const std::unordered_map<int, BVH>& foamBVHs,
         const std::unordered_map<int, AABB>& foamAABBs
     ) {
+        // Build per-foam world transforms from position and orientation.
+        // These are passed to the render subsystem so it can compute inverse
+        // transforms for transforming rays into each foam's local BVH space.
+        std::unordered_map<int, glm::mat4> foamTransforms;
+        foamRegistry.view<const Position, const Orientation>().each(
+            [&](entt::entity e, const Position& pos, const Orientation& orient) {
+                const glm::mat4 t = glm::translate(glm::mat4(1.0f), pos.value);
+                const glm::mat4 r = glm::mat4_cast(orient.value);
+                foamTransforms[static_cast<int>(e)] = t * r;
+            });
+
         OrthographicCamera camera;
         camera.origin = glm::vec3(0.0f, 0.0f, -5.0f);
         camera.lookAt = glm::vec3(0.0f, 0.0f, 0.0f);
         camera.up = glm::vec3(0.0f, 1.0f, 0.0f);
         camera.width = windowSize.x;
         camera.height = windowSize.y;
-        renderSubsystem.update(particleRegistry, foamAdjacencyLists, foamBVHs, foamAABBs, camera, windowSize);
+        renderSubsystem.update(particleRegistry, foamAdjacencyLists, foamBVHs, foamAABBs, foamTransforms, camera, windowSize);
     }
 
     void Simulation::step(const UserInput& input, float deltaTime) {

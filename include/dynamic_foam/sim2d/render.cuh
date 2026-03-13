@@ -10,6 +10,7 @@
 #define GLM_FORCE_CUDA
 #include <entt/entt.hpp>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
 #include <cuda_runtime.h>
 #include <unordered_map>
 
@@ -68,6 +69,9 @@ __global__ void k_broadphase_collision(
 // surface_mask is a per-particle boolean array (uint8_t, 1 = surface).
 // Leaf hits against interior particles (mask == 0) are discarded, so only
 // surface particles reach the exact collision stage.
+// foam_inv_transforms is a per-foam array of inverse world-to-local transforms
+// indexed by foam_id. Rays are transformed into each foam's local space before
+// BVH traversal since BVH nodes are built in local particle coordinates.
 __global__ void k_narrowphase_collision(
     const glm::vec3*     ray_origins,
     const glm::vec3*     ray_dirs,
@@ -76,6 +80,7 @@ __global__ void k_narrowphase_collision(
     const BVHNode*       bvh_nodes,
     const int*           bvh_offsets,
     const uint8_t*       surface_mask,
+    const glm::mat4*     foam_inv_transforms,
     NarrowphaseHit*      narrowphase_hits,
     int*                 hit_counter
 );
@@ -130,11 +135,15 @@ public:
 
     // foamAdjacencyLists is non-const: dirty flags are cleared after each
     // GPU rebuild via adj.clearDirty().
+    // foamTransforms maps foam_id -> world transform (position * rotation mat4).
+    // Their inverses are computed on the host and uploaded so the narrowphase
+    // kernel can transform rays into each foam's local BVH space.
     void update(
         const entt::registry&                                  particleRegistry,
         std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
         const std::unordered_map<int, BVH>&                   foamBVHs,
         const std::unordered_map<int, AABB>&                  foamAABBs,
+        const std::unordered_map<int, glm::mat4>&             foamTransforms,
         const OrthographicCamera&                             camera,
         const glm::ivec2&                                     windowSize
     );
@@ -217,6 +226,12 @@ private:
     // CSR. Rebuilt whenever any foam adjacency list is dirty.
     int*   d_particle_to_sorted_   = nullptr;
     size_t cap_particle_to_sorted_ = 0;
+
+    // Per-foam inverse world-to-local transforms — one mat4 per foam, indexed
+    // by foam_id. Used in k_narrowphase_collision to transform rays into the
+    // foam's local BVH coordinate space.
+    glm::mat4* d_foam_inv_transforms_   = nullptr;
+    size_t     cap_foam_inv_transforms_ = 0;
 
     // Final pixel output
     glm::vec4* d_output_buffer_   = nullptr;

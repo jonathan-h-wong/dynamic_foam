@@ -60,6 +60,7 @@ __global__ void k_narrowphase_collision(
     const BVHNode*       bvh_nodes,
     const int*           bvh_offsets,
     const uint8_t*       surface_mask,
+    const glm::mat4*     foam_inv_transforms,
     NarrowphaseHit*      narrowphase_hits,
     int*                 hit_counter
 ) {
@@ -69,9 +70,13 @@ __global__ void k_narrowphase_collision(
     const BroadphaseHit b_hit   = broadphase_hits[hit_idx];
     const int           ray_idx = b_hit.ray_idx;
 
-    const glm::vec3 origin  = ray_origins[ray_idx];
-    const glm::vec3 dir     = ray_dirs[ray_idx];
-    const glm::vec3 inv_dir = 1.0f / dir;
+    // Transform the world-space ray into this foam's local BVH space.
+    // BVH nodes were built in local particle coordinates, so rays must be
+    // expressed in the same space before traversal.
+    const glm::mat4& inv_xform    = foam_inv_transforms[b_hit.foam_id];
+    const glm::vec3  origin       = glm::vec3(inv_xform * glm::vec4(ray_origins[ray_idx], 1.0f));
+    const glm::vec3  dir          = glm::vec3(inv_xform * glm::vec4(ray_dirs[ray_idx],    0.0f));
+    const glm::vec3  inv_dir      = 1.0f / dir;
 
     const BVHNode* foam_bvh = &bvh_nodes[bvh_offsets[b_hit.foam_id]];
 
@@ -87,7 +92,7 @@ __global__ void k_narrowphase_collision(
             if (node.prim_idx >= 0) {
                 if (surface_mask[node.prim_idx]) {
                     int narrow_hit_idx = atomicAdd(hit_counter, 1);
-                    narrowphase_hits[narrow_hit_idx] = {ray_idx, node.prim_idx, t_hit};
+                    narrowphase_hits[narrow_hit_idx] = {ray_idx, node.prim_idx, b_hit.foam_id, t_hit};
                 }
             } else {
                 if (stack_ptr < 62) {
@@ -251,6 +256,7 @@ void Render::update(
     std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
     const std::unordered_map<int, BVH>& foamBVHs,
     const std::unordered_map<int, AABB>& foamAABBs,
+    const std::unordered_map<int, glm::mat4>& foamTransforms,
     const OrthographicCamera& camera,
     const glm::ivec2& windowSize
 ) {
@@ -438,6 +444,21 @@ void Render::update(
                           num_foams * sizeof(int),  cudaMemcpyHostToDevice));
 
     // ------------------------------------------------------------------
+    // Per-foam inverse transforms — one mat4 per foam, indexed by foam_id.
+    // Computed on the host to avoid matrix inversion in the kernel.
+    // ------------------------------------------------------------------
+
+    std::vector<glm::mat4> h_foam_inv_transforms(num_foams, glm::mat4(1.0f));
+    for (const auto& [id, mat] : foamTransforms) {
+        if (id >= 0 && id < num_foams)
+            h_foam_inv_transforms[id] = glm::inverse(mat);
+    }
+
+    cuda_realloc_if_needed(&d_foam_inv_transforms_, &cap_foam_inv_transforms_, num_foams);
+    CUDA_CHECK(cudaMemcpy(d_foam_inv_transforms_, h_foam_inv_transforms.data(),
+                          num_foams * sizeof(glm::mat4), cudaMemcpyHostToDevice));
+
+    // ------------------------------------------------------------------
     // BVH nodes consolidated into a single flat buffer
     // ------------------------------------------------------------------
 
@@ -504,6 +525,7 @@ void Render::update(
         d_broadphase_hits_, num_broadphase_hits,
         d_bvh_nodes_,   d_bvh_offsets_,
         d_surface_mask_,
+        d_foam_inv_transforms_,
         d_narrowphase_hits_, d_narrowphase_hit_counter_
     );
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -620,6 +642,7 @@ void Render::free_device_memory() {
     f(d_particle_to_sorted_);        d_particle_to_sorted_        = nullptr;
     f(d_foam_node_offsets_ptrs_);    d_foam_node_offsets_ptrs_    = nullptr;
     f(d_foam_nbrs_ptrs_);            d_foam_nbrs_ptrs_            = nullptr;
+    f(d_foam_inv_transforms_);       d_foam_inv_transforms_       = nullptr;
     f(d_output_buffer_);             d_output_buffer_             = nullptr;
 
     for (auto& [id, gpu_adj] : foam_gpu_adj_)
