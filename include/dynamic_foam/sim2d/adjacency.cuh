@@ -56,8 +56,9 @@ struct AdjacencyListGPU {
 };
 
 // =============================================================================
-// Kernels
+// Kernels — compiled by NVCC only
 // =============================================================================
+#ifdef __CUDACC__
 namespace {
 
 // Remap raw node IDs in a COO buffer to their sorted positions.
@@ -84,7 +85,8 @@ __global__ void buildInverseMapKernel(
     if (i < n) inverse_map[sorted_ids[i]] = i;
 }
 
-}
+} // anonymous namespace
+#endif // __CUDACC__
 
 // =============================================================================
 // AdjacencyList
@@ -152,7 +154,10 @@ public:
         nodeHeads[a] = idxAB;
         nodeHeads[b] = idxBA;
 
-        cooDirty = true;
+        coo_src.push_back(a);
+        coo_dst.push_back(b);
+        coo_src.push_back(b);
+        coo_dst.push_back(a);
     }
 
     void addNodeEdges(T nodeId, const std::vector<T>& connections) {
@@ -209,7 +214,7 @@ public:
             idx = edges[idx].next_out;
         }
     }
-    
+
     // Reconstructs an unordered_map view for compatibility. Allocates -- avoid
     // calling this every frame.
     std::unordered_map<T, std::unordered_set<T>> getAdjList() const {
@@ -225,14 +230,29 @@ public:
         return result;
     }
 
-    // Rebuild COO if dirty, then return the flat directed edge arrays.
-    // Both arrays contain all directed half-edges (2 per undirected edge).
-    const std::vector<T>& getCOOSrc() { rebuildCOOIfDirty(); return coo_src; }
-    const std::vector<T>& getCOODst() { rebuildCOOIfDirty(); return coo_dst; }
-    bool isCOODirty() const { return cooDirty; }
+    // Returns the flat directed COO edge arrays. Always current — no lazy
+    // rebuild needed since mutations update the COO eagerly.
+    const std::vector<T>& getCOOSrc() const { return coo_src; }
+    const std::vector<T>& getCOODst() const { return coo_dst; }
+
+    // Returns node IDs in insertion order. Used by the render layer to build
+    // the per-foam slice of the flat position/color/surface-mask buffers in
+    // a deterministic order that matches the GPU CSR's sorted node layout.
+    // Call after buildGPUAdjacencyList so that insertion order matches the
+    // order nodes were added (which is the same order used for the nodes[]
+    // buffer when d_morton_sorted_ids is null).
+    std::vector<T> getOrderedNodeIds() const {
+        std::vector<T> ids;
+        ids.reserve(nodeHeads.size());
+        for (const auto& [node, _] : nodeHeads)
+            ids.push_back(node);
+        return ids;
+    }
+
+    uint32_t nodeCount() const { return static_cast<uint32_t>(nodeHeads.size()); }
 
     // -------------------------------------------------------------------------
-    // buildGPUAdjacencyList
+    // buildGPUAdjacencyList — compiled by NVCC only
     //
     // Constructs a CSR adjacency list entirely on the GPU from the current
     // COO edge list.
@@ -246,12 +266,12 @@ public:
     //
     // stream               All GPU work is issued onto this stream.
     // -------------------------------------------------------------------------
+#ifdef __CUDACC__
     void buildGPUAdjacencyList(
         AdjacencyListGPU<T>& out,
         const uint32_t*      d_morton_sorted_ids = nullptr,
         cudaStream_t         stream = 0)
     {
-        rebuildCOOIfDirty();
 
         const uint32_t N = static_cast<uint32_t>(nodeHeads.size());
         const uint32_t E = static_cast<uint32_t>(coo_src.size());
@@ -393,6 +413,7 @@ public:
         CUDA_CHECK(cudaFree(d_num_runs));
         CUDA_CHECK(cudaFree(d_degrees));
     }
+#endif // __CUDACC__
 
 private:
 
@@ -417,10 +438,9 @@ private:
     // O(1) existence check. Does not store neighbor data.
     std::unordered_set<uint64_t> edgeIndex;
 
-    // COO cache -- rebuilt lazily from edges[] on demand
+    // COO cache — kept current eagerly by all mutation methods
     std::vector<T> coo_src;
     std::vector<T> coo_dst;
-    bool cooDirty = false;
 
     // -------------------------------------------------------------------------
     // Internal helpers
@@ -474,15 +494,14 @@ private:
                 freeList.push(idxAB);
                 freeList.push(idxBA);
 
-                cooDirty = true;
+                rebuildCOO();
                 return;
             }
             cursor = &e.next_out;
         }
     }
 
-    void rebuildCOOIfDirty() {
-        if (!cooDirty) return;
+    void rebuildCOO() {
         coo_src.clear();
         coo_dst.clear();
         for (const auto& e : edges) {
@@ -491,7 +510,6 @@ private:
                 coo_dst.push_back(e.dst);
             }
         }
-        cooDirty = false;
     }
 };
 
