@@ -1,7 +1,7 @@
 #pragma once
 #include <glm/glm.hpp>
 #include <entt/entt.hpp>
-#include "dynamic_foam/Sim2D/adjacency.h"
+#include "dynamic_foam/Sim2D/adjacency.cuh"
 #include "dynamic_foam/Sim2D/bvh.cuh"
 #include "dynamic_foam/Sim2D/scenegraph.h"
 #include "dynamic_foam/Sim2D/user_input.h"
@@ -30,7 +30,7 @@ class Simulation {
             entt::registry& particleRegistry,
             float deltaTime);
         void render(
-            entt::registry& particleRegistry, 
+            const entt::registry& particleRegistry, 
             const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
             const std::unordered_map<int, BVH>& foamBVHs,
             const std::unordered_map<int, AABB>& foamAABBs
@@ -47,6 +47,8 @@ class Simulation {
         std::unordered_map<int, AABB> foamAABBs;
         std::unordered_map<int, AABB> particleAABBs;
         
+        glm::ivec2 windowSize_;
+
         Topology topologySubsystem;
         Physics physicsSubsystem;
         Render renderSubsystem;

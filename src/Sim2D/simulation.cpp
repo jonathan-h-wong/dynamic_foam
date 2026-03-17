@@ -7,7 +7,7 @@ namespace DynamicFoam::Sim2D {
     Simulation::Simulation(
         const SceneGraph& sceneGraph, 
         const glm::ivec2& windowSize
-    ) : renderSubsystem(windowSize) {
+    ) : renderSubsystem(), windowSize_(windowSize) {
         // Creates rigid body and particle registries
         // For each foam, this creates 1 rigid body and N particles, and populates registries
         for (const auto& [foamId, foam] : sceneGraph.foams) {
@@ -42,8 +42,8 @@ namespace DynamicFoam::Sim2D {
 
             // Add RB to central Adjacency List registry
             foamAdjacencyLists[static_cast<int>(rigidBody)] = AdjacencyList<entt::entity>(
-                foam.adjacencyList, 
-                [&](int p_id) { return particleMap.at(p_id); }
+                foam.adjacencyList,
+                std::function<entt::entity(int)>([&](int p_id) { return particleMap.at(p_id); })
             );
 
             std::vector<glm::vec3> world_positions;
@@ -51,7 +51,7 @@ namespace DynamicFoam::Sim2D {
             std::unordered_map<int, float> masses;
 
             // Set Particle components
-            std::vector<AABB> particleAABBs;
+            std::unordered_map<int, AABB> particleAABBs;
             for (const auto& [particleId, localPos] : foam.particlePosition) {
                 auto particle = particleMap.at(particleId);
 
@@ -67,7 +67,7 @@ namespace DynamicFoam::Sim2D {
 
                 auto [min, max] = calculateAABB(p_verts);
                 AABB particle_aabb(min, max);
-                particleAABBs[particleId] = particle_aabb;
+                particleAABBs.emplace(particleId, particle_aabb);
 
                 glm::vec3 worldPos = glm::vec3(transform * glm::vec4(localPos, 1.0f));
                 particleRegistry.emplace<ParticleWorldPosition>(particle, worldPos);
@@ -83,10 +83,20 @@ namespace DynamicFoam::Sim2D {
                 }
             }
 
-            // Build BVH for the foam's particles
+            // Build BVH for the foam's particles.
+            // AABBs must be ordered by getOrderedNodeIds() so that BVH prim_idx
+            // matches the foam-local sorted position used by the narrowphase kernel.
             if (!particleAABBs.empty()) {
+                const auto& ordered = foamAdjacencyLists.at(static_cast<int>(rigidBody)).getOrderedNodeIds();
+                std::unordered_map<entt::entity, int> entity_to_pid;
+                for (const auto& [pid, e] : particleMap)
+                    entity_to_pid[e] = pid;
+                std::vector<AABB> ordered_aabbs;
+                ordered_aabbs.reserve(ordered.size());
+                for (auto e : ordered)
+                    ordered_aabbs.push_back(particleAABBs.at(entity_to_pid.at(e)));
                 BVH bvh;
-                bvh.build(particleAABBs.data(), particleAABBs.size());
+                bvh.build(ordered_aabbs.data(), ordered_aabbs.size());
                 foamBVHs[static_cast<int>(rigidBody)] = std::move(bvh);
             }
 
@@ -127,8 +137,8 @@ namespace DynamicFoam::Sim2D {
 
     void Simulation::handleUserInput(const UserInput& input) {
         // Convert from ImGui screen coordinates (top-left origin) to world coordinates (center origin)
-        float world_x = input.mouse_pos.x - windowSize.x / 2.0f;
-        float world_y = -(input.mouse_pos.y - windowSize.y / 2.0f); // Flip y-axis
+        float world_x = input.mouse_pos.x - windowSize_.x / 2.0f;
+        float world_y = -(input.mouse_pos.y - windowSize_.y / 2.0f); // Flip y-axis
 
         foamRegistry.view<Controller, Position>().each([&](auto entity, auto& pos) {
             pos.value = glm::vec3(world_x, world_y, 0.0f);
@@ -152,7 +162,7 @@ namespace DynamicFoam::Sim2D {
     }
 
     void Simulation::render(
-        const entt::registry& particleRegistry, 
+        const entt::registry& particleRegistry,
         const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
         const std::unordered_map<int, BVH>& foamBVHs,
         const std::unordered_map<int, AABB>& foamAABBs
@@ -172,9 +182,9 @@ namespace DynamicFoam::Sim2D {
         camera.origin = glm::vec3(0.0f, 0.0f, -5.0f);
         camera.lookAt = glm::vec3(0.0f, 0.0f, 0.0f);
         camera.up = glm::vec3(0.0f, 1.0f, 0.0f);
-        camera.width = windowSize.x;
-        camera.height = windowSize.y;
-        renderSubsystem.update(particleRegistry, foamAdjacencyLists, foamBVHs, foamAABBs, foamTransforms, camera, windowSize);
+        camera.width = windowSize_.x;
+        camera.height = windowSize_.y;
+        renderSubsystem.update(particleRegistry, foamAdjacencyLists, foamBVHs, foamAABBs, foamTransforms, camera, windowSize_);
     }
 
     void Simulation::step(const UserInput& input, float deltaTime) {
