@@ -3,12 +3,13 @@
 
 #pragma once
 #include <random>
+#define NOMINMAX
 #include <cuda_runtime.h>
 #include <glm/glm.hpp>
 #include <glm/mat3x3.hpp>
 
 #include "dynamic_foam/Sim2D/utils.h"
-#include "dynamic_foam/Sim2D/adjacency.h"
+#include "dynamic_foam/Sim2D/adjacency.cuh"
 
 namespace DynamicFoam::Sim2D {
 
@@ -319,20 +320,20 @@ std::pair<glm::vec3, glm::vec3> calculateAABB(
         return {glm::vec3(0.0f), glm::vec3(0.0f)};
     }
 
-    glm::vec3 min = positions[0];
-    glm::vec3 max = positions[0];
+    glm::vec3 lo = positions[0];
+    glm::vec3 hi = positions[0];
 
     for (size_t i = 1; i < positions.size(); ++i) {
         const glm::vec3& pos = positions[i];
-        min.x = std::min(min.x, pos.x);
-        min.y = std::min(min.y, pos.y);
-        min.z = std::min(min.z, pos.z);
-        max.x = std::max(max.x, pos.x);
-        max.y = std::max(max.y, pos.y);
-        max.z = std::max(max.z, pos.z);
+        lo.x = std::min(lo.x, pos.x);
+        lo.y = std::min(lo.y, pos.y);
+        lo.z = std::min(lo.z, pos.z);
+        hi.x = std::max(hi.x, pos.x);
+        hi.y = std::max(hi.y, pos.y);
+        hi.z = std::max(hi.z, pos.z);
     }
 
-    return {min, max};
+    return {lo, hi};
 }
 
 // Count cycles in the air cell subgraph

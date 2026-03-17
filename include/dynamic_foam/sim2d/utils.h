@@ -8,7 +8,7 @@
 #include <glm/glm.hpp>
 #include <glm/mat3x3.hpp>
 
-#include "dynamic_foam/Sim2D/adjacency.h"
+#include "dynamic_foam/Sim2D/adjacency.cuh"
 
 // CGAL header-only setup with faster kernel
 #include <CGAL/Delaunay_triangulation_3.h>

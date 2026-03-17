@@ -3,7 +3,7 @@
 #include <glm/glm.hpp>
 #include <stdexcept>
 #include <unordered_map>
-#include "dynamic_foam/Sim2D/adjacency.h"
+#include "dynamic_foam/Sim2D/adjacency.cuh"
 #include "dynamic_foam/Sim2D/utils.h"
 
 namespace DynamicFoam::Sim2D {
