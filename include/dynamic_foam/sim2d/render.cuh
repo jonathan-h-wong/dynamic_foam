@@ -14,7 +14,7 @@
 #include <cuda_runtime.h>
 #include <unordered_map>
 
-#include "dynamic_foam/Sim2D/adjacency.h"
+#include "dynamic_foam/Sim2D/adjacency.cuh"
 #include "dynamic_foam/Sim2D/bvh.cuh"
 #include "dynamic_foam/Sim2D/cuda_utils.cuh"
 
@@ -81,6 +81,7 @@ __global__ void k_narrowphase_collision(
     const int*           bvh_offsets,
     const uint8_t*       surface_mask,
     const glm::mat4*     foam_inv_transforms,
+    const int*           foam_particle_offsets,
     NarrowphaseHit*      narrowphase_hits,
     int*                 hit_counter
 );
@@ -99,15 +100,16 @@ __global__ void k_extract_ray_idx(
 
 // One thread per ray that received narrowphase hits.
 // Performs a generalized Voronoi slab test against each candidate particle,
-// using per-foam CSR adjacency buffers passed as device pointer tables.
+// using flat concatenated CSR buffers (all foams packed end-to-end).
 //
-// foam_node_offsets   Device array of per-foam node_offsets pointers.
-//                     foam_node_offsets[foam_id][i] is the start of node i's
-//                     neighbor run in foam_nbrs[foam_id].
-// foam_nbrs           Device array of per-foam neighbor index arrays.
-//                     Indices are global dense particle IDs.
-// particle_to_sorted  Maps global dense particle index -> local sorted
-//                     position within that particle's foam CSR.
+// csr_node_offsets    Flat array of per-node neighbor run starts.
+//                     csr_node_offsets[csr_offsets[fid] + local_idx] gives
+//                     the start of that node's neighbor run.
+// csr_nbrs            Flat array of neighbor indices (foam-local sorted pos).
+// csr_offsets         csr_offsets[fid] = start of foam fid's block in
+//                     csr_node_offsets.
+// foam_particle_offsets  foam_particle_offsets[fid] = start of foam fid's
+//                        particles in the flat position/color buffers.
 __global__ void k_exact_collision(
     const glm::vec3*      ray_origins,
     const glm::vec3*      ray_dirs,
@@ -115,9 +117,10 @@ __global__ void k_exact_collision(
     const int*            unique_ray_ids,
     const int*            ray_hit_offsets,
     const int*            ray_hit_counts,
-    const uint32_t**      foam_node_offsets,
-    const uint32_t**      foam_nbrs,
-    const int*            particle_to_sorted,
+    const uint32_t*       csr_node_offsets,
+    const uint32_t*       csr_nbrs,
+    const int*            csr_offsets,
+    const int*            foam_particle_offsets,
     const glm::vec3*      particle_positions,
     const glm::vec4*      particle_colors,
     glm::vec4*            output_buffer,
@@ -133,14 +136,13 @@ public:
     Render();
     ~Render();
 
-    // foamAdjacencyLists is non-const: dirty flags are cleared after each
-    // GPU rebuild via adj.clearDirty().
+    // All arguments are const: the render subsystem only reads simulation state.
     // foamTransforms maps foam_id -> world transform (position * rotation mat4).
     // Their inverses are computed on the host and uploaded so the narrowphase
     // kernel can transform rays into each foam's local BVH space.
     void update(
-        const entt::registry&                                  particleRegistry,
-        std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
+        const entt::registry&                                        particleRegistry,
+        const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
         const std::unordered_map<int, BVH>&                   foamBVHs,
         const std::unordered_map<int, AABB>&                  foamAABBs,
         const std::unordered_map<int, glm::mat4>&             foamTransforms,
@@ -211,21 +213,24 @@ private:
     glm::vec4* d_particle_colors_    = nullptr;
     size_t     cap_particles_        = 0;
 
-    // Per-foam GPU adjacency lists — persistent across frames, rebuilt only
-    // when a foam's topology changes (isCOODirty()).
+    // Per-foam GPU adjacency lists
     std::unordered_map<int, AdjacencyListGPU<entt::entity>> foam_gpu_adj_;
 
-    // Device pointer tables — one entry per foam, pointing into the
-    // corresponding foam's AdjacencyListGPU buffers.
-    // Uploaded whenever foam_gpu_adj_ changes.
-    uint32_t** d_foam_node_offsets_ptrs_ = nullptr;
-    uint32_t** d_foam_nbrs_ptrs_         = nullptr;
-    size_t     cap_foam_ptr_table_       = 0;
+    // Flat concatenated CSR — all foams packed end-to-end.
+    // csr_node_offsets[csr_offsets[fid] + local_idx] = neighbor run start.
+    // csr_nbrs entries are foam-local sorted positions.
+    // Rebuilt from host each frame alongside particle buffers.
+    uint32_t* d_csr_node_offsets_   = nullptr;
+    size_t    cap_csr_node_offsets_ = 0;
+    uint32_t* d_csr_nbrs_           = nullptr;
+    size_t    cap_csr_nbrs_         = 0;
 
-    // Maps global dense particle index -> local sorted position in its foam's
-    // CSR. Rebuilt whenever any foam adjacency list is dirty.
-    int*   d_particle_to_sorted_   = nullptr;
-    size_t cap_particle_to_sorted_ = 0;
+    // Per-foam offset tables (one int per foam).
+    // d_csr_offsets_[fid]           = start of foam fid in d_csr_node_offsets_.
+    // d_foam_particle_offsets_[fid] = start of foam fid in flat particle arrays.
+    int*   d_csr_offsets_            = nullptr;
+    int*   d_foam_particle_offsets_  = nullptr;
+    size_t cap_foam_offsets_         = 0;
 
     // Per-foam inverse world-to-local transforms — one mat4 per foam, indexed
     // by foam_id. Used in k_narrowphase_collision to transform rays into the
