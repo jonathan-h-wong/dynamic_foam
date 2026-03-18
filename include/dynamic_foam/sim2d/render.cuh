@@ -150,6 +150,8 @@ public:
         const glm::ivec2&                                     windowSize
     );
 
+    const glm::vec4* deviceOutputBuffer() const { return d_output_buffer_; }
+
 private:
     void free_device_memory();
 
