@@ -46,7 +46,6 @@ namespace DynamicFoam::Sim2D {
                 std::function<entt::entity(int)>([&](int p_id) { return particleMap.at(p_id); })
             );
 
-            std::vector<glm::vec3> world_positions;
             std::unordered_map<int, glm::vec3> local_positions;
             std::unordered_map<int, float> masses;
 
@@ -71,7 +70,6 @@ namespace DynamicFoam::Sim2D {
 
                 glm::vec3 worldPos = glm::vec3(transform * glm::vec4(localPos, 1.0f));
                 particleRegistry.emplace<ParticleWorldPosition>(particle, worldPos);
-                world_positions.push_back(worldPos);
                 local_positions[particleId] = localPos;
 
                 if (foam.isStencil.at(particleId)) {
@@ -84,27 +82,11 @@ namespace DynamicFoam::Sim2D {
             }
 
             // Build BVH for the foam's particles.
-            // AABBs must be ordered by getOrderedNodeIds() so that BVH prim_idx
-            // matches the foam-local sorted position used by the narrowphase kernel.
-            if (!particleAABBs.empty()) {
-                const auto& ordered = foamAdjacencyLists.at(static_cast<int>(rigidBody)).getOrderedNodeIds();
-                std::unordered_map<entt::entity, int> entity_to_pid;
-                for (const auto& [pid, e] : particleMap)
-                    entity_to_pid[e] = pid;
-                std::vector<AABB> ordered_aabbs;
-                ordered_aabbs.reserve(ordered.size());
-                for (auto e : ordered)
-                    ordered_aabbs.push_back(particleAABBs.at(entity_to_pid.at(e)));
-                BVH bvh;
-                bvh.build(ordered_aabbs.data(), ordered_aabbs.size());
-                foamBVHs[static_cast<int>(rigidBody)] = std::move(bvh);
-            }
+            if (!particleAABBs.empty())
+                buildBVH(rigidBody, particleAABBs, particleMap);
 
             // Define worldspace AABB
-            if (!world_positions.empty()) {
-                auto [min, max] = calculateAABB(world_positions);
-                foamAABBs[static_cast<int>(rigidBody)] = AABB(min, max);
-            }
+            buildAABB(rigidBody);
 
             // Find and emplace surface particles
             auto surface_cells = findSurfaceCells(foam.adjacencyList, foam.particleOpacity);
@@ -114,6 +96,36 @@ namespace DynamicFoam::Sim2D {
 
 
         }
+    }
+
+    void Simulation::buildAABB(entt::entity foamEntity) {
+        const auto& ordered = foamAdjacencyLists.at(static_cast<int>(foamEntity)).getOrderedNodeIds();
+        std::vector<glm::vec3> world_positions;
+        world_positions.reserve(ordered.size());
+        for (auto e : ordered)
+            world_positions.push_back(particleRegistry.get<ParticleWorldPosition>(e).value);
+        if (!world_positions.empty()) {
+            auto [min, max] = calculateAABB(world_positions);
+            foamAABBs[static_cast<int>(foamEntity)] = AABB(min, max);
+        }
+    }
+
+    void Simulation::buildBVH(
+        entt::entity foamEntity,
+        const std::unordered_map<int, AABB>& particleAABBs,
+        const std::unordered_map<int, entt::entity>& particleMap
+    ) {
+        const auto& ordered = foamAdjacencyLists.at(static_cast<int>(foamEntity)).getOrderedNodeIds();
+        std::unordered_map<entt::entity, int> entity_to_pid;
+        for (const auto& [pid, e] : particleMap)
+            entity_to_pid[e] = pid;
+        std::vector<AABB> ordered_aabbs;
+        ordered_aabbs.reserve(ordered.size());
+        for (auto e : ordered)
+            ordered_aabbs.push_back(particleAABBs.at(entity_to_pid.at(e)));
+        BVH bvh;
+        bvh.build(ordered_aabbs.data(), ordered_aabbs.size());
+        foamBVHs[static_cast<int>(foamEntity)] = std::move(bvh);
     }
 
     void Simulation::applyForwardKinematics(
