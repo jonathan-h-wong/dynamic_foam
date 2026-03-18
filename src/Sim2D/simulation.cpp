@@ -116,22 +116,44 @@ namespace DynamicFoam::Sim2D {
         }
     }
 
-    void Simulation::applyForwardKinematics(entt::entity controllerFoam) {
-        const auto& pos = foamRegistry.get<Position>(controllerFoam);
-        const auto& orient = foamRegistry.get<Orientation>(controllerFoam);
+    void Simulation::applyForwardKinematics(
+        entt::entity foamEntity,
+        const std::optional<std::unordered_set<entt::entity>>& particleSubset
+    ) {
+        const auto& pos = foamRegistry.get<Position>(foamEntity);
+        const auto& orient = foamRegistry.get<Orientation>(foamEntity);
 
         glm::mat4 translationMatrix = glm::translate(glm::mat4(1.0f), pos.value);
         glm::mat4 rotationMatrix = glm::mat4_cast(orient.value);
         glm::mat4 transform = translationMatrix * rotationMatrix;
 
-        auto foamId = static_cast<int>(controllerFoam);
-        if (foamAdjacencyLists.count(foamId)) {
-            const auto& adjList = foamAdjacencyLists.at(foamId).getAdjList();
-            for (const auto& [particleEntity, neighbors] : adjList) {
-                auto& worldPos = particleRegistry.get<ParticleWorldPosition>(particleEntity);
-                const auto& localPos = particleRegistry.get<ParticleLocalPosition>(particleEntity);
-                worldPos.value = glm::vec3(transform * glm::vec4(localPos.value, 1.0f));
+        const int foamId = static_cast<int>(foamEntity);
+        if (!foamAdjacencyLists.count(foamId)) return;
+
+        const auto& adjList = foamAdjacencyLists.at(foamId);
+        const auto allParticles = adjList.getOrderedNodeIds();
+
+        // Build the update buffer: validate and use the subset if provided, otherwise use all particles.
+        const std::unordered_set<entt::entity> foamParticleSet(allParticles.begin(), allParticles.end());
+        const std::vector<entt::entity>* updateBuffer = &allParticles;
+        std::vector<entt::entity> subsetBuffer;
+        if (particleSubset.has_value()) {
+            for (const auto& particle : *particleSubset) {
+                if (!foamParticleSet.count(particle)) {
+                    throw std::invalid_argument(
+                        "Particle entity " + std::to_string(static_cast<uint32_t>(particle)) +
+                        " does not belong to foam " + std::to_string(foamId)
+                    );
+                }
             }
+            subsetBuffer.assign(particleSubset->begin(), particleSubset->end());
+            updateBuffer = &subsetBuffer;
+        }
+
+        for (const auto& particle : *updateBuffer) {
+            auto& worldPos = particleRegistry.get<ParticleWorldPosition>(particle);
+            const auto& localPos = particleRegistry.get<ParticleLocalPosition>(particle);
+            worldPos.value = glm::vec3(transform * glm::vec4(localPos.value, 1.0f));
         }
     }
 

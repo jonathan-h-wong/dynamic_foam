@@ -1,6 +1,9 @@
 #pragma once
 #include <glm/glm.hpp>
 #include <entt/entt.hpp>
+#include <optional>
+#include <stdexcept>
+#include <unordered_set>
 #include "dynamic_foam/Sim2D/adjacency.cuh"
 #include "dynamic_foam/Sim2D/bvh.cuh"
 #include "dynamic_foam/Sim2D/scenegraph.h"
@@ -38,14 +41,16 @@ class Simulation {
         void step(const UserInput& input, float deltaTime);
 
     private:
-        void applyForwardKinematics(entt::entity controllerFoam);
+        void applyForwardKinematics(
+            entt::entity foamEntity,
+            const std::optional<std::unordered_set<entt::entity>>& particleSubset = std::nullopt
+        );
         
         entt::registry foamRegistry;
         entt::registry particleRegistry;
         std::unordered_map<int, AdjacencyList<entt::entity>> foamAdjacencyLists;
         std::unordered_map<int, BVH> foamBVHs;
         std::unordered_map<int, AABB> foamAABBs;
-        std::unordered_map<int, AABB> particleAABBs;
         
         glm::ivec2 windowSize_;
 
