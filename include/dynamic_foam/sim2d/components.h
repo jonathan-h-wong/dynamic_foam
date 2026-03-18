@@ -9,6 +9,7 @@ namespace DynamicFoam::Sim2D {
     // ============================================================================
 
     // Persistent Components
+    // Initalized once per foam
     struct InertiaTensor {
         glm::mat3 value{1.0f}; // Identity matrix by default
     };
@@ -40,19 +41,12 @@ namespace DynamicFoam::Sim2D {
     // ============================================================================
 
     // Persistent Components
-    struct ParticleLocalPosition {
-        glm::vec3 value{0.0f};
-    };
+    // Initalized once per particle
     struct ParticleColor {
         glm::vec3 rgb{1.0f}; // White by default
     };
     struct ParticleOpacity {
         float value{1.0f};
-    };
-
-    // Transient Components
-    struct ParticleWorldPosition {
-        glm::vec3 value{0.0f};
     };
     struct ParticleMass {
         float value{1.0f};
@@ -61,6 +55,14 @@ namespace DynamicFoam::Sim2D {
         std::vector<glm::vec3> value;
     };
     struct Surface {};
+
+    // Transient Components
+    struct ParticleLocalPosition {
+        glm::vec3 value{0.0f};
+    };
+    struct ParticleWorldPosition {
+        glm::vec3 value{0.0f};
+    };
 
     // Persistent Particle Types
     struct Stencil {};
