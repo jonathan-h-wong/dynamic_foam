@@ -141,13 +141,13 @@ public:
     // Their inverses are computed on the host and uploaded so the narrowphase
     // kernel can transform rays into each foam's local BVH space.
     void update(
-        const entt::registry&                                        particleRegistry,
+        const std::unordered_map<int, AABB>&                         foamAABBs,
+        const std::unordered_map<int, BVH>&                          foamBVHs,
         const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-        const std::unordered_map<int, BVH>&                   foamBVHs,
-        const std::unordered_map<int, AABB>&                  foamAABBs,
-        const std::unordered_map<int, glm::mat4>&             foamTransforms,
-        const OrthographicCamera&                             camera,
-        const glm::ivec2&                                     windowSize
+        const entt::registry&                                        particleRegistry,
+        const std::unordered_map<int, glm::mat4>&                    foamTransforms,
+        const OrthographicCamera&                                    camera,
+        const glm::ivec2&                                            windowSize
     );
 
     const glm::vec4* deviceOutputBuffer() const { return d_output_buffer_; }

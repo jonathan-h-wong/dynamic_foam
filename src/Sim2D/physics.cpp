@@ -2,10 +2,12 @@
 
 namespace DynamicFoam::Sim2D {
     std::vector<entt::entity> Physics::update(
-        entt::registry& foamRegistry,
-        entt::registry& particleRegistry,
+        const std::unordered_map<int, AABB>&                         foamAABBs,
+        const std::unordered_map<int, BVH>&                          foamBVHs,
         const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-        float deltaTime
+        entt::registry&                                              foamRegistry,
+        const entt::registry&                                        particleRegistry,
+        float                                                        deltaTime
     ) {
         std::vector<entt::entity> updatedFoams;
         // TODO: Implement physics update logic

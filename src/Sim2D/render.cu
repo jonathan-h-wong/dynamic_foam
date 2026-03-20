@@ -266,13 +266,13 @@ Render::~Render() {
 }
 
 void Render::update(
-    const entt::registry& particleRegistry,
+    const std::unordered_map<int, AABB>&                         foamAABBs,
+    const std::unordered_map<int, BVH>&                          foamBVHs,
     const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-    const std::unordered_map<int, BVH>& foamBVHs,
-    const std::unordered_map<int, AABB>& foamAABBs,
-    const std::unordered_map<int, glm::mat4>& foamTransforms,
-    const OrthographicCamera& camera,
-    const glm::ivec2& windowSize
+    const entt::registry&                                        particleRegistry,
+    const std::unordered_map<int, glm::mat4>&                    foamTransforms,
+    const OrthographicCamera&                                    camera,
+    const glm::ivec2&                                            windowSize
 ) {
     const int num_rays  = windowSize.x * windowSize.y;
     const int num_foams = static_cast<int>(foamAABBs.size());

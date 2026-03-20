@@ -171,11 +171,11 @@ namespace DynamicFoam::Sim2D {
     }
 
     void Simulation::updateTopology(
-        entt::registry& foamRegistry,
-        entt::registry& particleRegistry,
-        std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists
+        const std::unordered_map<int, AABB>&                         foamAABBs,
+        const std::unordered_map<int, BVH>&                          foamBVHs,
+        std::unordered_map<int, AdjacencyList<entt::entity>>&        foamAdjacencyLists
     ) {
-        const auto results = topologySubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists);
+        const auto results = topologySubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, foamRegistry, particleRegistry);
         for (const auto& result : results) {
             // Refresh world positions for the affected particles.
             const std::unordered_set<entt::entity> particleSubset(
@@ -236,19 +236,19 @@ namespace DynamicFoam::Sim2D {
     }
 
     void Simulation::updatePhysics(
-        entt::registry& foamRegistry,
-        entt::registry& particleRegistry,
+        const std::unordered_map<int, AABB>&  foamAABBs,
+        const std::unordered_map<int, BVH>&   foamBVHs,
         float deltaTime) {
-        const auto updatedFoams = physicsSubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists, deltaTime);
+        const auto updatedFoams = physicsSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, foamRegistry, particleRegistry, deltaTime);
         for (const auto foamEntity : updatedFoams)
             buildAABB(foamEntity);
     }
 
     void Simulation::render(
-        const entt::registry& particleRegistry,
+        const std::unordered_map<int, AABB>&                         foamAABBs,
+        const std::unordered_map<int, BVH>&                          foamBVHs,
         const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-        const std::unordered_map<int, BVH>& foamBVHs,
-        const std::unordered_map<int, AABB>& foamAABBs
+        const entt::registry&                                        particleRegistry
     ) {
         // Build per-foam world transforms from position and orientation.
         // These are passed to the render subsystem so it can compute inverse
@@ -267,13 +267,13 @@ namespace DynamicFoam::Sim2D {
         camera.up = glm::vec3(0.0f, 1.0f, 0.0f);
         camera.width = windowSize_.x;
         camera.height = windowSize_.y;
-        renderSubsystem.update(particleRegistry, foamAdjacencyLists, foamBVHs, foamAABBs, foamTransforms, camera, windowSize_);
+        renderSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, foamTransforms, camera, windowSize_);
     }
 
     void Simulation::step(const UserInput& input, float deltaTime) {
         handleUserInput(input);
-        updateTopology(foamRegistry, particleRegistry, foamAdjacencyLists);
-        updatePhysics(foamRegistry, particleRegistry, deltaTime);
-        render(particleRegistry, foamAdjacencyLists, foamBVHs, foamAABBs);
+        updateTopology(foamAABBs, foamBVHs, foamAdjacencyLists);
+        updatePhysics(foamAABBs, foamBVHs, deltaTime);
+        render(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry);
     }
 };

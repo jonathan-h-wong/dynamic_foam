@@ -3,6 +3,7 @@
 #include <vector>
 #include <entt/entt.hpp>
 #include "dynamic_foam/Sim2D/adjacency.cuh"
+#include "dynamic_foam/Sim2D/bvh.cuh"
 #include "dynamic_foam/Sim2D/components.h"
 
 namespace DynamicFoam::Sim2D {
@@ -45,9 +46,11 @@ namespace DynamicFoam::Sim2D {
 
         // Returns one result per foam that was structurally modified this tick.
         std::vector<TopologyUpdateResult> update(
-            entt::registry& foamRegistry,
-            entt::registry& particleRegistry,
-            std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists
+            const std::unordered_map<int, AABB>&                         foamAABBs,
+            const std::unordered_map<int, BVH>&                          foamBVHs,
+            std::unordered_map<int, AdjacencyList<entt::entity>>&        foamAdjacencyLists,
+            entt::registry&                                              foamRegistry,
+            entt::registry&                                              particleRegistry
         );
     };
 }

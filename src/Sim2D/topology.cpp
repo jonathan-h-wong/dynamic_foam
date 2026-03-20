@@ -2,9 +2,11 @@
 
 namespace DynamicFoam::Sim2D {
     std::vector<TopologyUpdateResult> Topology::update(
-        entt::registry& foamRegistry,
-        entt::registry& particleRegistry,
-        std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists
+        const std::unordered_map<int, AABB>&                         foamAABBs,
+        const std::unordered_map<int, BVH>&                          foamBVHs,
+        std::unordered_map<int, AdjacencyList<entt::entity>>&        foamAdjacencyLists,
+        entt::registry&                                              foamRegistry,
+        entt::registry&                                              particleRegistry
     ) {
         std::vector<TopologyUpdateResult> results;
         // TODO: Implement topology update logic.

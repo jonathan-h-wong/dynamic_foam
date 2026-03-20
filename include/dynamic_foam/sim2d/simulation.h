@@ -25,18 +25,18 @@ class Simulation {
         // Subsystems
         void handleUserInput(const UserInput& input);
         void updateTopology(
-            entt::registry& foamRegistry,
-            entt::registry& particleRegistry,
-            std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists);
+            const std::unordered_map<int, AABB>&                         foamAABBs,
+            const std::unordered_map<int, BVH>&                          foamBVHs,
+            std::unordered_map<int, AdjacencyList<entt::entity>>&        foamAdjacencyLists);
         void updatePhysics(
-            entt::registry& foamRegistry,
-            entt::registry& particleRegistry,
+            const std::unordered_map<int, AABB>&                         foamAABBs,
+            const std::unordered_map<int, BVH>&                          foamBVHs,
             float deltaTime);
         void render(
-            const entt::registry& particleRegistry, 
+            const std::unordered_map<int, AABB>&                         foamAABBs,
+            const std::unordered_map<int, BVH>&                          foamBVHs,
             const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-            const std::unordered_map<int, BVH>& foamBVHs,
-            const std::unordered_map<int, AABB>& foamAABBs
+            const entt::registry&                                        particleRegistry
         );
         void step(const UserInput& input, float deltaTime);
 
