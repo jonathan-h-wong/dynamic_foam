@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 #include "dynamic_foam/Sim2D/adjacency.cuh"
 #include "dynamic_foam/Sim2D/utils.h"
 
@@ -28,24 +29,32 @@ namespace DynamicFoam::Sim2D {
         std::unordered_map<int, float> particleOpacity;
 
         Foam(
-            const AdjacencyList<int>& adjList,
+            const std::vector<int>& particleIds,
+            const std::vector<glm::vec3>& positions,
             const std::unordered_map<int, bool>& stencil,
             const std::unordered_map<int, bool>& mutable_map,
-            const std::unordered_map<int, glm::vec3>& position,
-            const std::unordered_map<int, std::vector<glm::vec3>>& vertices,
-            const std::unordered_map<int, float>& mass,
             const std::unordered_map<int, glm::vec3>& color,
             const std::unordered_map<int, float>& opacity,
             float density = 1.0f
-        ) : adjacencyList(adjList),
-            isStencil(stencil),
+        ) : isStencil(stencil),
             isMutable(mutable_map),
-            particlePosition(position),
-            particleVertices(vertices),
-            particleMass(mass),
             particleColor(color),
             particleOpacity(opacity),
             density(density) {
+            // Triangulate in original space (translation-invariant topology/volumes)
+            auto [adjList, volumeMap, voronoiVertices] = triangulateWithMetadata(positions, particleIds);
+            adjacencyList = adjList;
+            particleVertices = voronoiVertices;
+
+            // Build position and mass maps
+            for (size_t i = 0; i < particleIds.size(); ++i) {
+                int id = particleIds[i];
+                particlePosition[id] = positions[i];
+                particleMass[id] = (volumeMap.count(id) && volumeMap.at(id) > 0.0f)
+                    ? volumeMap.at(id) * density
+                    : 0.0f;
+            }
+
             validate();
             parentToCenterOfMass();
             intertiaTensor = calculateInertiaTensor(particlePosition, particleMass);
@@ -56,6 +65,12 @@ namespace DynamicFoam::Sim2D {
             glm::vec3 com = calculateCenterOfMass(particlePosition, particleMass);
             for (auto& [id, pos] : particlePosition) {
                 pos -= com;
+            }
+            // Shift voronoi vertices so they are also in CoM-local space
+            for (auto& [id, verts] : particleVertices) {
+                for (auto& v : verts) {
+                    v -= com;
+                }
             }
         }
 

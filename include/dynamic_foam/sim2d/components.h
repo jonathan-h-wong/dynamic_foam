@@ -52,6 +52,7 @@ namespace DynamicFoam::Sim2D {
     struct ParticleMass {
         float value{1.0f};
     };
+    // This is in localspace
     struct ParticleVertices {
         std::vector<glm::vec3> value;
     };

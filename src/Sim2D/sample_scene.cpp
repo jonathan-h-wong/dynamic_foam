@@ -1,5 +1,4 @@
 #include "dynamic_foam/Sim2D/sample_scene.h"
-#include "dynamic_foam/Sim2D/utils.h"
 
 namespace DynamicFoam::Sim2D {
     Foam generateFoamBar(
@@ -14,10 +13,8 @@ namespace DynamicFoam::Sim2D {
         
         std::vector<int> particleIds;
         std::vector<glm::vec3> positions;
-        std::unordered_map<int, glm::vec3> position;
         std::unordered_map<int, bool> stencil;
         std::unordered_map<int, bool> mutable_map;
-        std::unordered_map<int, float> mass;
         std::unordered_map<int, glm::vec3> color;
         std::unordered_map<int, float> opacity;
 
@@ -33,16 +30,14 @@ namespace DynamicFoam::Sim2D {
                 for (int k = 0; k < paddedDepth; ++k) {
                     int id = i * (paddedHeight * paddedDepth) + j * paddedDepth + k;
                     particleIds.push_back(id);
-
-                    float x = (i - 1) * dx - width / 2.0f;
-                    float y = (j - 1) * dy - height / 2.0f;
-                    float z = (k - 1) * dz - depth / 2.0f;
-                    glm::vec3 pos(x, y, z);
-                    position[id] = pos;
-                    positions.push_back(pos);
+                    positions.push_back(glm::vec3(
+                        (i - 1) * dx - width / 2.0f,
+                        (j - 1) * dy - height / 2.0f,
+                        (k - 1) * dz - depth / 2.0f
+                    ));
 
                     bool isPadding = (i == 0 || i == paddedWidth - 1 || j == 0 || j == paddedHeight - 1 || k == 0 || k == paddedDepth - 1);
-                    
+
                     stencil[id] = false;
                     mutable_map[id] = true;
                     color[id] = color_param;
@@ -51,31 +46,21 @@ namespace DynamicFoam::Sim2D {
             }
         }
 
-        auto [adjList, volumeMap, voronoiVertices] = triangulateWithMetadata(positions, particleIds);
-
-        for (const auto& id : particleIds) {
-            mass[id] = volumeMap[id] > 0.0f ? volumeMap[id] * density : 0.0f;
-        }
-
-        return Foam(adjList, stencil, mutable_map, position, voronoiVertices, mass, color, opacity, density);
+        return Foam(particleIds, positions, stencil, mutable_map, color, opacity, density);
     }
 
     Foam generateFoamPointCursor() {
         std::vector<int> particleIds;
         std::vector<glm::vec3> positions;
-        std::unordered_map<int, glm::vec3> position;
         std::unordered_map<int, bool> stencil;
         std::unordered_map<int, bool> mutable_map;
-        std::unordered_map<int, float> mass;
         std::unordered_map<int, glm::vec3> color;
         std::unordered_map<int, float> opacity;
 
         // Central particle
         int centerId = 0;
         particleIds.push_back(centerId);
-        glm::vec3 centerPos(0.0f, 0.0f, 0.0f);
-        position[centerId] = centerPos;
-        positions.push_back(centerPos);
+        positions.push_back(glm::vec3(0.0f, 0.0f, 0.0f));
         opacity[centerId] = 1.0f;
 
         // Surrounding particles on a sphere
@@ -97,22 +82,17 @@ namespace DynamicFoam::Sim2D {
 
             int id = id_counter++;
             particleIds.push_back(id);
-            glm::vec3 pos(x * radius, y * radius, z * radius);
-            position[id] = pos;
-            positions.push_back(pos);
+            positions.push_back(glm::vec3(x * radius, y * radius, z * radius));
             opacity[id] = 0.0f; // Padding particles
         }
-
-        auto [adjList, volumeMap, voronoiVertices] = triangulateWithMetadata(positions, particleIds);
 
         for (const auto& id : particleIds) {
             stencil[id] = true;
             mutable_map[id] = false;
-            mass[id] = volumeMap[id] > 0.0f ? volumeMap[id] : 0.0f;
             color[id] = glm::vec3(1.0f); // White
         }
 
-        return Foam(adjList, stencil, mutable_map, position, voronoiVertices, mass, color, opacity, 1.0f);
+        return Foam(particleIds, positions, stencil, mutable_map, color, opacity, 1.0f);
     }
 
     SceneGraph createSampleSceneGraph() {
