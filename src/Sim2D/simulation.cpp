@@ -50,7 +50,6 @@ namespace DynamicFoam::Sim2D {
             std::unordered_map<int, float> masses;
 
             // Set Particle components
-            std::unordered_map<int, AABB> particleAABBs;
             for (const auto& [particleId, localPos] : foam.particlePosition) {
                 auto particle = particleMap.at(particleId);
 
@@ -63,10 +62,6 @@ namespace DynamicFoam::Sim2D {
                 masses[particleId] = mass;
                 const auto& p_verts = foam.particleVertices.at(particleId);
                 particleRegistry.emplace<ParticleVertices>(particle, p_verts);
-
-                auto [min, max] = calculateAABB(p_verts);
-                AABB particle_aabb(min, max);
-                particleAABBs.emplace(particleId, particle_aabb);
 
                 glm::vec3 worldPos = glm::vec3(transform * glm::vec4(localPos, 1.0f));
                 particleRegistry.emplace<ParticleWorldPosition>(particle, worldPos);
@@ -82,8 +77,7 @@ namespace DynamicFoam::Sim2D {
             }
 
             // Build BVH for the foam's particles.
-            if (!particleAABBs.empty())
-                buildBVH(rigidBody, particleAABBs, particleMap);
+            buildBVH(rigidBody);
 
             // Define worldspace AABB
             buildAABB(rigidBody);
@@ -110,19 +104,15 @@ namespace DynamicFoam::Sim2D {
         }
     }
 
-    void Simulation::buildBVH(
-        entt::entity foamEntity,
-        const std::unordered_map<int, AABB>& particleAABBs,
-        const std::unordered_map<int, entt::entity>& particleMap
-    ) {
+    void Simulation::buildBVH(entt::entity foamEntity) {
         const auto& ordered = foamAdjacencyLists.at(static_cast<int>(foamEntity)).getOrderedNodeIds();
-        std::unordered_map<entt::entity, int> entity_to_pid;
-        for (const auto& [pid, e] : particleMap)
-            entity_to_pid[e] = pid;
         std::vector<AABB> ordered_aabbs;
         ordered_aabbs.reserve(ordered.size());
-        for (auto e : ordered)
-            ordered_aabbs.push_back(particleAABBs.at(entity_to_pid.at(e)));
+        for (auto e : ordered) {
+            const auto& verts = particleRegistry.get<ParticleVertices>(e).value;
+            auto [min, max] = calculateAABB(verts);
+            ordered_aabbs.push_back(AABB(min, max));
+        }
         BVH bvh;
         bvh.build(ordered_aabbs.data(), ordered_aabbs.size());
         foamBVHs[static_cast<int>(foamEntity)] = std::move(bvh);
@@ -185,14 +175,73 @@ namespace DynamicFoam::Sim2D {
         entt::registry& particleRegistry,
         std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists
     ) {
-        topologySubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists);
+        const auto results = topologySubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists);
+        for (const auto& result : results) {
+            // Refresh world positions for the affected particles.
+            const std::unordered_set<entt::entity> particleSubset(
+                result.updatedParticles.begin(), result.updatedParticles.end());
+            applyForwardKinematics(result.foamId, particleSubset);
+
+            // Rebuild BVH from current ParticleVertices in the registry.
+            buildBVH(result.foamId);
+
+            // A parent foam snapshot indicates a new foam was spawned from a topology change.
+            if (result.parentFoamSnapshot.has_value()) {
+                const FoamSnapshot& snap = *result.parentFoamSnapshot;
+
+                // Rebuild AABB of the parent using already-updated world positions.
+                buildAABB(snap.foamId);
+
+                // --- Populate the new foam's rigid body components ---
+
+                // Gather per-particle data needed for several derived quantities.
+                std::unordered_map<entt::entity, glm::vec3> localPositions;
+                std::unordered_map<entt::entity, glm::vec3> worldPositions;
+                std::unordered_map<entt::entity, float> masses;
+                for (const auto& particle : result.updatedParticles) {
+                    localPositions[particle] = particleRegistry.get<ParticleLocalPosition>(particle).value;
+                    worldPositions[particle] = particleRegistry.get<ParticleWorldPosition>(particle).value;
+                    masses[particle] = particleRegistry.get<ParticleMass>(particle).value;
+                }
+
+                // InertiaTensor: derived from the particles' local positions and masses.
+                foamRegistry.emplace_or_replace<InertiaTensor>(result.foamId,
+                    calculateInertiaTensor(localPositions, masses));
+
+                // Density: sourced from the parent snapshot.
+                foamRegistry.emplace_or_replace<Density>(result.foamId, snap.density.value);
+
+                // Foam type: spawned foams inherit Dynamic from the parent snapshot.
+                // Static and Controller types are not applicable here.
+                if (snap.isDynamic)
+                    foamRegistry.emplace_or_replace<Dynamic>(result.foamId);
+
+                // Position: center of mass computed from particle world positions and masses.
+                const glm::vec3 childPos = calculateCenterOfMass(worldPositions, masses);
+                foamRegistry.emplace_or_replace<Position>(result.foamId, childPos);
+
+                // Velocity: Chasles decomposition — v(p) = v_cm + ω × (p − p_cm).
+                // Derived entirely from the parent snapshot to avoid stale registry reads.
+                foamRegistry.emplace_or_replace<Velocity>(result.foamId,
+                    snap.velocity.value + glm::cross(snap.angularVelocity.value, childPos - snap.position.value));
+
+                // Orientation: sourced from the parent snapshot.
+                foamRegistry.emplace_or_replace<Orientation>(result.foamId, snap.orientation.value);
+
+                // AngularVelocity: sourced from the parent snapshot.
+                // By Chasles decomposition every sub-body of a rigid body shares the same ω.
+                foamRegistry.emplace_or_replace<AngularVelocity>(result.foamId, snap.angularVelocity.value);
+            }
+        }
     }
 
     void Simulation::updatePhysics(
         entt::registry& foamRegistry,
         entt::registry& particleRegistry,
         float deltaTime) {
-        physicsSubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists, deltaTime);
+        const auto updatedFoams = physicsSubsystem.update(foamRegistry, particleRegistry, foamAdjacencyLists, deltaTime);
+        for (const auto foamEntity : updatedFoams)
+            buildAABB(foamEntity);
     }
 
     void Simulation::render(

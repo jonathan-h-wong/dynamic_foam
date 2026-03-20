@@ -16,6 +16,12 @@ namespace DynamicFoam::Sim2D {
     struct Density {
         float value{1.0f};
     };
+    
+    // Persistent Foam Types
+    // Initialzed once per foam
+    struct Static {};
+    struct Dynamic {};
+    struct Controller {};
 
     // Transient Components
     struct Position {
@@ -30,11 +36,6 @@ namespace DynamicFoam::Sim2D {
     struct AngularVelocity {
         glm::vec3 value{0.0f};
     };
-
-    // Persistent Foam Types
-    struct Static {};
-    struct Dynamic {};
-    struct Controller {};
 
     // ============================================================================
     // Particle Components
@@ -56,6 +57,12 @@ namespace DynamicFoam::Sim2D {
     };
     struct Surface {};
 
+    // Persistent Particle Types
+    // Initialized once per particle
+    struct Stencil {};
+    struct Mutable {};
+    struct Immutable {};
+
     // Transient Components
     struct ParticleLocalPosition {
         glm::vec3 value{0.0f};
@@ -63,10 +70,5 @@ namespace DynamicFoam::Sim2D {
     struct ParticleWorldPosition {
         glm::vec3 value{0.0f};
     };
-
-    // Persistent Particle Types
-    struct Stencil {};
-    struct Mutable {};
-    struct Immutable {};
 
 }

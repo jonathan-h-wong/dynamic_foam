@@ -46,14 +46,10 @@ class Simulation {
             const std::optional<std::unordered_set<entt::entity>>& particleSubset = std::nullopt
         );
 
-        // Rebuilds the BVH for a foam body using the provided per-particle AABBs.
-        // AABBs are reordered by getOrderedNodeIds() so that BVH prim_idx matches
-        // the foam-local sorted position used by the narrowphase kernel.
-        void buildBVH(
-            entt::entity foamEntity,
-            const std::unordered_map<int, AABB>& particleAABBs,
-            const std::unordered_map<int, entt::entity>& particleMap
-        );
+        // Rebuilds the BVH for a foam body by reading ParticleVertices directly
+        // from the particle registry, ordered by getOrderedNodeIds() so that
+        // BVH prim_idx matches the foam-local sorted position used by the narrowphase kernel.
+        void buildBVH(entt::entity foamEntity);
 
         // Rebuilds the world-space AABB for a foam body by collecting
         // ParticleWorldPosition values for all particles in getOrderedNodeIds() order.
