@@ -25,6 +25,7 @@ set (DYNAMIC_FOAM_SOURCES
     kernels.cu
     Sim2D/bvh.cu
     Sim2D/render.cu
+    Sim2D/collision.cu
     ${imgui_backends_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_backends_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )

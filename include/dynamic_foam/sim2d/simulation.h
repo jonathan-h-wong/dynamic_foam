@@ -46,7 +46,7 @@ class Simulation {
             const std::optional<std::unordered_set<entt::entity>>& particleSubset = std::nullopt
         );
 
-        // Rebuilds the BVH for a foam body by reading ParticleConvexPolytope directly
+        // Rebuilds the BVH for a foam body by reading ParticleVertices directly
         // from the particle registry, ordered by getOrderedNodeIds() so that
         // BVH prim_idx matches the foam-local sorted position used by the narrowphase kernel.
         void buildBVH(entt::entity foamEntity);

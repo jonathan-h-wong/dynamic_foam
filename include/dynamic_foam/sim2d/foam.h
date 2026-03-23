@@ -18,7 +18,7 @@ namespace DynamicFoam::Sim2D {
 
         // Local Space Geometry
         std::unordered_map<int, glm::vec3> particlePosition;
-        std::unordered_map<int, ConvexPolytope> particlePolytopes;
+        std::unordered_map<int, std::vector<glm::vec3>> particleVertices;
 
         // Physics
         float density;
@@ -43,9 +43,9 @@ namespace DynamicFoam::Sim2D {
             particleOpacity(opacity),
             density(density) {
             // Triangulate in original space (translation-invariant topology/volumes)
-            auto [adjList, volumeMap, voronoiPolytopes] = triangulateVoronoiCells(positions, particleIds);
+            auto [adjList, volumeMap, voronoiVertices] = triangulateVoronoiCells(positions, particleIds);
             adjacencyList = adjList;
-            particlePolytopes = voronoiPolytopes;
+            particleVertices = voronoiVertices;
 
             // Build position and mass maps
             for (size_t i = 0; i < particleIds.size(); ++i) {
@@ -67,16 +67,10 @@ namespace DynamicFoam::Sim2D {
             for (auto& [id, pos] : particlePosition) {
                 pos -= com;
             }
-            // Shift voronoi vertices so they are also in CoM-local space.
-            // Normals are direction vectors and are unaffected by translation.
-            // Distances encode dot(normal, point_on_plane), so shifting every
-            // vertex by -com reduces each face distance to: d -= dot(normal, com).
-            for (auto& [id, polytope] : particlePolytopes) {
-                for (auto& v : polytope.vertices) {
+            // Shift Voronoi vertices into CoM-local space.
+            for (auto& [id, verts] : particleVertices) {
+                for (auto& v : verts) {
                     v -= com;
-                }
-                for (auto& face : polytope.faces) {
-                    face.distance -= glm::dot(face.normal, com);
                 }
             }
         }
