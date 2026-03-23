@@ -2,9 +2,13 @@
 
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <tuple>
+#include <random>
+#include <algorithm>
 
+#define NOMINMAX
 #include <glm/glm.hpp>
 #include <glm/mat3x3.hpp>
 
@@ -46,8 +50,108 @@ std::tuple<
 >
 triangulateWithMetadata(
     const std::vector<Vec3>& positions,
-    const std::vector<T>& particleIds
-);
+    const std::vector<T>&    particleIds
+) {
+    size_t numParticles = particleIds.size();
+
+    Delaunay_3 dt;
+    std::unordered_map<Delaunay_3::Vertex_handle, size_t> vertexToIndex;
+
+    std::vector<Point_3> points;
+    points.reserve(numParticles);
+    for (size_t i = 0; i < numParticles; ++i)
+        points.emplace_back(positions[i].x, positions[i].y, positions[i].z);
+    dt.insert(points.begin(), points.end());
+
+    for (auto vh = dt.finite_vertices_begin(); vh != dt.finite_vertices_end(); ++vh) {
+        const auto& p = vh->point();
+        for (size_t i = 0; i < numParticles; ++i) {
+            if (p.x() == positions[i].x && p.y() == positions[i].y && p.z() == positions[i].z) {
+                vertexToIndex[vh] = i;
+                break;
+            }
+        }
+    }
+
+    AdjacencyList<T> adjList(particleIds);
+    for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+        auto cell = eit->first;
+        auto v1 = cell->vertex(eit->second);
+        auto v2 = cell->vertex(eit->third);
+        if (vertexToIndex.count(v1) && vertexToIndex.count(v2)) {
+            T id1 = particleIds[vertexToIndex[v1]];
+            T id2 = particleIds[vertexToIndex[v2]];
+            adjList.addNodeEdges(id1, {id2});
+        }
+    }
+
+    std::unordered_map<T, float> volumeMap;
+    volumeMap.reserve(numParticles);
+    std::unordered_map<T, std::vector<glm::vec3>> voronoiVertices;
+    voronoiVertices.reserve(numParticles);
+
+    for (auto vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit) {
+        if (!vertexToIndex.count(vit)) continue;
+        size_t i  = vertexToIndex[vit];
+        T      id = particleIds[i];
+
+        glm::vec3 genPt(
+            static_cast<float>(vit->point().x()),
+            static_cast<float>(vit->point().y()),
+            static_cast<float>(vit->point().z()));
+
+        if (dt.is_infinite(vit)) {
+            volumeMap[id] = -1.0f;
+            voronoiVertices[id] = {};
+            continue;
+        }
+
+        std::vector<Delaunay_3::Cell_handle> incident_cells;
+        dt.incident_cells(vit, std::back_inserter(incident_cells));
+        std::vector<glm::vec3> v_vertices;
+        for (const auto& cell_handle : incident_cells) {
+            Point_3 cc = dt.dual(cell_handle);
+            v_vertices.emplace_back(
+                static_cast<float>(cc.x()),
+                static_cast<float>(cc.y()),
+                static_cast<float>(cc.z()));
+        }
+        voronoiVertices[id] = v_vertices;
+
+        float total_volume = 0.0f;
+        std::vector<Delaunay_3::Edge> incident_edges;
+        dt.incident_edges(vit, std::back_inserter(incident_edges));
+
+        for (const auto& edge : incident_edges) {
+            Delaunay_3::Cell_circulator cc = dt.incident_cells(edge), done(cc);
+            if (cc == nullptr) continue;
+
+            std::vector<glm::vec3> face_points;
+            do {
+                if (!dt.is_infinite(cc)) {
+                    Point_3 dual_pt = dt.dual(cc);
+                    face_points.emplace_back(
+                        static_cast<float>(dual_pt.x()),
+                        static_cast<float>(dual_pt.y()),
+                        static_cast<float>(dual_pt.z()));
+                }
+                cc++;
+            } while (cc != done);
+
+            if (face_points.size() < 3) continue;
+            const glm::vec3& p0 = face_points[0];
+            for (size_t j = 1; j < face_points.size() - 1; ++j) {
+                const glm::vec3& p1 = face_points[j];
+                const glm::vec3& p2 = face_points[j + 1];
+                total_volume += (1.0f / 6.0f) * glm::determinant(
+                    glm::mat3(p0 - genPt, p1 - genPt, p2 - genPt));
+            }
+        }
+        volumeMap[id] = std::abs(total_volume);
+    }
+
+    return {adjList, volumeMap, voronoiVertices};
+}
 
 /**
  * @brief Finds connected components in a graph based on an opacity map.
@@ -66,7 +170,39 @@ template <typename T>
 std::unordered_map<T, int> findConnectedComponents(
     const AdjacencyList<T>& adjList,
     const std::unordered_map<T, float>& opacityMap
-);
+) {
+    std::unordered_map<T, int> componentLabels;
+    std::unordered_set<T> visited;
+    int componentId = 0;
+
+    for (const auto& pair : opacityMap) {
+        const T& startNode = pair.first;
+        float opacity = pair.second;
+
+        if (opacity > 0.0f && visited.find(startNode) == visited.end()) {
+            componentId++;
+            std::vector<T> stack;
+            stack.push_back(startNode);
+            visited.insert(startNode);
+            componentLabels[startNode] = componentId;
+
+            while (!stack.empty()) {
+                T currentNode = stack.back();
+                stack.pop_back();
+                adjList.forEachNeighbor(currentNode, [&](const T& neighbor) {
+                    auto it = opacityMap.find(neighbor);
+                    if (it != opacityMap.end() && it->second > 0.0f
+                            && visited.find(neighbor) == visited.end()) {
+                        visited.insert(neighbor);
+                        componentLabels[neighbor] = componentId;
+                        stack.push_back(neighbor);
+                    }
+                });
+            }
+        }
+    }
+    return componentLabels;
+}
 
 /**
  * @brief Finds surface cells in a graph based on an opacity map.
@@ -83,7 +219,23 @@ template <typename T>
 std::vector<T> findSurfaceCells(
     const AdjacencyList<T>& adjList,
     const std::unordered_map<T, float>& opacityMap
-);
+) {
+    std::vector<T> surfaceCells;
+    for (const auto& pair : opacityMap) {
+        const T& nodeId = pair.first;
+        if (pair.second > 0.0f) {
+            bool isSurfaceCell = false;
+            adjList.forEachNeighbor(nodeId, [&](const T& neighborId) {
+                auto it = opacityMap.find(neighborId);
+                if (it == opacityMap.end() || it->second == 0.0f)
+                    isSurfaceCell = true;
+            });
+            if (isSurfaceCell)
+                surfaceCells.push_back(nodeId);
+        }
+    }
+    return surfaceCells;
+}
 
 /**
  * @brief Calculates the center of mass for a collection of particles.
@@ -97,7 +249,19 @@ template <typename T>
 glm::vec3 calculateCenterOfMass(
     const std::unordered_map<T, glm::vec3>& positions,
     const std::unordered_map<T, float>& masses
-);
+) {
+    glm::vec3 com(0.0f);
+    float totalMass = 0.0f;
+    for (const auto& pair : positions) {
+        auto massIt = masses.find(pair.first);
+        if (massIt != masses.end()) {
+            com += pair.second * massIt->second;
+            totalMass += massIt->second;
+        }
+    }
+    if (totalMass > 0.0f) com /= totalMass;
+    return com;
+}
 
 /**
  * @brief Calculates the inertia tensor for a collection of particles.
@@ -111,7 +275,25 @@ template <typename T>
 glm::mat3 calculateInertiaTensor(
     const std::unordered_map<T, glm::vec3>& localPositions,
     const std::unordered_map<T, float>& masses
-);
+) {
+    glm::mat3 I(0.0f);
+    for (const auto& pair : localPositions) {
+        auto massIt = masses.find(pair.first);
+        if (massIt == masses.end()) continue;
+        float m = massIt->second;
+        const glm::vec3& r = pair.second;
+        I[0][0] += m * (r.y*r.y + r.z*r.z);
+        I[1][1] += m * (r.x*r.x + r.z*r.z);
+        I[2][2] += m * (r.x*r.x + r.y*r.y);
+        I[0][1] -= m * r.x * r.y;
+        I[0][2] -= m * r.x * r.z;
+        I[1][2] -= m * r.y * r.z;
+    }
+    I[1][0] = I[0][1];
+    I[2][0] = I[0][2];
+    I[2][1] = I[1][2];
+    return I;
+}
 
 /**
  * @brief Calculates the Axis-Aligned Bounding Box (AABB) for a collection of positions.
@@ -119,9 +301,22 @@ glm::mat3 calculateInertiaTensor(
  * @param positions A vector of positions (glm::vec3).
  * @return A pair containing the min and max corners of the AABB as glm::vec3.
  */
-std::pair<glm::vec3, glm::vec3> calculateAABB(
+inline std::pair<glm::vec3, glm::vec3> calculateAABB(
     const std::vector<glm::vec3>& positions
-);
+) {
+    if (positions.empty())
+        return {glm::vec3(0.0f), glm::vec3(0.0f)};
+    glm::vec3 lo = positions[0], hi = positions[0];
+    for (size_t i = 1; i < positions.size(); ++i) {
+        lo.x = std::min(lo.x, positions[i].x);
+        lo.y = std::min(lo.y, positions[i].y);
+        lo.z = std::min(lo.z, positions[i].z);
+        hi.x = std::max(hi.x, positions[i].x);
+        hi.y = std::max(hi.y, positions[i].y);
+        hi.z = std::max(hi.z, positions[i].z);
+    }
+    return {lo, hi};
+}
 
 /**
  * @brief Counts cycles in the air cell subgraph using cyclomatic complexity.
@@ -141,6 +336,27 @@ int countCycles(
     const AdjacencyList<T>& adjList,
     const std::vector<T>& surfaceIds,
     const std::unordered_map<T, float>& opacityMap
-);
+) {
+    std::unordered_set<T> airCells;
+    for (const T& surfaceId : surfaceIds) {
+        adjList.forEachNeighbor(surfaceId, [&](const T& neighborId) {
+            auto it = opacityMap.find(neighborId);
+            if (it != opacityMap.end() && it->second == 0.0f)
+                airCells.insert(neighborId);
+        });
+    }
+    if (airCells.empty()) return 0;
+
+    int V = static_cast<int>(airCells.size());
+    int E = 0;
+    for (const T& airCell : airCells) {
+        adjList.forEachNeighbor(airCell, [&](const T& neighborId) {
+            if (airCells.count(neighborId) && airCell < neighborId)
+                E++;
+        });
+    }
+    int C = 1; // Assuming all air cells are connected
+    return E - V + C;
+}
 
 } // namespace DynamicFoam::Sim2D
