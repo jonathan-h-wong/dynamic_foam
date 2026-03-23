@@ -2,6 +2,7 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include "dynamic_foam/Sim2D/triangulation.h"
 
 namespace DynamicFoam::Sim2D {
     // ============================================================================
@@ -52,9 +53,9 @@ namespace DynamicFoam::Sim2D {
     struct ParticleMass {
         float value{1.0f};
     };
-    // This is in localspace
-    struct ParticleVertices {
-        std::vector<glm::vec3> value;
+    // This is in localspace; used as the collision primitive for GJK-EPA.
+    struct ParticleConvexPolytope {
+        ConvexPolytope polytope;
     };
     struct Surface {};
 

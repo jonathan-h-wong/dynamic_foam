@@ -6,6 +6,7 @@
 #include <vector>
 #include "dynamic_foam/Sim2D/adjacency.cuh"
 #include "dynamic_foam/Sim2D/utils.h"
+#include "dynamic_foam/Sim2D/triangulation.h"
 
 namespace DynamicFoam::Sim2D {
     class Foam {
@@ -17,7 +18,7 @@ namespace DynamicFoam::Sim2D {
 
         // Local Space Geometry
         std::unordered_map<int, glm::vec3> particlePosition;
-        std::unordered_map<int, std::vector<glm::vec3>> particleVertices;
+        std::unordered_map<int, ConvexPolytope> particlePolytopes;
 
         // Physics
         float density;
@@ -42,9 +43,9 @@ namespace DynamicFoam::Sim2D {
             particleOpacity(opacity),
             density(density) {
             // Triangulate in original space (translation-invariant topology/volumes)
-            auto [adjList, volumeMap, voronoiVertices] = triangulateWithMetadata(positions, particleIds);
+            auto [adjList, volumeMap, voronoiPolytopes] = triangulateVoronoiCells(positions, particleIds);
             adjacencyList = adjList;
-            particleVertices = voronoiVertices;
+            particlePolytopes = voronoiPolytopes;
 
             // Build position and mass maps
             for (size_t i = 0; i < particleIds.size(); ++i) {
@@ -66,10 +67,16 @@ namespace DynamicFoam::Sim2D {
             for (auto& [id, pos] : particlePosition) {
                 pos -= com;
             }
-            // Shift voronoi vertices so they are also in CoM-local space
-            for (auto& [id, verts] : particleVertices) {
-                for (auto& v : verts) {
+            // Shift voronoi vertices so they are also in CoM-local space.
+            // Normals are direction vectors and are unaffected by translation.
+            // Distances encode dot(normal, point_on_plane), so shifting every
+            // vertex by -com reduces each face distance to: d -= dot(normal, com).
+            for (auto& [id, polytope] : particlePolytopes) {
+                for (auto& v : polytope.vertices) {
                     v -= com;
+                }
+                for (auto& face : polytope.faces) {
+                    face.distance -= glm::dot(face.normal, com);
                 }
             }
         }

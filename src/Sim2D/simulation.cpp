@@ -60,8 +60,8 @@ namespace DynamicFoam::Sim2D {
                 float mass = foam.particleMass.at(particleId);
                 particleRegistry.emplace<ParticleMass>(particle, mass);
                 masses[particleId] = mass;
-                const auto& p_verts = foam.particleVertices.at(particleId);
-                particleRegistry.emplace<ParticleVertices>(particle, p_verts);
+                const auto& p_polytope = foam.particlePolytopes.at(particleId);
+                particleRegistry.emplace<ParticleConvexPolytope>(particle, p_polytope);
 
                 glm::vec3 worldPos = glm::vec3(transform * glm::vec4(localPos, 1.0f));
                 particleRegistry.emplace<ParticleWorldPosition>(particle, worldPos);
@@ -109,7 +109,7 @@ namespace DynamicFoam::Sim2D {
         std::vector<AABB> ordered_aabbs;
         ordered_aabbs.reserve(ordered.size());
         for (auto e : ordered) {
-            const auto& verts = particleRegistry.get<ParticleVertices>(e).value;
+            const auto& verts = particleRegistry.get<ParticleConvexPolytope>(e).polytope.vertices;
             auto [min, max] = calculateAABB(verts);
             ordered_aabbs.push_back(AABB(min, max));
         }
@@ -182,7 +182,7 @@ namespace DynamicFoam::Sim2D {
                 result.updatedParticles.begin(), result.updatedParticles.end());
             applyForwardKinematics(result.foamId, particleSubset);
 
-            // Rebuild BVH from current ParticleVertices in the registry.
+            // Rebuild BVH from current ParticleConvexPolytope in the registry.
             buildBVH(result.foamId);
 
             // A parent foam snapshot indicates a new foam was spawned from a topology change.
