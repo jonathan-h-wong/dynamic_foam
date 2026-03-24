@@ -236,6 +236,11 @@ void BVH::alloc_device(int n) {
 
     CUDA_CHECK(cudaMalloc(&d_primitives_,     n                    * sizeof(AABB)));
     CUDA_CHECK(cudaMalloc(&d_nodes_,          num_nodes            * sizeof(BVHNode)));
+    // Pre-fill every int field (left, right, parent) to -1 (0xFFFFFFFF).
+    // k_build_topology sets children's parents but never touches the root's
+    // parent, so without this the root retains garbage and k_propagate_bboxes
+    // loops forever when a leaf thread climbs past the root.
+    CUDA_CHECK(cudaMemset(d_nodes_, 0xFF,     num_nodes            * sizeof(BVHNode)));
     CUDA_CHECK(cudaMalloc(&d_morton_codes_,   n                    * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_morton_sorted_,  n                    * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_indices_,        n                    * sizeof(int)));

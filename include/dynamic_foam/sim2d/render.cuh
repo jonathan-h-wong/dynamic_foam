@@ -163,12 +163,14 @@ private:
     // Ray buffers
     glm::vec3* d_ray_origins_ = nullptr;
     glm::vec3* d_ray_dirs_    = nullptr;
-    size_t     cap_rays_      = 0;
+    size_t     cap_rays_      = 0;  // capacity for d_ray_origins_
+    size_t     cap_ray_dirs_  = 0;  // capacity for d_ray_dirs_
 
     // Foam AABB buffers
     AABB*  d_foam_aabbs_ = nullptr;
     int*   d_foam_ids_   = nullptr;
     size_t cap_foams_    = 0;
+    size_t cap_foam_ids_ = 0;
 
     // BVH node/offset buffers
     BVHNode* d_bvh_nodes_     = nullptr;
@@ -195,16 +197,19 @@ private:
     // Sort/compaction temporaries (reused across frames)
     uint64_t* d_sort_keys_in_  = nullptr;
     uint64_t* d_sort_keys_out_ = nullptr;
-    size_t    cap_sort_keys_   = 0;
+    size_t    cap_sort_keys_     = 0;
+    size_t    cap_sort_keys_out_ = 0;
 
     NarrowphaseHit* d_hits_sorted_   = nullptr;
     size_t          cap_hits_sorted_ = 0;
 
-    int*   d_ray_idx_keys_   = nullptr;
-    int*   d_unique_ray_ids_ = nullptr;
-    int*   d_rle_counts_     = nullptr;
-    int*   d_num_unique_     = nullptr;  // single int on device
-    size_t cap_rle_          = 0;
+    int*   d_ray_idx_keys_    = nullptr;
+    int*   d_unique_ray_ids_  = nullptr;
+    int*   d_rle_counts_      = nullptr;
+    int*   d_num_unique_      = nullptr;  // single int on device
+    size_t cap_rle_             = 0;
+    size_t cap_unique_ray_ids_  = 0;
+    size_t cap_rle_counts_      = 0;
 
     // Compact per-ray offsets into the sorted hit buffer (length = num_unique)
     int*   d_ray_hit_offsets_   = nullptr;
@@ -214,6 +219,7 @@ private:
     glm::vec3* d_particle_positions_ = nullptr;
     glm::vec4* d_particle_colors_    = nullptr;
     size_t     cap_particles_        = 0;
+    size_t     cap_particle_colors_  = 0;
 
     // Per-foam GPU adjacency lists
     std::unordered_map<int, AdjacencyListGPU<entt::entity>> foam_gpu_adj_;
@@ -233,6 +239,7 @@ private:
     int*   d_csr_offsets_            = nullptr;
     int*   d_foam_particle_offsets_  = nullptr;
     size_t cap_foam_offsets_         = 0;
+    size_t cap_csr_offsets_          = 0;
 
     // Per-foam inverse world-to-local transforms — one mat4 per foam, indexed
     // by foam_id. Used in k_narrowphase_collision to transform rays into the

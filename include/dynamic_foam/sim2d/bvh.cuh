@@ -157,6 +157,41 @@ public:
     BVH() = default;
     ~BVH();
 
+    // Non-copyable — device memory ownership is unique.
+    BVH(const BVH&)            = delete;
+    BVH& operator=(const BVH&) = delete;
+
+    // Move constructor: transfer ownership, null-out source.
+    BVH(BVH&& o) noexcept
+        : n_(o.n_),
+          d_primitives_(o.d_primitives_),
+          d_nodes_(o.d_nodes_),
+          d_morton_codes_(o.d_morton_codes_),
+          d_morton_sorted_(o.d_morton_sorted_),
+          d_indices_(o.d_indices_),
+          d_indices_sorted_(o.d_indices_sorted_),
+          d_flags_(o.d_flags_),
+          d_scene_bbox_(o.d_scene_bbox_)
+    { o.null_ptrs(); }
+
+    // Move assignment: free existing resources, then steal source.
+    BVH& operator=(BVH&& o) noexcept {
+        if (this != &o) {
+            free_device();
+            n_                = o.n_;
+            d_primitives_     = o.d_primitives_;
+            d_nodes_          = o.d_nodes_;
+            d_morton_codes_   = o.d_morton_codes_;
+            d_morton_sorted_  = o.d_morton_sorted_;
+            d_indices_        = o.d_indices_;
+            d_indices_sorted_ = o.d_indices_sorted_;
+            d_flags_          = o.d_flags_;
+            d_scene_bbox_     = o.d_scene_bbox_;
+            o.null_ptrs();
+        }
+        return *this;
+    }
+
     // Upload primitives and build the BVH entirely on the GPU.
     void build(const AABB* primitives_host, int n);
 
@@ -169,6 +204,17 @@ public:
 private:
     void alloc_device(int n);
     void free_device();
+    void null_ptrs() noexcept {
+        n_ = 0;
+        d_primitives_     = nullptr;
+        d_nodes_          = nullptr;
+        d_morton_codes_   = nullptr;
+        d_morton_sorted_  = nullptr;
+        d_indices_        = nullptr;
+        d_indices_sorted_ = nullptr;
+        d_flags_          = nullptr;
+        d_scene_bbox_     = nullptr;
+    }
 
     int       n_                = 0;
     AABB*     d_primitives_     = nullptr;

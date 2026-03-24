@@ -300,8 +300,8 @@ void Render::update(
         }
     }
 
-    cuda_realloc_if_needed(&d_ray_origins_, &cap_rays_, num_rays);
-    cuda_realloc_if_needed(&d_ray_dirs_,    &cap_rays_, num_rays);
+    cuda_realloc_if_needed(&d_ray_origins_, &cap_rays_,     num_rays);
+    cuda_realloc_if_needed(&d_ray_dirs_,    &cap_ray_dirs_, num_rays);
     CUDA_CHECK(cudaMemcpy(d_ray_origins_, origins.data(),
                           num_rays * sizeof(glm::vec3), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_ray_dirs_, dirs.data(),
@@ -411,8 +411,8 @@ void Render::update(
     }
 
     // Upload flat particle buffers.
-    cuda_realloc_if_needed(&d_particle_positions_, &cap_particles_, total_particles);
-    cuda_realloc_if_needed(&d_particle_colors_,    &cap_particles_, total_particles);
+    cuda_realloc_if_needed(&d_particle_positions_, &cap_particles_,       total_particles);
+    cuda_realloc_if_needed(&d_particle_colors_,    &cap_particle_colors_, total_particles);
     cuda_realloc_if_needed(&d_surface_mask_,       &cap_surface_mask_, total_particles);
     CUDA_CHECK(cudaMemcpy(d_particle_positions_, h_positions.data(),
                           total_particles * sizeof(glm::vec3), cudaMemcpyHostToDevice));
@@ -432,7 +432,7 @@ void Render::update(
 
     // Upload offset tables.
     cuda_realloc_if_needed(&d_foam_particle_offsets_, &cap_foam_offsets_, num_foams);
-    cuda_realloc_if_needed(&d_csr_offsets_,           &cap_foam_offsets_, num_foams);
+    cuda_realloc_if_needed(&d_csr_offsets_,           &cap_csr_offsets_,  num_foams);
     CUDA_CHECK(cudaMemcpy(d_foam_particle_offsets_, h_foam_particle_offsets.data(),
                           num_foams * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_csr_offsets_, h_csr_offsets.data(),
@@ -453,8 +453,8 @@ void Render::update(
         }
     }
 
-    cuda_realloc_if_needed(&d_foam_aabbs_, &cap_foams_, num_foams);
-    cuda_realloc_if_needed(&d_foam_ids_,   &cap_foams_, num_foams);
+    cuda_realloc_if_needed(&d_foam_aabbs_, &cap_foams_,    num_foams);
+    cuda_realloc_if_needed(&d_foam_ids_,   &cap_foam_ids_, num_foams);
     CUDA_CHECK(cudaMemcpy(d_foam_aabbs_, h_foam_aabbs.data(),
                           num_foams * sizeof(AABB), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_foam_ids_,   h_foam_ids.data(),
@@ -556,8 +556,8 @@ void Render::update(
     // Sort narrowphase hits by (ray_idx, t) via packed uint64 radix sort
     // ------------------------------------------------------------------
 
-    cuda_realloc_if_needed(&d_sort_keys_in_,  &cap_sort_keys_,   num_narrowphase_hits);
-    cuda_realloc_if_needed(&d_sort_keys_out_, &cap_sort_keys_,   num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_sort_keys_in_,  &cap_sort_keys_,     num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_sort_keys_out_, &cap_sort_keys_out_, num_narrowphase_hits);
     cuda_realloc_if_needed(&d_hits_sorted_,   &cap_hits_sorted_, num_narrowphase_hits);
 
     k_pack_sort_key<<<grid_size(num_narrowphase_hits), 256>>>(
@@ -573,9 +573,11 @@ void Render::update(
     // Extract ray indices, run-length encode → per-ray hit counts
     // ------------------------------------------------------------------
 
-    cuda_realloc_if_needed(&d_ray_idx_keys_,  &cap_rle_, num_narrowphase_hits);
-    cuda_realloc_if_needed(&d_unique_ray_ids_, &cap_rle_, num_narrowphase_hits);
-    cuda_realloc_if_needed(&d_rle_counts_,     &cap_rle_, num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_ray_idx_keys_,   &cap_rle_,        num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_unique_ray_ids_, &cap_unique_ray_ids_, num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_rle_counts_,     &cap_rle_counts_, num_narrowphase_hits);
+    // d_num_unique_ is a single device int — allocate once on first use.
+    if (!d_num_unique_) { CUDA_CHECK(cudaMalloc(&d_num_unique_, sizeof(int))); }
 
     k_extract_ray_idx<<<grid_size(num_narrowphase_hits), 256>>>(
         d_sort_keys_out_, d_ray_idx_keys_, num_narrowphase_hits);
