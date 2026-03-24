@@ -1,6 +1,6 @@
 #pragma once
 #include <glm/glm.hpp>
-#include <entt/entt.hpp>
+#include <entt/entity/registry.hpp>
 #include <optional>
 #include <stdexcept>
 #include <unordered_set>
@@ -39,6 +39,10 @@ class Simulation {
             const entt::registry&                                        particleRegistry
         );
         void step(const UserInput& input, float deltaTime);
+
+        // Returns the device-side RGBA output buffer produced by the last render call.
+        // Valid only after the first call to step(). Lifetime is managed by the Render subsystem.
+        const glm::vec4* deviceOutputBuffer() const { return renderSubsystem.deviceOutputBuffer(); }
 
     private:
         void applyForwardKinematics(

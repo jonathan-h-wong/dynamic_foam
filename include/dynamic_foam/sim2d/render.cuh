@@ -8,10 +8,10 @@
 #pragma once
 
 #define GLM_FORCE_CUDA
-#include <entt/entt.hpp>
+#include <cuda_runtime.h>
+#include <entt/entity/registry.hpp>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
-#include <cuda_runtime.h>
 #include <unordered_map>
 
 #include "dynamic_foam/Sim2D/adjacency.cuh"

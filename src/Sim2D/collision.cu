@@ -379,8 +379,8 @@ void expandToTetrahedron(
     const std::vector<glm::vec3>& vertsA,
     const std::vector<glm::vec3>& vertsB)
 {
-    constexpr glm::vec3 axes[6] = {
-        { 1,0,0},{-1,0,0},{ 0,1,0},{ 0,-1,0},{ 0,0,1},{ 0,0,-1}
+    const glm::vec3 axes[6] = {
+        { 1.f,0.f,0.f},{-1.f,0.f,0.f},{ 0.f,1.f,0.f},{ 0.f,-1.f,0.f},{ 0.f,0.f,1.f},{ 0.f,0.f,-1.f}
     };
 
     while (s.size < 4) {

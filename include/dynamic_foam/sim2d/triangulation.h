@@ -9,16 +9,20 @@
 
 #include "dynamic_foam/Sim2D/adjacency.cuh"
 
+#ifndef __CUDACC__
 // CGAL header-only setup with faster kernel
 #include <CGAL/Delaunay_triangulation_3.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#endif // !__CUDACC__
 
 namespace DynamicFoam::Sim2D {
 
+#ifndef __CUDACC__
 // CGAL typedefs (shared with utils.h; re-declared here for standalone use)
 using K_tri       = CGAL::Exact_predicates_inexact_constructions_kernel;
 using Delaunay_tri = CGAL::Delaunay_triangulation_3<K_tri>;
 using Point_tri   = K_tri::Point_3;
+#endif // !__CUDACC__
 
 // ============================================================================
 // Triangulation – internal helpers
@@ -39,6 +43,7 @@ inline float signedTetVolume(
 // Triangulation
 // ============================================================================
 
+#ifndef __CUDACC__
 /**
  * @brief Build Delaunay triangulation, extract adjacency, volumes, and
  *        a vertex buffer for every Voronoi cell.
@@ -204,5 +209,6 @@ triangulateVoronoiCells(
 
     return {adjList, volumeMap, voronoiVertices};
 }
+#endif // !__CUDACC__
 
 } // namespace DynamicFoam::Sim2D

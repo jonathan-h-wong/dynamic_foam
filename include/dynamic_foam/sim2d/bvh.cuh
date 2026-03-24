@@ -21,10 +21,13 @@
 #pragma once
 
 #define GLM_FORCE_CUDA
+#include <cuda.h>          // defines CUDA_VERSION required by glm/detail/simd/platform.h
+#include <cuda_runtime.h>
 #include <glm/glm.hpp>
 
+#ifdef __CUDACC__
 #include <cub/cub.cuh>
-#include <cuda_runtime.h>
+#endif // __CUDACC__
 #include <cstdint>
 #include <cstdio>
 
@@ -118,6 +121,8 @@ __host__ __device__ inline uint32_t morton3D(float x, float y, float z) {
 // Kernel declarations
 // -----------------------------------------------------------------------------
 
+// Kernel declarations — NVCC only
+#ifdef __CUDACC__
 __global__ void k_compute_morton(
     const AABB* __restrict__ primitives,
     uint32_t*   __restrict__ morton_codes,
@@ -141,6 +146,7 @@ __global__ void k_propagate_bboxes(
     BVHNode* __restrict__ nodes,
     int*     __restrict__ flags,
     int n);
+#endif // __CUDACC__
 
 // -----------------------------------------------------------------------------
 // BVH: host-side manager

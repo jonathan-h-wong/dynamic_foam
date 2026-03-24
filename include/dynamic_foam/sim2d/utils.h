@@ -14,18 +14,23 @@
 
 #include "dynamic_foam/Sim2D/adjacency.cuh"
 
+#ifndef __CUDACC__
 // CGAL header-only setup with faster kernel
 #include <CGAL/Delaunay_triangulation_3.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#endif // !__CUDACC__
 
 namespace DynamicFoam::Sim2D {
 
+#ifndef __CUDACC__
 // CGAL typedefs for use in function signatures
 // Using Exact_predicates_inexact_constructions_kernel for faster compilation
 using K = CGAL::Exact_predicates_inexact_constructions_kernel;
 using Delaunay_3 = CGAL::Delaunay_triangulation_3<K>;
 using Point_3 = K::Point_3;
+#endif // !__CUDACC__
 
+#ifndef __CUDACC__
 /**
  * @brief Triangulate and compute Voronoi cell metadata (volume, vertices).
  *
@@ -152,6 +157,7 @@ triangulateWithMetadata(
 
     return {adjList, volumeMap, voronoiVertices};
 }
+#endif // !__CUDACC__
 
 /**
  * @brief Finds connected components in a graph based on an opacity map.

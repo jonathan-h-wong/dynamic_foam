@@ -1,7 +1,7 @@
 #pragma once
 #include <optional>
 #include <vector>
-#include <entt/entt.hpp>
+#include <entt/entity/registry.hpp>
 #include "dynamic_foam/Sim2D/adjacency.cuh"
 #include "dynamic_foam/Sim2D/bvh.cuh"
 #include "dynamic_foam/Sim2D/components.h"

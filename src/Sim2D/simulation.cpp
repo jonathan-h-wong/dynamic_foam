@@ -1,7 +1,7 @@
 #include "dynamic_foam/Sim2D/components.h"
 #include "dynamic_foam/Sim2D/simulation.h"
 #include "dynamic_foam/Sim2D/utils.h"
-#include <entt/entt.hpp>
+#include <entt/entity/registry.hpp>
 
 namespace DynamicFoam::Sim2D {
     Simulation::Simulation(

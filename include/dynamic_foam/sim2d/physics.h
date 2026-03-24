@@ -1,6 +1,6 @@
 #pragma once
 #include <vector>
-#include <entt/entt.hpp>
+#include <entt/entity/registry.hpp>
 #include "dynamic_foam/Sim2D/adjacency.cuh"
 #include "dynamic_foam/Sim2D/bvh.cuh"
 

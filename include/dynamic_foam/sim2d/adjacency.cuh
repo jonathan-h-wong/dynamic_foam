@@ -7,12 +7,13 @@
 #include <stack>
 
 #include <cuda_runtime.h>
+#ifdef __CUDACC__
 #include <cub/cub.cuh>
 #include <thrust/scatter.h>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
-
 #include "cuda_utils.cuh"
+#endif // __CUDACC__
 
 namespace DynamicFoam::Sim2D {
 

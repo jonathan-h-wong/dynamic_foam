@@ -9,11 +9,13 @@
 
 namespace DynamicFoam::Sim2D {
     Foam generateFoamBar(
-        int width, 
-        int height, 
-        int widthParticles, 
-        int heightParticles, 
-        float density, 
+        float width,
+        float height,
+        float depth,
+        int widthParticles,
+        int heightParticles,
+        int depthParticles,
+        float density,
         const glm::vec3& color_param
     );
     Foam generateFoamPointCursor();

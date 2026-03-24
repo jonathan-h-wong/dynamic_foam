@@ -17,7 +17,7 @@
 #include <vector>
 #include <unordered_map>
 
-#include <entt/entt.hpp>
+#include <entt/entity/registry.hpp>
 #include <glm/glm.hpp>
 
 #include "dynamic_foam/Sim2D/bvh.cuh"

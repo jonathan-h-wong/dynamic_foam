@@ -7,7 +7,9 @@
 
 #include <cstdio>
 #include <cuda_runtime.h>
+#ifdef __CUDACC__
 #include <cub/cub.cuh>
+#endif // __CUDACC__
 
 // -----------------------------------------------------------------------------
 // Error checking

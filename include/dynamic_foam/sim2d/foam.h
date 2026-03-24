@@ -11,6 +11,9 @@
 namespace DynamicFoam::Sim2D {
     class Foam {
     public:
+        // Default constructor — needed for use as std::unordered_map value type
+        Foam() = default;
+
         // Topology
         AdjacencyList<int> adjacencyList;
         std::unordered_map<int, bool> isStencil;
@@ -29,6 +32,7 @@ namespace DynamicFoam::Sim2D {
         std::unordered_map<int, glm::vec3> particleColor;
         std::unordered_map<int, float> particleOpacity;
 
+#ifndef __CUDACC__
         Foam(
             const std::vector<int>& particleIds,
             const std::vector<glm::vec3>& positions,
@@ -60,6 +64,7 @@ namespace DynamicFoam::Sim2D {
             parentToCenterOfMass();
             intertiaTensor = calculateInertiaTensor(particlePosition, particleMass);
         }
+#endif // !__CUDACC__
 
     private:
         void parentToCenterOfMass() {
