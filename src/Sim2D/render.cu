@@ -186,7 +186,8 @@ __global__ void k_exact_collision(
     const glm::vec3*      particle_positions,
     const glm::vec4*      particle_colors,
     glm::vec4*            output_buffer,
-    int                   num_unique
+    int                   num_unique,
+    RenderOverlayParams   overlay
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_unique) return;
@@ -198,8 +199,10 @@ __global__ void k_exact_collision(
     glm::vec3 origin, dir;
     generateRay(camera, ray_idx, width, height, origin, dir);
 
-    float best_t        = 1e30f;
-    int   best_particle = -1;
+    float    best_t        = 1e30f;
+    int      best_particle = -1;
+    int      best_foam_id  = -1;
+    uint32_t best_enter_k  = ~0u; // CSR index of the neighbor whose bisector produced t_enter
 
     for (int j = 0; j < hit_count; ++j) {
         const NarrowphaseHit hit   = narrowphase_hits[hit_offset + j];
@@ -219,9 +222,10 @@ __global__ void k_exact_collision(
         const uint32_t adj_start = csr_node_offsets[csr_base + local_idx];
         const uint32_t adj_end   = csr_node_offsets[csr_base + local_idx + 1];
 
-        float t_enter = 0.f;
-        float t_exit  = 1e30f;
-        bool  valid   = true;
+        float    t_enter = 0.f;
+        float    t_exit  = 1e30f;
+        bool     valid   = true;
+        uint32_t enter_k = ~0u; // CSR index that gave t_enter for this candidate
 
         for (uint32_t k = adj_start; k < adj_end; ++k) {
             // csr_nbrs[k] is a foam-local sorted-position index.
@@ -242,8 +246,14 @@ __global__ void k_exact_collision(
                 // Constraint: t * denom <= numer  (ray must stay on P's side)
                 // denom > 0 → t <= t_plane → upper bound on t → tighten t_exit
                 // denom < 0 → t >= t_plane → lower bound on t → tighten t_enter
-                if (denom > 0.f) t_exit  = fminf(t_exit,  t_plane);
-                else             t_enter = fmaxf(t_enter, t_plane);
+                if (denom > 0.f) {
+                    t_exit = fminf(t_exit, t_plane);
+                } else {
+                    if (t_plane > t_enter) {
+                        t_enter = t_plane;
+                        enter_k = k; // record which neighbor is the entry face
+                    }
+                }
                 if (t_enter > t_exit) { valid = false; break; }
             }
         }
@@ -251,11 +261,69 @@ __global__ void k_exact_collision(
         if (valid && t_enter <= t_exit && t_enter < best_t) {
             best_t        = t_enter;
             best_particle = pid;
+            best_foam_id  = fid;
+            best_enter_k  = enter_k;
         }
     }
 
-    if (best_particle >= 0)
-        output_buffer[ray_idx] = particle_colors[best_particle];
+    if (best_particle >= 0) {
+        glm::vec4 out_color = particle_colors[best_particle];
+
+        if (overlay.show_edges || overlay.show_centers) {
+            const glm::vec3 p_hit = origin + best_t * dir;
+            const glm::vec3 p_pos = particle_positions[best_particle];
+            // 2D projection used only for the screen-space center-dot check.
+            const glm::vec2 hit2d = glm::vec2(p_hit.x, p_hit.y);
+            const glm::vec2 p2d   = glm::vec2(p_pos.x, p_pos.y);
+
+            // --- Edge overlay ---
+            // Compute the 3D signed distance from p_hit to each Voronoi bisector
+            // plane. The margin for neighbor N is:
+            //   dot(p_hit − midpt, N−P) / |N−P|
+            // which is negative when p_hit is on P's side (interior) and
+            // approaches 0 near the bisector face.
+            //
+            // p_hit = origin + t_enter * dir lies exactly on the entry bisector
+            // plane by construction, so that neighbor always gives margin = 0
+            // and must be skipped. best_enter_k records which CSR index produced
+            // t_enter in the slab test, so we can exclude exactly that neighbor.
+            if (overlay.show_edges) {
+                const int      fp_offset = foam_particle_offsets[best_foam_id];
+                const int      local_idx = best_particle - fp_offset;
+                const int      csr_base  = csr_offsets[best_foam_id];
+                const uint32_t adj_start = csr_node_offsets[csr_base + local_idx];
+                const uint32_t adj_end   = csr_node_offsets[csr_base + local_idx + 1];
+
+                float max_margin = -1e30f;
+                for (uint32_t k = adj_start; k < adj_end; ++k) {
+                    // Skip the entry bisector — its margin is 0 by construction.
+                    if (k == best_enter_k) continue;
+                    const int       nid    = fp_offset + (int)csr_nbrs[k];
+                    const glm::vec3 n_pos  = particle_positions[nid];
+                    const glm::vec3 diff3d = n_pos - p_pos;
+                    const float     len3d  = glm::length(diff3d);
+                    if (len3d < 1e-6f) continue;
+                    const glm::vec3 midpt3d = (p_pos + n_pos) * 0.5f;
+                    // Negative = inside P's cell, 0 = on face, positive = outside.
+                    const float margin = glm::dot(p_hit - midpt3d, diff3d) / len3d;
+                    max_margin = fmaxf(max_margin, margin);
+                }
+                // max_margin > -edge_threshold: p_hit is within edge_threshold
+                // world units of the nearest non-entry Voronoi face.
+                if (max_margin > -overlay.edge_threshold)
+                    out_color = overlay.edge_color;
+            }
+
+            // --- Center overlay (drawn on top of edge overlay) ---
+            if (overlay.show_centers) {
+                const float dist2d = glm::length(hit2d - p2d);
+                if (dist2d < overlay.center_radius)
+                    out_color = overlay.center_color;
+            }
+        }
+
+        output_buffer[ray_idx] = out_color;
+    }
 }
 
 // =============================================================================
@@ -279,7 +347,8 @@ void Render::update(
     const entt::registry&                                        particleRegistry,
     const std::unordered_map<int, glm::mat4>&                    foamTransforms,
     const CameraParams&                                          camera,
-    const glm::ivec2&                                            windowSize
+    const glm::ivec2&                                            windowSize,
+    const RenderOverlayParams&                                   overlay
 ) {
     const int num_rays  = windowSize.x * windowSize.y;
     const int num_foams = static_cast<int>(foamAABBs.size());
@@ -595,7 +664,8 @@ void Render::update(
         d_particle_positions_,
         d_particle_colors_,
         d_output_buffer_,
-        num_unique
+        num_unique,
+        overlay
     );
     CUDA_CHECK(cudaDeviceSynchronize());
 }

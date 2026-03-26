@@ -88,6 +88,20 @@ inline glm::vec3 unprojectPixel(
 }
 
 // -----------------------------------------------------------------------------
+// Overlay parameters passed to k_exact_collision.
+// All fields are plain-old-data so the struct can be passed by value to CUDA
+// kernels. Distances are in world-space units.
+// -----------------------------------------------------------------------------
+struct RenderOverlayParams {
+    bool      show_centers   = false;
+    bool      show_edges     = false;
+    float     center_radius  = 0.005f;             // world-space dot radius
+    float     edge_threshold = 0.001f;             // world-space edge half-width
+    glm::vec4 center_color   = {1.f, 0.f, 0.f, 1.f};
+    glm::vec4 edge_color     = {1.f, 0.f, 0.f, 1.f};
+};
+
+// -----------------------------------------------------------------------------
 // Hit record types
 // -----------------------------------------------------------------------------
 
@@ -182,7 +196,8 @@ __global__ void k_exact_collision(
     const glm::vec3*      particle_positions,
     const glm::vec4*      particle_colors,
     glm::vec4*            output_buffer,
-    int                   num_unique
+    int                   num_unique,
+    RenderOverlayParams   overlay
 );
 
 // -----------------------------------------------------------------------------
@@ -205,7 +220,8 @@ public:
         const entt::registry&                                        particleRegistry,
         const std::unordered_map<int, glm::mat4>&                    foamTransforms,
         const CameraParams&                                          camera,
-        const glm::ivec2&                                            windowSize
+        const glm::ivec2&                                            windowSize,
+        const RenderOverlayParams&                                   overlay = {}
     );
 
     const glm::vec4* deviceOutputBuffer() const { return d_output_buffer_; }

@@ -256,7 +256,8 @@ namespace DynamicFoam::Sim2D {
         const std::unordered_map<int, AABB>&                         foamAABBs,
         const std::unordered_map<int, BVH>&                          foamBVHs,
         const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-        const entt::registry&                                        particleRegistry
+        const entt::registry&                                        particleRegistry,
+        const RenderOverlayParams&                                   overlays
     ) {
         // Build per-foam world transforms from position and orientation.
         // These are passed to the render subsystem so it can compute inverse
@@ -271,13 +272,13 @@ namespace DynamicFoam::Sim2D {
 
         // Recompute viewport height from current aspect ratio before rendering.
         camera_.height = camera_.width * (float(windowSize_.y) / float(windowSize_.x));
-        renderSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, foamTransforms, camera_, windowSize_);
+        renderSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, foamTransforms, camera_, windowSize_, overlays);
     }
 
-    void Simulation::step(const UserInput& input, float deltaTime) {
+    void Simulation::step(const UserInput& input, float deltaTime, const RenderOverlayParams& overlays) {
         handleUserInput(input);
         updateTopology(foamAABBs, foamBVHs, foamAdjacencyLists);
         updatePhysics(foamAABBs, foamBVHs, deltaTime);
-        render(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry);
+        render(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, overlays);
     }
 };

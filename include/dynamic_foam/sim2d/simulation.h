@@ -36,9 +36,10 @@ class Simulation {
             const std::unordered_map<int, AABB>&                         foamAABBs,
             const std::unordered_map<int, BVH>&                          foamBVHs,
             const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-            const entt::registry&                                        particleRegistry
+            const entt::registry&                                        particleRegistry,
+            const RenderOverlayParams&                                   overlays = {}
         );
-        void step(const UserInput& input, float deltaTime);
+        void step(const UserInput& input, float deltaTime, const RenderOverlayParams& overlays = {});
 
         // Returns the device-side RGBA output buffer produced by the last render call.
         // Valid only after the first call to step(). Lifetime is managed by the Render subsystem.

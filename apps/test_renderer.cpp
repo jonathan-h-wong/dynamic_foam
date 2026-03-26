@@ -88,6 +88,11 @@ int main() {
     glBindTexture(GL_TEXTURE_2D, 0);
 
     // -----------------------------------------------------------------------
+    // Overlay state — persists across frames
+    // -----------------------------------------------------------------------
+    RenderOverlayParams overlays;
+
+    // -----------------------------------------------------------------------
     // Main loop
     // -----------------------------------------------------------------------
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -108,7 +113,7 @@ int main() {
 
         // Poll input and advance simulation
         UserInput input = PollUserInput();
-        sim.step(input, dt);
+        sim.step(input, dt, overlays);
 
         // Copy CUDA device output buffer → host → OpenGL texture
         const glm::vec4* d_output = sim.deviceOutputBuffer();
@@ -159,6 +164,24 @@ int main() {
         ImGui::Text("Dynamic Foam – Sample Scene");
         ImGui::Separator();
         ImGui::Text("%.1f FPS  (%.2f ms)", 1.0f / dt, dt * 1000.0f);
+        ImGui::Separator();
+        ImGui::Text("Overlays");
+
+        // --- Cell centers ---
+        ImGui::Checkbox("Cell centers", &overlays.show_centers);
+        if (overlays.show_centers) {
+            // glm::vec4 is contiguous floats — safe to pass as float[4]
+            ImGui::ColorEdit4("Center color", &overlays.center_color.x,
+                ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+        }
+
+        // --- Cell edges ---
+        ImGui::Checkbox("Cell edges", &overlays.show_edges);
+        if (overlays.show_edges) {
+            ImGui::ColorEdit4("Edge color", &overlays.edge_color.x,
+                ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+        }
+
         ImGui::End();
 
         // Composite and present
