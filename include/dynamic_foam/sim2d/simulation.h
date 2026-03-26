@@ -66,10 +66,10 @@ class Simulation {
         std::unordered_map<int, AABB> foamAABBs;
         
         glm::ivec2 windowSize_;
-        // World-space width of the orthographic camera view.
-        // Shared by render() (which builds the camera) and handleUserInput()
-        // (which converts mouse pixel coordinates to world space).
-        float cameraWorldWidth_ = 3.0f;
+        // Camera descriptor shared by render() and handleUserInput().
+        // origin/lookAt/up/width/type/fovY hold the logical camera parameters;
+        // height is recomputed from the aspect ratio each frame inside render().
+        CameraParams camera_;
 
         Topology topologySubsystem;
         Physics physicsSubsystem;

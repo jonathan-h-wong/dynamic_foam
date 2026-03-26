@@ -22,8 +22,9 @@ namespace DynamicFoam::Sim2D {
 // -----------------------------------------------------------------------------
 
 __global__ void k_broadphase_collision(
-    const glm::vec3*  ray_origins,
-    const glm::vec3*  ray_dirs,
+    CameraParams      camera,
+    int               width,
+    int               height,
     const AABB*       foam_aabbs,
     const int*        foam_ids,
     BroadphaseHit*    hits,
@@ -34,8 +35,8 @@ __global__ void k_broadphase_collision(
     int ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray_idx >= num_rays) return;
 
-    const glm::vec3 origin  = ray_origins[ray_idx];
-    const glm::vec3 dir     = ray_dirs[ray_idx];
+    glm::vec3 origin, dir;
+    generateRay(camera, ray_idx, width, height, origin, dir);
     const glm::vec3 inv_dir = 1.0f / dir;
 
     for (int i = 0; i < num_foams; ++i) {
@@ -53,8 +54,9 @@ __global__ void k_broadphase_collision(
 // -----------------------------------------------------------------------------
 
 __global__ void k_narrowphase_collision(
-    const glm::vec3*     ray_origins,
-    const glm::vec3*     ray_dirs,
+    CameraParams         camera,
+    int                  width,
+    int                  height,
     const BroadphaseHit* broadphase_hits,
     int                  num_broadphase_hits,
     const BVHNode*       bvh_nodes,
@@ -75,12 +77,13 @@ __global__ void k_narrowphase_collision(
     const int           ray_idx = b_hit.ray_idx;
     const int           fid     = b_hit.foam_id;
 
-    // Transform the world-space ray into this foam's local BVH space.
-    // BVH nodes were built in local particle coordinates, so rays must be
-    // expressed in the same space before traversal.
+    // Generate the world-space ray for this pixel, then transform into the
+    // foam's local BVH space. BVH nodes were built in local particle coordinates.
+    glm::vec3 world_origin, world_dir;
+    generateRay(camera, ray_idx, width, height, world_origin, world_dir);
     const glm::mat4& inv_xform = foam_inv_transforms[fid];
-    const glm::vec3  origin    = glm::vec3(inv_xform * glm::vec4(ray_origins[ray_idx], 1.0f));
-    const glm::vec3  dir       = glm::vec3(inv_xform * glm::vec4(ray_dirs[ray_idx],    0.0f));
+    const glm::vec3  origin    = glm::vec3(inv_xform * glm::vec4(world_origin, 1.0f));
+    const glm::vec3  dir       = glm::vec3(inv_xform * glm::vec4(world_dir,    0.0f));
     const glm::vec3  inv_dir   = 1.0f / dir;
 
     const BVHNode* foam_bvh      = &bvh_nodes[bvh_offsets[fid]];
@@ -164,8 +167,9 @@ __global__ void k_extract_ray_idx(
 //   and we take the first cell that passes.
 // -----------------------------------------------------------------------------
 __global__ void k_exact_collision(
-    const glm::vec3*      ray_origins,
-    const glm::vec3*      ray_dirs,
+    CameraParams          camera,
+    int                   width,
+    int                   height,
     const NarrowphaseHit* narrowphase_hits,
     const int*            unique_ray_ids,
     const int*            ray_hit_offsets,
@@ -191,8 +195,8 @@ __global__ void k_exact_collision(
     const int hit_count  = ray_hit_counts[i];
     const int hit_offset = ray_hit_offsets[i];
 
-    const glm::vec3 origin = ray_origins[ray_idx];
-    const glm::vec3 dir    = ray_dirs[ray_idx];
+    glm::vec3 origin, dir;
+    generateRay(camera, ray_idx, width, height, origin, dir);
 
     float best_t        = 1e30f;
     int   best_particle = -1;
@@ -274,57 +278,11 @@ void Render::update(
     const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
     const entt::registry&                                        particleRegistry,
     const std::unordered_map<int, glm::mat4>&                    foamTransforms,
-    const OrthographicCamera&                                    camera,
+    const CameraParams&                                          camera,
     const glm::ivec2&                                            windowSize
 ) {
     const int num_rays  = windowSize.x * windowSize.y;
     const int num_foams = static_cast<int>(foamAABBs.size());
-
-    // ------------------------------------------------------------------
-    // Ray buffer
-    // ------------------------------------------------------------------
-
-    const glm::vec3 forward = glm::normalize(camera.lookAt - camera.origin);
-    const glm::vec3 right   = glm::normalize(glm::cross(forward, camera.up));
-    const glm::vec3 up      = glm::cross(right, forward);
-
-    // Only recompute and re-upload ray data when the camera changes.
-    // For a static orthographic camera this saves ~22 MB of H2D transfer per frame.
-    const bool camera_changed = (
-        camera.origin != last_camera_.origin ||
-        camera.lookAt != last_camera_.lookAt ||
-        camera.up     != last_camera_.up     ||
-        camera.width  != last_camera_.width  ||
-        camera.height != last_camera_.height ||
-        windowSize.x  != last_window_size_.x ||
-        windowSize.y  != last_window_size_.y);
-
-    if (camera_changed) {
-        std::vector<glm::vec3> origins(num_rays);
-        std::vector<glm::vec3> dirs(num_rays);
-
-        for (int y = 0; y < windowSize.y; ++y) {
-            for (int x = 0; x < windowSize.x; ++x) {
-                const int   idx = y * windowSize.x + x;
-                const float u   = (float(x) / float(windowSize.x)) - 0.5f;
-                const float v   = (float(y) / float(windowSize.y)) - 0.5f;
-                origins[idx] = camera.origin
-                             + u * camera.width  * right
-                             + v * camera.height * up;
-                dirs[idx] = forward;
-            }
-        }
-
-        cuda_realloc_if_needed(&d_ray_origins_, &cap_rays_,     num_rays);
-        cuda_realloc_if_needed(&d_ray_dirs_,    &cap_ray_dirs_, num_rays);
-        CUDA_CHECK(cudaMemcpy(d_ray_origins_, origins.data(),
-                              num_rays * sizeof(glm::vec3), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_ray_dirs_, dirs.data(),
-                              num_rays * sizeof(glm::vec3), cudaMemcpyHostToDevice));
-
-        last_camera_      = camera;
-        last_window_size_ = windowSize;
-    }
 
     // ------------------------------------------------------------------
     // Flat particle buffers + adjacency
@@ -527,7 +485,7 @@ void Render::update(
     CUDA_CHECK(cudaMemset(d_broadphase_hit_counter_, 0, sizeof(int)));
 
     k_broadphase_collision<<<grid_size(num_rays), 256>>>(
-        d_ray_origins_, d_ray_dirs_,
+        camera, windowSize.x, windowSize.y,
         d_foam_aabbs_,  d_foam_ids_,
         d_broadphase_hits_, d_broadphase_hit_counter_,
         num_rays, num_foams
@@ -549,7 +507,7 @@ void Render::update(
     CUDA_CHECK(cudaMemset(d_narrowphase_hit_counter_, 0, sizeof(int)));
 
     k_narrowphase_collision<<<grid_size(num_broadphase_hits), 256>>>(
-        d_ray_origins_, d_ray_dirs_,
+        camera, windowSize.x, windowSize.y,
         d_broadphase_hits_, num_broadphase_hits,
         d_bvh_nodes_,   d_bvh_offsets_,
         d_surface_mask_,
@@ -625,8 +583,7 @@ void Render::update(
     // ------------------------------------------------------------------
 
     k_exact_collision<<<grid_size(num_unique), 256>>>(
-        d_ray_origins_,
-        d_ray_dirs_,
+        camera, windowSize.x, windowSize.y,
         d_hits_sorted_,
         d_unique_ray_ids_,
         d_ray_hit_offsets_,
@@ -650,8 +607,6 @@ void Render::update(
 void Render::free_device_memory() {
     auto f = [](void* p) { if (p) cudaFree(p); };
 
-    f(d_ray_origins_);               d_ray_origins_               = nullptr;
-    f(d_ray_dirs_);                  d_ray_dirs_                  = nullptr;
     f(d_foam_aabbs_);                d_foam_aabbs_                = nullptr;
     f(d_foam_ids_);                  d_foam_ids_                  = nullptr;
     f(d_bvh_nodes_);                 d_bvh_nodes_                 = nullptr;

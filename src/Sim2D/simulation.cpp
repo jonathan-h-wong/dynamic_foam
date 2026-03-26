@@ -163,13 +163,12 @@ namespace DynamicFoam::Sim2D {
         // Guard: ImGui reports (-FLT_MAX, -FLT_MAX) when the mouse is outside the window.
         if (input.mouse_pos.x < -1e6f || input.mouse_pos.y < -1e6f) return;
 
-        // Convert from ImGui pixel coordinates (top-left origin) to world space.
-        // cameraWorldWidth_ is the total world-space width of the ortho view;
-        // camera.up=(0,-1,0) means screen-Y increases downward, so world-Y is negated.
-        const float worldWidth  = cameraWorldWidth_;
-        const float worldHeight = worldWidth * (float(windowSize_.y) / float(windowSize_.x));
-        const float world_x =  (input.mouse_pos.x / float(windowSize_.x) - 0.5f) * worldWidth;
-        const float world_y = -(input.mouse_pos.y / float(windowSize_.y) - 0.5f) * worldHeight;
+        // Convert from ImGui pixel coordinates (top-left origin) to world space
+        // using the camera's projection. unprojectPixel delegates to generateRay,
+        // so the mapping is consistent with the GPU rendering kernels.
+        const glm::vec3 world   = unprojectPixel(camera_, glm::vec2(input.mouse_pos.x, input.mouse_pos.y), windowSize_);
+        const float     world_x = world.x;
+        const float     world_y = world.y;
 
         foamRegistry.view<Controller, Position>().each([&](auto entity, auto& pos) {
             pos.value = glm::vec3(world_x, world_y, 0.0f);
@@ -270,13 +269,9 @@ namespace DynamicFoam::Sim2D {
                 foamTransforms[static_cast<int>(e)] = t * r;
             });
 
-        OrthographicCamera camera;
-        camera.origin = glm::vec3(0.0f, 0.0f, -5.0f);
-        camera.lookAt = glm::vec3(0.0f, 0.0f, 0.0f);
-        camera.up = glm::vec3(0.0f, -1.0f, 0.0f);
-        camera.width  = cameraWorldWidth_;
-        camera.height = cameraWorldWidth_ * (float(windowSize_.y) / float(windowSize_.x));
-        renderSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, foamTransforms, camera, windowSize_);
+        // Recompute viewport height from current aspect ratio before rendering.
+        camera_.height = camera_.width * (float(windowSize_.y) / float(windowSize_.x));
+        renderSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, foamTransforms, camera_, windowSize_);
     }
 
     void Simulation::step(const UserInput& input, float deltaTime) {

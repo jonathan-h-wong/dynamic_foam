@@ -24,13 +24,68 @@ namespace DynamicFoam::Sim2D {
 // Camera
 // -----------------------------------------------------------------------------
 
-struct OrthographicCamera {
-    glm::vec3 origin;
-    glm::vec3 lookAt;
-    glm::vec3 up;
-    float width;
-    float height;
+enum class ProjectionType : int { Orthographic = 0, Perspective = 1 };
+
+// Plain-old-data camera descriptor passed by value to GPU kernels.
+// For orthographic cameras, width/height are world-space viewport dimensions.
+// For perspective cameras, fovY is the vertical field-of-view in radians;
+// width/height are unused (aspect ratio is derived from the render resolution).
+struct CameraParams {
+    glm::vec3      origin  = {0.f,  0.f, -5.f};
+    glm::vec3      lookAt  = {0.f,  0.f,  0.f};
+    glm::vec3      up      = {0.f,  1.f,  0.f};
+    float          width   = 3.f;
+    float          height  = 3.f;
+    float          fovY    = 0.785398f; // 45 degrees in radians
+    ProjectionType type    = ProjectionType::Orthographic;
 };
+
+// Generates a ray for pixel (ray_idx % img_width, ray_idx / img_width).
+// Callable from both host and device code — no global-memory ray buffers needed.
+__host__ __device__ inline void generateRay(
+    const CameraParams& cam,
+    int ray_idx, int img_width, int img_height,
+    glm::vec3& out_origin, glm::vec3& out_dir
+) {
+    const int   px = ray_idx % img_width;
+    const int   py = ray_idx / img_width;
+    // u: [-0.5, +0.5] left to right.
+    // v: flip py so screen row 0 (ImGui top) maps to +0.5 (world +Y up).
+    const float u  =        float(px) / float(img_width)  - 0.5f;
+    const float v  = 0.5f - float(py) / float(img_height);
+    const glm::vec3 forward = glm::normalize(cam.lookAt - cam.origin);
+    // Standard right-hand basis: right = cross(up, forward).
+    const glm::vec3 right   = glm::normalize(glm::cross(cam.up, forward));
+    const glm::vec3 up_vec  = glm::cross(forward, right);
+
+    if (cam.type == ProjectionType::Orthographic) {
+        out_origin = cam.origin + u * cam.width * right + v * cam.height * up_vec;
+        out_dir    = forward;
+    } else {
+        const float half_h = tanf(cam.fovY * 0.5f);
+        const float half_w = half_h * (float(img_width) / float(img_height));
+        out_origin = cam.origin;
+        out_dir    = glm::normalize(forward
+                     + (u * 2.f * half_w) * right
+                     + (v * 2.f * half_h) * up_vec);
+    }
+}
+
+// Converts an ImGui pixel coordinate (top-left origin) to a world-space point
+// by inverting the camera projection. For orthographic cameras this equals the
+// ray origin; for perspective it lies on the image plane at the camera origin.
+// Used by handleUserInput to map mouse positions to world space.
+inline glm::vec3 unprojectPixel(
+    const CameraParams& cam,
+    glm::vec2 pixel, glm::ivec2 window
+) {
+    glm::vec3 origin, dir;
+    generateRay(cam,
+                static_cast<int>(pixel.y) * window.x + static_cast<int>(pixel.x),
+                window.x, window.y,
+                origin, dir);
+    return origin;
+}
 
 // -----------------------------------------------------------------------------
 // Hit record types
@@ -56,8 +111,9 @@ struct NarrowphaseHit {
 // -----------------------------------------------------------------------------
 
 __global__ void k_broadphase_collision(
-    const glm::vec3*    ray_origins,
-    const glm::vec3*    ray_dirs,
+    CameraParams        camera,
+    int                 width,
+    int                 height,
     const AABB*         foam_aabbs,
     const int*          foam_ids,
     BroadphaseHit*      hits,
@@ -73,8 +129,9 @@ __global__ void k_broadphase_collision(
 // indexed by foam_id. Rays are transformed into each foam's local space before
 // BVH traversal since BVH nodes are built in local particle coordinates.
 __global__ void k_narrowphase_collision(
-    const glm::vec3*     ray_origins,
-    const glm::vec3*     ray_dirs,
+    CameraParams         camera,
+    int                  width,
+    int                  height,
     const BroadphaseHit* broadphase_hits,
     int                  num_broadphase_hits,
     const BVHNode*       bvh_nodes,
@@ -111,8 +168,9 @@ __global__ void k_extract_ray_idx(
 // foam_particle_offsets  foam_particle_offsets[fid] = start of foam fid's
 //                        particles in the flat position/color buffers.
 __global__ void k_exact_collision(
-    const glm::vec3*      ray_origins,
-    const glm::vec3*      ray_dirs,
+    CameraParams          camera,
+    int                   width,
+    int                   height,
     const NarrowphaseHit* narrowphase_hits,
     const int*            unique_ray_ids,
     const int*            ray_hit_offsets,
@@ -146,7 +204,7 @@ public:
         const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
         const entt::registry&                                        particleRegistry,
         const std::unordered_map<int, glm::mat4>&                    foamTransforms,
-        const OrthographicCamera&                                    camera,
+        const CameraParams&                                          camera,
         const glm::ivec2&                                            windowSize
     );
 
@@ -159,12 +217,6 @@ private:
     // Persistent device buffers — allocated once, reused every frame.
     // Capacities track current allocation size for realloc-if-needed.
     // ------------------------------------------------------------------
-
-    // Ray buffers
-    glm::vec3* d_ray_origins_ = nullptr;
-    glm::vec3* d_ray_dirs_    = nullptr;
-    size_t     cap_rays_      = 0;  // capacity for d_ray_origins_
-    size_t     cap_ray_dirs_  = 0;  // capacity for d_ray_dirs_
 
     // Foam AABB buffers
     AABB*  d_foam_aabbs_ = nullptr;
@@ -251,9 +303,6 @@ private:
     glm::vec4* d_output_buffer_   = nullptr;
     size_t     cap_output_buffer_ = 0;
 
-    // Camera cache — ray origins/dirs are only rebuilt when the camera changes.
-    OrthographicCamera last_camera_      = {};
-    glm::ivec2         last_window_size_ = {0, 0};
 };
 
 } // namespace DynamicFoam::Sim2D
