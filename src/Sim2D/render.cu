@@ -235,8 +235,11 @@ __global__ void k_exact_collision(
                 if (numer < 0.f) { valid = false; break; }
             } else {
                 const float t_plane = numer / denom;
-                if (denom > 0.f) t_enter = fmaxf(t_enter, t_plane);
-                else             t_exit  = fminf(t_exit,  t_plane);
+                // Constraint: t * denom <= numer  (ray must stay on P's side)
+                // denom > 0 → t <= t_plane → upper bound on t → tighten t_exit
+                // denom < 0 → t >= t_plane → lower bound on t → tighten t_enter
+                if (denom > 0.f) t_exit  = fminf(t_exit,  t_plane);
+                else             t_enter = fmaxf(t_enter, t_plane);
                 if (t_enter > t_exit) { valid = false; break; }
             }
         }
@@ -285,27 +288,43 @@ void Render::update(
     const glm::vec3 right   = glm::normalize(glm::cross(forward, camera.up));
     const glm::vec3 up      = glm::cross(right, forward);
 
-    std::vector<glm::vec3> origins(num_rays);
-    std::vector<glm::vec3> dirs(num_rays);
+    // Only recompute and re-upload ray data when the camera changes.
+    // For a static orthographic camera this saves ~22 MB of H2D transfer per frame.
+    const bool camera_changed = (
+        camera.origin != last_camera_.origin ||
+        camera.lookAt != last_camera_.lookAt ||
+        camera.up     != last_camera_.up     ||
+        camera.width  != last_camera_.width  ||
+        camera.height != last_camera_.height ||
+        windowSize.x  != last_window_size_.x ||
+        windowSize.y  != last_window_size_.y);
 
-    for (int y = 0; y < windowSize.y; ++y) {
-        for (int x = 0; x < windowSize.x; ++x) {
-            const int   idx = y * windowSize.x + x;
-            const float u   = (float(x) / float(windowSize.x)) - 0.5f;
-            const float v   = (float(y) / float(windowSize.y)) - 0.5f;
-            origins[idx] = camera.origin
-                         + u * camera.width  * right
-                         + v * camera.height * up;
-            dirs[idx] = forward;
+    if (camera_changed) {
+        std::vector<glm::vec3> origins(num_rays);
+        std::vector<glm::vec3> dirs(num_rays);
+
+        for (int y = 0; y < windowSize.y; ++y) {
+            for (int x = 0; x < windowSize.x; ++x) {
+                const int   idx = y * windowSize.x + x;
+                const float u   = (float(x) / float(windowSize.x)) - 0.5f;
+                const float v   = (float(y) / float(windowSize.y)) - 0.5f;
+                origins[idx] = camera.origin
+                             + u * camera.width  * right
+                             + v * camera.height * up;
+                dirs[idx] = forward;
+            }
         }
-    }
 
-    cuda_realloc_if_needed(&d_ray_origins_, &cap_rays_,     num_rays);
-    cuda_realloc_if_needed(&d_ray_dirs_,    &cap_ray_dirs_, num_rays);
-    CUDA_CHECK(cudaMemcpy(d_ray_origins_, origins.data(),
-                          num_rays * sizeof(glm::vec3), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_ray_dirs_, dirs.data(),
-                          num_rays * sizeof(glm::vec3), cudaMemcpyHostToDevice));
+        cuda_realloc_if_needed(&d_ray_origins_, &cap_rays_,     num_rays);
+        cuda_realloc_if_needed(&d_ray_dirs_,    &cap_ray_dirs_, num_rays);
+        CUDA_CHECK(cudaMemcpy(d_ray_origins_, origins.data(),
+                              num_rays * sizeof(glm::vec3), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_ray_dirs_, dirs.data(),
+                              num_rays * sizeof(glm::vec3), cudaMemcpyHostToDevice));
+
+        last_camera_      = camera;
+        last_window_size_ = windowSize;
+    }
 
     // ------------------------------------------------------------------
     // Flat particle buffers + adjacency
@@ -324,35 +343,31 @@ void Render::update(
     // on topology change, but at <=100k particles the memcpy is cheap).
     // ------------------------------------------------------------------
 
-    // GPU CSRs are rebuilt by the topology subsystem whenever the graph
-    // changes. By the time render runs they are already current.
+    // Build CSR, renderer is only place in application where GPU CSR is needed
     for (const auto& [foam_id, adj] : foamAdjacencyLists) {
-        // Ensure an entry exists in foam_gpu_adj_ for every foam even if
-        // the topology subsystem hasn't triggered a rebuild this frame.
-        (void)foam_gpu_adj_[foam_id];
+        auto& gpu_adj = foam_gpu_adj_[foam_id];
+        if (gpu_adj.num_nodes == 0)
+            adj.buildGPUAdjacencyList(gpu_adj);
     }
 
     // Compute per-foam offsets (prefix sum over particle counts).
-    std::vector<int> h_foam_particle_offsets(num_foams + 1, 0);
-    std::vector<int> h_csr_offsets(num_foams + 1, 0);
+    std::vector<int> h_foam_particle_offsets(num_foams, 0);
+    std::vector<int> h_csr_offsets(num_foams, 0);
+    int total_particles = 0;
+    int total_csr_nodes = 0;
     {
         int poffset = 0;
         int coffset = 0;
-        int fi = 0;
         for (const auto& [foam_id, adj] : foamAdjacencyLists) {
-            h_foam_particle_offsets[fi] = poffset;
-            h_csr_offsets[fi]           = coffset;
+            h_foam_particle_offsets[foam_id] = poffset;
+            h_csr_offsets[foam_id]           = coffset;
             const uint32_t n = adj.nodeCount();
             poffset += static_cast<int>(n);
             coffset += static_cast<int>(n) + 1; // node_offsets has N+1 entries
-            ++fi;
         }
-        h_foam_particle_offsets[fi] = poffset;
-        h_csr_offsets[fi]           = coffset;
+        total_particles = poffset;
+        total_csr_nodes = coffset;
     }
-
-    const int total_particles = h_foam_particle_offsets[num_foams];
-    const int total_csr_nodes = h_csr_offsets[num_foams];
 
     // Build flat host buffers by iterating each foam's ordered node list.
     std::vector<glm::vec3> h_positions(total_particles,    glm::vec3(0.f));
@@ -363,10 +378,9 @@ void Render::update(
     h_csr_nbrs.reserve(total_particles * 6); // rough upper bound
 
     {
-        int fi = 0;
         for (const auto& [foam_id, adj] : foamAdjacencyLists) {
-            const int pbase  = h_foam_particle_offsets[fi];
-            const int cbase  = h_csr_offsets[fi];
+            const int pbase  = h_foam_particle_offsets[foam_id];
+            const int cbase  = h_csr_offsets[foam_id];
             const auto& gpu  = foam_gpu_adj_[foam_id];
             const auto nodes = adj.getOrderedNodeIds(); // host-side ordered list
 
@@ -405,8 +419,6 @@ void Render::update(
                     gpu.num_edges * sizeof(uint32_t), cudaMemcpyDeviceToHost));
                 h_csr_nbrs.insert(h_csr_nbrs.end(), local_nbrs.begin(), local_nbrs.end());
             }
-
-            ++fi;
         }
     }
 

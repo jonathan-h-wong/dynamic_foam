@@ -160,13 +160,22 @@ namespace DynamicFoam::Sim2D {
     }
 
     void Simulation::handleUserInput(const UserInput& input) {
-        // Convert from ImGui screen coordinates (top-left origin) to world coordinates (center origin)
-        float world_x = input.mouse_pos.x - windowSize_.x / 2.0f;
-        float world_y = -(input.mouse_pos.y - windowSize_.y / 2.0f); // Flip y-axis
+        // Guard: ImGui reports (-FLT_MAX, -FLT_MAX) when the mouse is outside the window.
+        if (input.mouse_pos.x < -1e6f || input.mouse_pos.y < -1e6f) return;
+
+        // Convert from ImGui pixel coordinates (top-left origin) to world space.
+        // cameraWorldWidth_ is the total world-space width of the ortho view;
+        // camera.up=(0,-1,0) means screen-Y increases downward, so world-Y is negated.
+        const float worldWidth  = cameraWorldWidth_;
+        const float worldHeight = worldWidth * (float(windowSize_.y) / float(windowSize_.x));
+        const float world_x =  (input.mouse_pos.x / float(windowSize_.x) - 0.5f) * worldWidth;
+        const float world_y = -(input.mouse_pos.y / float(windowSize_.y) - 0.5f) * worldHeight;
 
         foamRegistry.view<Controller, Position>().each([&](auto entity, auto& pos) {
             pos.value = glm::vec3(world_x, world_y, 0.0f);
             applyForwardKinematics(entity);
+            buildBVH(entity);   // keep narrowphase BVH in sync with particle world positions
+            buildAABB(entity);  // keep broadphase AABB in sync with particle world positions
         });
     }
 
@@ -264,9 +273,9 @@ namespace DynamicFoam::Sim2D {
         OrthographicCamera camera;
         camera.origin = glm::vec3(0.0f, 0.0f, -5.0f);
         camera.lookAt = glm::vec3(0.0f, 0.0f, 0.0f);
-        camera.up = glm::vec3(0.0f, 1.0f, 0.0f);
-        camera.width = windowSize_.x;
-        camera.height = windowSize_.y;
+        camera.up = glm::vec3(0.0f, -1.0f, 0.0f);
+        camera.width  = cameraWorldWidth_;
+        camera.height = cameraWorldWidth_ * (float(windowSize_.y) / float(windowSize_.x));
         renderSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, foamTransforms, camera, windowSize_);
     }
 

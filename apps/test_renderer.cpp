@@ -139,11 +139,13 @@ int main() {
             ImGuiWindowFlags_NoBackground |
             ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-        // Flip UVs vertically: CUDA fills row 0 = top, GL stores row 0 = bottom
+        // No UV flip needed: glTexSubImage2D places CUDA row 0 at GL v=0 (texture
+        // bottom), and ImGui maps screen-top to uv v=0, so the two conventions
+        // cancel and the image is displayed right-side-up without any extra flip.
         ImGui::Image(
             (ImTextureID)(uintptr_t)renderTex,
             ImVec2(static_cast<float>(WIDTH), static_cast<float>(HEIGHT)),
-            ImVec2(0, 1), ImVec2(1, 0));   // uv0 / uv1 flip
+            ImVec2(0, 0), ImVec2(1, 1));
 
         ImGui::End();
 

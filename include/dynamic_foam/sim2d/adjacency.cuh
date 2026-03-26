@@ -72,7 +72,7 @@ __global__ void remapCOOKernel(
     int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) remapped[i] = inverse_map[raw[i]];
+    if (i < n) remapped[i] = inverse_map[static_cast<uint32_t>(raw[i])];
 }
 
 // Build inverse map from sorted index array.
@@ -271,7 +271,7 @@ public:
     void buildGPUAdjacencyList(
         AdjacencyListGPU<T>& out,
         const uint32_t*      d_morton_sorted_ids = nullptr,
-        cudaStream_t         stream = 0)
+        cudaStream_t         stream = 0) const
     {
 
         const uint32_t N = static_cast<uint32_t>(nodeHeads.size());
@@ -291,14 +291,20 @@ public:
 
         // ------------------------------------------------------------------
         // Step 1 — upload node ordering
+        //
+        // Build h_nodes unconditionally so we can compute max_entity_id below
+        // (entity IDs are globally assigned by entt and may be much larger than N).
         // ------------------------------------------------------------------
+        std::vector<T> h_nodes;
+        h_nodes.reserve(N);
         if (d_morton_sorted_ids) {
+            h_nodes.resize(N);
+            CUDA_CHECK(cudaMemcpy(h_nodes.data(), d_morton_sorted_ids,
+                N * sizeof(T), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(
                 out.nodes, d_morton_sorted_ids,
                 N * sizeof(T), cudaMemcpyDeviceToDevice));
         } else {
-            std::vector<T> h_nodes;
-            h_nodes.reserve(N);
             for (const auto& [node, _] : nodeHeads)
                 h_nodes.push_back(node);
             CUDA_CHECK(cudaMemcpy(
@@ -308,9 +314,19 @@ public:
 
         // ------------------------------------------------------------------
         // Step 2 — build inverse map: node_id -> sorted position
+        //
+        // Entity IDs are assigned globally by entt (not per-foam), so the max
+        // ID can be >> N. Allocate the map to max_entity_id + 1 and zero-fill
+        // unused slots to avoid out-of-bounds writes from buildInverseMapKernel.
         // ------------------------------------------------------------------
+        uint32_t max_entity_id = 0;
+        for (const auto& v : h_nodes)
+            max_entity_id = std::max(max_entity_id, static_cast<uint32_t>(v));
+
         uint32_t* d_inverse_map = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_inverse_map, N * sizeof(uint32_t)));
+        const uint32_t inv_map_size = max_entity_id + 1;
+        CUDA_CHECK(cudaMalloc(&d_inverse_map, inv_map_size * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(d_inverse_map, 0, inv_map_size * sizeof(uint32_t)));
 
         buildInverseMapKernel<<<grid_size(N), 256, 0, stream>>>(
             reinterpret_cast<const uint32_t*>(out.nodes),

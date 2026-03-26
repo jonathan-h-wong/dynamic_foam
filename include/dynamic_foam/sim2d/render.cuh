@@ -250,6 +250,10 @@ private:
     // Final pixel output
     glm::vec4* d_output_buffer_   = nullptr;
     size_t     cap_output_buffer_ = 0;
+
+    // Camera cache — ray origins/dirs are only rebuilt when the camera changes.
+    OrthographicCamera last_camera_      = {};
+    glm::ivec2         last_window_size_ = {0, 0};
 };
 
 } // namespace DynamicFoam::Sim2D
