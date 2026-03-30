@@ -23,7 +23,6 @@ FetchContent_MakeAvailable(imgui_backends)
 
 # Source files
 set (DYNAMIC_FOAM_SOURCES
-    kernels.cu
     Sim2D/bvh.cu
     Sim2D/render.cu
     Sim2D/collision.cu
