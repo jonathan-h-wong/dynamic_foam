@@ -272,9 +272,6 @@ __global__ void k_exact_collision(
         if (overlay.show_edges || overlay.show_centers) {
             const glm::vec3 p_hit = origin + best_t * dir;
             const glm::vec3 p_pos = particle_positions[best_particle];
-            // 2D projection used only for the screen-space center-dot check.
-            const glm::vec2 hit2d = glm::vec2(p_hit.x, p_hit.y);
-            const glm::vec2 p2d   = glm::vec2(p_pos.x, p_pos.y);
 
             // --- Edge overlay ---
             // Compute the 3D signed distance from p_hit to each Voronoi bisector
@@ -315,9 +312,13 @@ __global__ void k_exact_collision(
             }
 
             // --- Center overlay (drawn on top of edge overlay) ---
-            if (overlay.show_centers) {
-                const float dist2d = glm::length(hit2d - p2d);
-                if (dist2d < overlay.center_radius)
+            // Calculate distance between hit site and midpoint to neighbor is within overlay.center_radius
+            if (overlay.show_centers && best_enter_k != ~0u) {
+                const int       fp_offset_c = foam_particle_offsets[best_foam_id];
+                const int       nid         = fp_offset_c + (int)csr_nbrs[best_enter_k];
+                const glm::vec3 n_pos_c     = particle_positions[nid];
+                const glm::vec3 midpoint    = (p_pos + n_pos_c) * 0.5f;
+                if (glm::length(p_hit - midpoint) < overlay.center_radius)
                     out_color = overlay.center_color;
             }
         }

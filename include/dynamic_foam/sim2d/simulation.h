@@ -23,7 +23,7 @@ class Simulation {
         ~Simulation() = default;
 
         // Subsystems
-        void handleUserInput(const UserInput& input);
+        void handleUserInput(const UserInput& input, float deltaTime);
         void updateTopology(
             const std::unordered_map<int, AABB>&                         foamAABBs,
             const std::unordered_map<int, BVH>&                          foamBVHs,
@@ -36,14 +36,21 @@ class Simulation {
             const std::unordered_map<int, AABB>&                         foamAABBs,
             const std::unordered_map<int, BVH>&                          foamBVHs,
             const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-            const entt::registry&                                        particleRegistry,
-            const RenderOverlayParams&                                   overlays = {}
+            const entt::registry&                                        particleRegistry
         );
-        void step(const UserInput& input, float deltaTime, const RenderOverlayParams& overlays = {});
+        void step(const UserInput& input, float deltaTime);
 
         // Returns the device-side RGBA output buffer produced by the last render call.
         // Valid only after the first call to step(). Lifetime is managed by the Render subsystem.
         const glm::vec4* deviceOutputBuffer() const { return renderSubsystem.deviceOutputBuffer(); }
+
+        // Persistent render overlay configuration — mutate freely between steps.
+        RenderOverlayParams overlayParams;
+
+        // Camera descriptor — mutate freely between steps.
+        // origin/lookAt/up/width/type/fovY are logical parameters;
+        // height is recomputed from the aspect ratio each frame inside render().
+        CameraParams camera_;
 
     private:
         void applyForwardKinematics(
@@ -67,10 +74,6 @@ class Simulation {
         std::unordered_map<int, AABB> foamAABBs;
         
         glm::ivec2 windowSize_;
-        // Camera descriptor shared by render() and handleUserInput().
-        // origin/lookAt/up/width/type/fovY hold the logical camera parameters;
-        // height is recomputed from the aspect ratio each frame inside render().
-        CameraParams camera_;
 
         Topology topologySubsystem;
         Physics physicsSubsystem;

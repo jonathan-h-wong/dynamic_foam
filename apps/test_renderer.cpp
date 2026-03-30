@@ -88,11 +88,6 @@ int main() {
     glBindTexture(GL_TEXTURE_2D, 0);
 
     // -----------------------------------------------------------------------
-    // Overlay state — persists across frames
-    // -----------------------------------------------------------------------
-    RenderOverlayParams overlays;
-
-    // -----------------------------------------------------------------------
     // Main loop
     // -----------------------------------------------------------------------
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -113,7 +108,7 @@ int main() {
 
         // Poll input and advance simulation
         UserInput input = PollUserInput();
-        sim.step(input, dt, overlays);
+        sim.step(input, dt);
 
         // Copy CUDA device output buffer → host → OpenGL texture
         const glm::vec4* d_output = sim.deviceOutputBuffer();
@@ -165,20 +160,36 @@ int main() {
         ImGui::Separator();
         ImGui::Text("%.1f FPS  (%.2f ms)", 1.0f / dt, dt * 1000.0f);
         ImGui::Separator();
+        // --- Camera projection ---
+        ImGui::Text("Camera");
+        int projType = static_cast<int>(sim.camera_.type);
+        if (ImGui::RadioButton("Orthographic", &projType, static_cast<int>(ProjectionType::Orthographic)))
+            sim.camera_.type = ProjectionType::Orthographic;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Perspective", &projType, static_cast<int>(ProjectionType::Perspective)))
+            sim.camera_.type = ProjectionType::Perspective;
+        if (sim.camera_.type == ProjectionType::Orthographic) {
+            ImGui::SliderFloat("Width", &sim.camera_.width, 0.5f, 20.0f);
+        } else {
+            float fovDeg = glm::degrees(sim.camera_.fovY);
+            if (ImGui::SliderFloat("FoV", &fovDeg, 5.0f, 120.0f))
+                sim.camera_.fovY = glm::radians(fovDeg);
+        }
+        ImGui::Separator();
         ImGui::Text("Overlays");
 
         // --- Cell centers ---
-        ImGui::Checkbox("Cell centers", &overlays.show_centers);
-        if (overlays.show_centers) {
+        ImGui::Checkbox("Cell centers", &sim.overlayParams.show_centers);
+        if (sim.overlayParams.show_centers) {
             // glm::vec4 is contiguous floats — safe to pass as float[4]
-            ImGui::ColorEdit4("Center color", &overlays.center_color.x,
+            ImGui::ColorEdit4("Center color", &sim.overlayParams.center_color.x,
                 ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
         }
 
         // --- Cell edges ---
-        ImGui::Checkbox("Cell edges", &overlays.show_edges);
-        if (overlays.show_edges) {
-            ImGui::ColorEdit4("Edge color", &overlays.edge_color.x,
+        ImGui::Checkbox("Cell edges", &sim.overlayParams.show_edges);
+        if (sim.overlayParams.show_edges) {
+            ImGui::ColorEdit4("Edge color", &sim.overlayParams.edge_color.x,
                 ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
         }
 

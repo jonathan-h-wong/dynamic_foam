@@ -159,7 +159,47 @@ namespace DynamicFoam::Sim2D {
         }
     }
 
-    void Simulation::handleUserInput(const UserInput& input) {
+    void Simulation::handleUserInput(const UserInput& input, float deltaTime) {
+        // --- Orbital camera: WASD moves along the tangent plane of the upper hemisphere ---
+        {
+            const float     r     = glm::length(camera_.origin);
+            const glm::vec3 r_hat = camera_.origin / r;
+            const glm::vec3 worldUp = glm::vec3(0.f, 1.f, 0.f);
+
+            // Skip when at the degenerate north-pole (cross product undefined).
+            if (glm::length(glm::vec2(r_hat.x, r_hat.z)) > 1e-6f) {
+                // Tangent-plane basis at the current camera position:
+                //   camRight   — azimuthal (+X when at south face), drives A/D
+                //   camForward — polar toward north pole, drives W/S
+                //   camUp      — outward radial normal (not used for movement)
+                const glm::vec3 camRight   = glm::normalize(glm::cross(worldUp, r_hat));
+                const glm::vec3 camForward = glm::cross(r_hat, camRight);
+                const glm::vec3 camUp      = r_hat; // outward normal, kept for reference
+                (void)camUp;
+
+                const float speed = 1.5f; // world-space units per second
+                const float fwd   = (input.key_w ? 1.f : 0.f) - (input.key_s ? 1.f : 0.f);
+                const float right = (input.key_d ? 1.f : 0.f) - (input.key_a ? 1.f : 0.f);
+
+                if (fwd != 0.f || right != 0.f) {
+                    // Step along the tangent plane then re-project onto the sphere.
+                    glm::vec3 new_pos = glm::normalize(
+                        camera_.origin + speed * deltaTime * (fwd * camForward + right * camRight)
+                    ) * r;
+
+                    // Clamp to upper hemisphere (y >= 0); re-project onto equatorial circle.
+                    if (new_pos.y < 0.f) {
+                        new_pos.y = 0.f;
+                        const float xz_len = glm::length(glm::vec2(new_pos.x, new_pos.z));
+                        if (xz_len > 1e-6f)
+                            new_pos = glm::vec3(new_pos.x / xz_len, 0.f, new_pos.z / xz_len) * r;
+                    }
+
+                    camera_.origin = new_pos;
+                }
+            }
+        }
+
         // Guard: ImGui reports (-FLT_MAX, -FLT_MAX) when the mouse is outside the window.
         if (input.mouse_pos.x < -1e6f || input.mouse_pos.y < -1e6f) return;
 
@@ -256,8 +296,7 @@ namespace DynamicFoam::Sim2D {
         const std::unordered_map<int, AABB>&                         foamAABBs,
         const std::unordered_map<int, BVH>&                          foamBVHs,
         const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-        const entt::registry&                                        particleRegistry,
-        const RenderOverlayParams&                                   overlays
+        const entt::registry&                                        particleRegistry
     ) {
         // Build per-foam world transforms from position and orientation.
         // These are passed to the render subsystem so it can compute inverse
@@ -272,13 +311,13 @@ namespace DynamicFoam::Sim2D {
 
         // Recompute viewport height from current aspect ratio before rendering.
         camera_.height = camera_.width * (float(windowSize_.y) / float(windowSize_.x));
-        renderSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, foamTransforms, camera_, windowSize_, overlays);
+        renderSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, foamTransforms, camera_, windowSize_, overlayParams);
     }
 
-    void Simulation::step(const UserInput& input, float deltaTime, const RenderOverlayParams& overlays) {
-        handleUserInput(input);
+    void Simulation::step(const UserInput& input, float deltaTime) {
+        handleUserInput(input, deltaTime);
         updateTopology(foamAABBs, foamBVHs, foamAdjacencyLists);
         updatePhysics(foamAABBs, foamBVHs, deltaTime);
-        render(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, overlays);
+        render(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry);
     }
 };
