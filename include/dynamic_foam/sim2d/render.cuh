@@ -13,10 +13,12 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "dynamic_foam/Sim2D/adjacency.cuh"
 #include "dynamic_foam/Sim2D/bvh.cuh"
 #include "dynamic_foam/Sim2D/cuda_utils.cuh"
+#include "dynamic_foam/Sim2D/gpu_slab.cuh"
 
 namespace DynamicFoam::Sim2D {
 
@@ -210,18 +212,21 @@ public:
     ~Render();
 
     // All arguments are const: the render subsystem only reads simulation state.
+    //
+    // slab           Holds pre-built BVH nodes, CSR, and particle data for all
+    //                foams.  Particle positions must already have been uploaded
+    //                to the slab by the caller (Simulation) before this call.
     // foamTransforms maps foam_id -> world transform (position * rotation mat4).
-    // Their inverses are computed on the host and uploaded so the narrowphase
-    // kernel can transform rays into each foam's local BVH space.
+    //                Their inverses are computed on the host and uploaded so the
+    //                narrowphase kernel can transform rays into each foam's local
+    //                BVH space.
     void update(
-        const std::unordered_map<int, AABB>&                         foamAABBs,
-        const std::unordered_map<int, BVH>&                          foamBVHs,
-        const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-        const entt::registry&                                        particleRegistry,
-        const std::unordered_map<int, glm::mat4>&                    foamTransforms,
-        const CameraParams&                                          camera,
-        const glm::ivec2&                                            windowSize,
-        const RenderOverlayParams&                                   overlay = {}
+        const std::unordered_map<int, AABB>&      foamAABBs,
+        const GpuSlabAllocator&                   slab,
+        const std::unordered_map<int, glm::mat4>& foamTransforms,
+        const CameraParams&                       camera,
+        const glm::ivec2&                         windowSize,
+        const RenderOverlayParams&                overlay = {}
     );
 
     const glm::vec4* deviceOutputBuffer() const { return d_output_buffer_; }
@@ -239,18 +244,6 @@ private:
     int*   d_foam_ids_   = nullptr;
     size_t cap_foams_    = 0;
     size_t cap_foam_ids_ = 0;
-
-    // BVH node/offset buffers
-    BVHNode* d_bvh_nodes_     = nullptr;
-    int*     d_bvh_offsets_   = nullptr;
-    size_t   cap_bvh_nodes_   = 0;
-    size_t   cap_bvh_offsets_ = 0;
-
-    // Surface mask — one uint8_t per particle: 1 = surface, 0 = interior.
-    // Built from entt Surface tag each frame and used in k_narrowphase_collision
-    // to skip interior particles before they reach exact collision.
-    uint8_t* d_surface_mask_   = nullptr;
-    size_t   cap_surface_mask_ = 0;
 
     // Broadphase hit buffer + atomic counter
     BroadphaseHit* d_broadphase_hits_        = nullptr;
@@ -282,32 +275,6 @@ private:
     // Compact per-ray offsets into the sorted hit buffer (length = num_unique)
     int*   d_ray_hit_offsets_   = nullptr;
     size_t cap_ray_hit_offsets_ = 0;
-
-    // Particle data buffers — uploaded each frame from the entt registry
-    glm::vec3* d_particle_positions_ = nullptr;
-    glm::vec4* d_particle_colors_    = nullptr;
-    size_t     cap_particles_        = 0;
-    size_t     cap_particle_colors_  = 0;
-
-    // Per-foam GPU adjacency lists
-    std::unordered_map<int, AdjacencyListGPU<entt::entity>> foam_gpu_adj_;
-
-    // Flat concatenated CSR — all foams packed end-to-end.
-    // csr_node_offsets[csr_offsets[fid] + local_idx] = neighbor run start.
-    // csr_nbrs entries are foam-local sorted positions.
-    // Rebuilt from host each frame alongside particle buffers.
-    uint32_t* d_csr_node_offsets_   = nullptr;
-    size_t    cap_csr_node_offsets_ = 0;
-    uint32_t* d_csr_nbrs_           = nullptr;
-    size_t    cap_csr_nbrs_         = 0;
-
-    // Per-foam offset tables (one int per foam).
-    // d_csr_offsets_[fid]           = start of foam fid in d_csr_node_offsets_.
-    // d_foam_particle_offsets_[fid] = start of foam fid in flat particle arrays.
-    int*   d_csr_offsets_            = nullptr;
-    int*   d_foam_particle_offsets_  = nullptr;
-    size_t cap_foam_offsets_         = 0;
-    size_t cap_csr_offsets_          = 0;
 
     // Per-foam inverse world-to-local transforms — one mat4 per foam, indexed
     // by foam_id. Used in k_narrowphase_collision to transform rays into the

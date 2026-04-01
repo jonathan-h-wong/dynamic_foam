@@ -47,11 +47,19 @@ struct AdjacencyListGPU {
     size_t nbrs_capacity         = 0;
     size_t node_offsets_capacity = 0;
 
+    // Ownership flags.  When false the pointer is a slice owned by an external
+    // allocator (e.g. GpuSlabAllocator); free() must not cudaFree it.
+    bool nodes_owned        = true;
+    bool nbrs_owned         = true;
+    bool node_offsets_owned = true;
+
     void free() {
-        if (nodes)        { cudaFree(nodes);        nodes        = nullptr; }
-        if (nbrs)         { cudaFree(nbrs);          nbrs         = nullptr; }
-        if (node_offsets) { cudaFree(node_offsets);  node_offsets = nullptr; }
-        nodes_capacity = nbrs_capacity = node_offsets_capacity = 0;
+        if (nodes        && nodes_owned)        { cudaFree(nodes);        }
+        if (nbrs         && nbrs_owned)         { cudaFree(nbrs);         }
+        if (node_offsets && node_offsets_owned) { cudaFree(node_offsets); }
+        nodes        = nullptr;  nodes_owned        = true;  nodes_capacity        = 0;
+        nbrs         = nullptr;  nbrs_owned         = true;  nbrs_capacity         = 0;
+        node_offsets = nullptr;  node_offsets_owned = true;  node_offsets_capacity = 0;
         num_nodes = num_edges = 0;
     }
 };
@@ -283,11 +291,23 @@ public:
         out.num_edges = E;
 
         // ------------------------------------------------------------------
-        // Grow persistent output buffers as needed
+        // Grow persistent output buffers as needed.
+        // Non-owned buffers (slab slices) must already have enough capacity;
+        // we assert rather than reallocate them.
         // ------------------------------------------------------------------
-        cuda_realloc_if_needed(&out.nodes,        &out.nodes_capacity,        N);
-        cuda_realloc_if_needed(&out.nbrs,          &out.nbrs_capacity,         E);
-        cuda_realloc_if_needed(&out.node_offsets,  &out.node_offsets_capacity, N + 1);
+        cuda_realloc_if_needed(&out.nodes, &out.nodes_capacity, N);
+        if (out.nbrs_owned) {
+            cuda_realloc_if_needed(&out.nbrs, &out.nbrs_capacity, E);
+        } else {
+            assert(out.nbrs_capacity >= E &&
+                   "slab nbrs slice is too small for this foam");
+        }
+        if (out.node_offsets_owned) {
+            cuda_realloc_if_needed(&out.node_offsets, &out.node_offsets_capacity, N + 1);
+        } else {
+            assert(out.node_offsets_capacity >= N + 1 &&
+                   "slab node_offsets slice is too small for this foam");
+        }
 
         // ------------------------------------------------------------------
         // Step 1 — upload node ordering
@@ -429,6 +449,49 @@ public:
         CUDA_CHECK(cudaFree(d_run_lengths));
         CUDA_CHECK(cudaFree(d_num_runs));
         CUDA_CHECK(cudaFree(d_degrees));
+    }
+#endif // __CUDACC__
+
+    // -------------------------------------------------------------------------
+    // buildGPUAdjacencyListIntoSlice
+    //
+    // Slab variant: d_nbrs_slice and d_node_offsets_slice are pre-allocated
+    // device memory owned by an external allocator (GpuSlabAllocator).  The
+    // adjacency list writes directly into these slices and will NOT free them.
+    //
+    // nbrs_cap        must be >= E (num directed edges in this foam).
+    // node_offsets_cap must be >= N + 1 (num nodes + sentinel).
+    //
+    // After this call, out.nbrs and out.node_offsets point at the slices with
+    // nbrs_owned = false / node_offsets_owned = false so that out.free() is
+    // safe to call without leaking.
+    // -------------------------------------------------------------------------
+#ifdef __CUDACC__
+    void buildGPUAdjacencyListIntoSlice(
+        AdjacencyListGPU<T>& out,
+        uint32_t*            d_nbrs_slice,
+        size_t               nbrs_cap,
+        uint32_t*            d_node_offsets_slice,
+        size_t               node_offsets_cap,
+        const uint32_t*      d_morton_sorted_ids = nullptr,
+        cudaStream_t         stream = 0) const
+    {
+        // Free any previously owned nbrs / node_offsets buffers, then adopt
+        // the slices without taking ownership.
+        if (out.nbrs         && out.nbrs_owned)         { cudaFree(out.nbrs);         }
+        if (out.node_offsets && out.node_offsets_owned) { cudaFree(out.node_offsets); }
+
+        out.nbrs                  = d_nbrs_slice;
+        out.nbrs_capacity         = nbrs_cap;
+        out.nbrs_owned            = false;
+
+        out.node_offsets          = d_node_offsets_slice;
+        out.node_offsets_capacity = node_offsets_cap;
+        out.node_offsets_owned    = false;
+
+        // Delegate to the main builder which will skip realloc for non-owned
+        // buffers (capacity is already set to the slice size).
+        buildGPUAdjacencyList(out, d_morton_sorted_ids, stream);
     }
 #endif // __CUDACC__
 

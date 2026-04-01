@@ -4,6 +4,19 @@
 #include <entt/entity/registry.hpp>
 
 namespace DynamicFoam::Sim2D {
+
+// Forward declarations for the CUDA helpers implemented in simulation_gpu.cu.
+// These are free functions that wrap __CUDACC__-guarded template methods so
+// they can be called from MSVC-compiled simulation.cpp without triggering the
+// nvcc/entt registry compatibility issue.
+void buildAdjacencyIntoSlabSlice(
+    AdjacencyList<entt::entity>& adj,
+    AdjacencyListGPU<entt::entity>& out,
+    uint32_t* d_nbrs_slice,         size_t nbrs_cap,
+    uint32_t* d_node_offsets_slice, size_t node_offsets_cap);
+
+void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
+
     Simulation::Simulation(
         const SceneGraph& sceneGraph, 
         const glm::ivec2& windowSize
@@ -87,9 +100,13 @@ namespace DynamicFoam::Sim2D {
             for(const auto& p_id : surface_cells){
                 particleRegistry.emplace<Surface>(particleMap.at(p_id));
             }
-
-
         }
+
+        // Initialise the GPU slab (allocates device buffers, builds BVH and
+        // CSR adjacency into slab slices, uploads static particle data).
+        // Must be called after all foams have been fully constructed above.
+        // Implemented in simulation_gpu.cu (requires nvcc / __CUDACC__).
+        initSlab();
     }
 
     void Simulation::buildAABB(entt::entity foamEntity) {
@@ -104,18 +121,159 @@ namespace DynamicFoam::Sim2D {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // initSlab
+    //
+    // Allocates and populates the GpuSlabAllocator from the CPU-side with foam data
+    // structures built during the constructor. This function is intentionally
+    // in simulation.cpp (MSVC) so it can access entt registry members; the two
+    // CUDA-kernel-guarded calls are delegated to free functions in
+    // simulation_gpu.cu via the forward declarations at the top of this file.
+    // -------------------------------------------------------------------------
+    void Simulation::initSlab() {
+        // Tally buffer totals across all foams.
+        int total_bvh_nodes = 0;
+        int total_csr_nodes = 0; // Σ (N_i + 1)
+        int total_csr_edges = 0; // Σ directed edge count
+        int total_particles = 0;
+
+        for (const auto& [foam_id, adj] : foamAdjacencyLists) {
+            const int N = adj.nodeCount();
+            const int E = static_cast<int>(adj.getCOOSrc().size());
+            total_bvh_nodes += (N > 1) ? 2 * N - 1 : 1;
+            total_csr_nodes += N + 1;
+            total_csr_edges += E;
+            total_particles += N;
+        }
+
+        // Allocate flat device buffers.
+        gpuSlab.init(total_bvh_nodes, total_csr_nodes, total_csr_edges, total_particles);
+
+        // Per-foam slice setup.
+        for (auto& [foam_id, adj] : foamAdjacencyLists) {
+            const int N             = static_cast<int>(adj.nodeCount());
+            const int E             = static_cast<int>(adj.getCOOSrc().size());
+            const int num_bvh_nodes = (N > 1) ? 2 * N - 1 : 1;
+
+            // Allocate a 2×-overcommitted slab slot.
+            gpuSlab.allocate(foam_id, num_bvh_nodes, N + 1, E, N);
+            const FoamSlot& slot = gpuSlab.slots.at(foam_id);
+
+            // Rebuild BVH into the slab slice.
+            const auto& ordered = adj.getOrderedNodeIds();
+            std::vector<AABB> ordered_aabbs;
+            ordered_aabbs.reserve(N);
+            for (auto e : ordered) {
+                const auto& verts = particleRegistry.get<ParticleVertices>(e).vertices;
+                auto [mn, mx] = calculateAABB(verts);
+                ordered_aabbs.push_back(AABB(mn, mx));
+            }
+            foamBVHs.at(foam_id).build(
+                ordered_aabbs.data(), N,
+                gpuSlab.d_bvh_nodes + slot.bvh_offset,
+                slot.bvh_capacity);
+
+            // Build GPU CSR into slab slices and bias offsets.
+            // Uses free-function wrappers in simulation_gpu.cu (nvcc-compiled)
+            // to avoid entt/nvcc registry incompatibility in .cu files.
+            buildAdjacencyIntoSlabSlice(
+                adj,
+                foamGpuAdj[foam_id],
+                gpuSlab.d_csr_nbrs         + slot.csr_edge_offset,
+                static_cast<size_t>(slot.csr_edge_capacity),
+                gpuSlab.d_csr_node_offsets + slot.csr_node_offset,
+                static_cast<size_t>(slot.csr_node_capacity));
+
+            biasSlabCsrOffsets(gpuSlab, foam_id);
+
+            // Upload static particle data (colors + surface mask) once.
+            std::vector<glm::vec4> h_colors(N);
+            std::vector<uint8_t>   h_mask(N, 0);
+            for (int li = 0; li < N; ++li) {
+                const entt::entity e = ordered[li];
+                const auto* c = particleRegistry.try_get<ParticleColor>(e);
+                const auto* o = particleRegistry.try_get<ParticleOpacity>(e);
+                if (c && o) h_colors[li] = glm::vec4(c->rgb, o->value);
+                if (particleRegistry.all_of<Surface>(e)) h_mask[li] = 1;
+            }
+            gpuSlab.uploadParticleColors(foam_id, h_colors.data(), N);
+            gpuSlab.uploadSurfaceMask(foam_id, h_mask.data(), N);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // rebuildAllSlabCsr
+    //
+    // Rebuilds the GPU CSR adjacency for every live foam directly into its
+    // current slab slice, then re-biases the node_offsets.
+    //
+    // This must be called after gpuSlab.compact().  compact() D->D moves the
+    // raw CSR node_offsets values but does not update the bias they carry: each
+    // value was written as (0-based_offset + old_csr_edge_offset).  After
+    // compaction csr_edge_offset has changed, so the values are wrong.
+    // Rebuilding from the always-valid CPU adjacency lists corrects this in one
+    // pass without any extra kernel.
+    // -------------------------------------------------------------------------
+    void Simulation::rebuildAllSlabCsr() {
+        for (auto& [foam_id, adj] : foamAdjacencyLists) {
+            auto it = gpuSlab.slots.find(foam_id);
+            if (it == gpuSlab.slots.end() || it->second.dead) continue;
+            const FoamSlot& slot = it->second;
+            buildAdjacencyIntoSlabSlice(
+                adj, foamGpuAdj[foam_id],
+                gpuSlab.d_csr_nbrs         + slot.csr_edge_offset,
+                static_cast<size_t>(slot.csr_edge_capacity),
+                gpuSlab.d_csr_node_offsets + slot.csr_node_offset,
+                static_cast<size_t>(slot.csr_node_capacity));
+            biasSlabCsrOffsets(gpuSlab, foam_id);
+        }
+    }
+
     void Simulation::buildBVH(entt::entity foamEntity) {
-        const auto& ordered = foamAdjacencyLists.at(static_cast<int>(foamEntity)).getOrderedNodeIds();
+        const int foam_id   = static_cast<int>(foamEntity);
+        auto& adj           = foamAdjacencyLists.at(foam_id);
+        const auto& ordered = adj.getOrderedNodeIds();
+        const int N = static_cast<int>(ordered.size());
+        const int E = static_cast<int>(adj.getCOOSrc().size());
+
         std::vector<AABB> ordered_aabbs;
-        ordered_aabbs.reserve(ordered.size());
+        ordered_aabbs.reserve(N);
         for (auto e : ordered) {
             const auto& verts = particleRegistry.get<ParticleVertices>(e).vertices;
-            auto [min, max] = calculateAABB(verts);
-            ordered_aabbs.push_back(AABB(min, max));
+            auto [mn, mx] = calculateAABB(verts);
+            ordered_aabbs.push_back(AABB(mn, mx));
         }
-        BVH bvh;
-        bvh.build(ordered_aabbs.data(), ordered_aabbs.size());
-        foamBVHs[static_cast<int>(foamEntity)] = std::move(bvh);
+
+        auto it = gpuSlab.slots.find(foam_id);
+        if (it != gpuSlab.slots.end() && !it->second.dead) {
+            const int num_bvh_nodes = (N > 1) ? 2 * N - 1 : 1;
+
+            // If particle count has grown beyond the 2x overcommit, tombstone the
+            // old slot and allocate a larger one.  The CSR must also be rebuilt
+            // into the new slice since the edge-block start offset has changed.
+            if (gpuSlab.needsResize(foam_id, num_bvh_nodes, N + 1, E, N)) {
+                gpuSlab.resize(foam_id, num_bvh_nodes, N + 1, E, N);
+                const FoamSlot& newSlot = gpuSlab.slots.at(foam_id);
+                buildAdjacencyIntoSlabSlice(
+                    adj, foamGpuAdj[foam_id],
+                    gpuSlab.d_csr_nbrs         + newSlot.csr_edge_offset,
+                    static_cast<size_t>(newSlot.csr_edge_capacity),
+                    gpuSlab.d_csr_node_offsets + newSlot.csr_node_offset,
+                    static_cast<size_t>(newSlot.csr_node_capacity));
+                biasSlabCsrOffsets(gpuSlab, foam_id);
+            }
+
+            const FoamSlot& slot = gpuSlab.slots.at(foam_id);
+            foamBVHs[foam_id].build(ordered_aabbs.data(), N,
+                                    gpuSlab.d_bvh_nodes + slot.bvh_offset,
+                                    slot.bvh_capacity);
+
+        } else {
+            // Slab not yet initialised (first construction pass) — normal alloc.
+            BVH bvh;
+            bvh.build(ordered_aabbs.data(), ordered_aabbs.size());
+            foamBVHs[foam_id] = std::move(bvh);
+        }
     }
 
     void Simulation::applyForwardKinematics(
@@ -200,13 +358,17 @@ namespace DynamicFoam::Sim2D {
             }
         }
 
+        applyControllerCursor(input.mouse_pos);
+    }
+
+    void Simulation::applyControllerCursor(ImVec2 mouse_pos) {
         // Guard: ImGui reports (-FLT_MAX, -FLT_MAX) when the mouse is outside the window.
-        if (input.mouse_pos.x < -1e6f || input.mouse_pos.y < -1e6f) return;
+        if (mouse_pos.x < -1e6f || mouse_pos.y < -1e6f) return;
 
         // Convert from ImGui pixel coordinates (top-left origin) to world space
         // using the camera's projection. unprojectPixel delegates to generateRay,
         // so the mapping is consistent with the GPU rendering kernels.
-        const glm::vec3 world   = unprojectPixel(camera_, glm::vec2(input.mouse_pos.x, input.mouse_pos.y), windowSize_);
+        const glm::vec3 world   = unprojectPixel(camera_, glm::vec2(mouse_pos.x, mouse_pos.y), windowSize_);
         const float     world_x = world.x;
         const float     world_y = world.y;
 
@@ -292,15 +454,22 @@ namespace DynamicFoam::Sim2D {
             buildAABB(foamEntity);
     }
 
-    void Simulation::render(
-        const std::unordered_map<int, AABB>&                         foamAABBs,
-        const std::unordered_map<int, BVH>&                          foamBVHs,
-        const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-        const entt::registry&                                        particleRegistry
-    ) {
+    void Simulation::render() {
+        // Upload per-frame particle world positions to the slab.
+        // Physics runs on the CPU, so positions change every frame for dynamic
+        // foams.  Static foams' entries in the slab are overwritten with the
+        // same data each frame, which is cheap (~few KB memcpy).
+        for (const auto& [foam_id, adj] : foamAdjacencyLists) {
+            const auto& ordered = adj.getOrderedNodeIds();
+            std::vector<glm::vec3> h_positions;
+            h_positions.reserve(ordered.size());
+            for (auto e : ordered)
+                h_positions.push_back(particleRegistry.get<ParticleWorldPosition>(e).value);
+            gpuSlab.uploadParticlePositions(
+                foam_id, h_positions.data(), static_cast<int>(h_positions.size()));
+        }
+
         // Build per-foam world transforms from position and orientation.
-        // These are passed to the render subsystem so it can compute inverse
-        // transforms for transforming rays into each foam's local BVH space.
         std::unordered_map<int, glm::mat4> foamTransforms;
         foamRegistry.view<const Position, const Orientation>().each(
             [&](entt::entity e, const Position& pos, const Orientation& orient) {
@@ -311,13 +480,30 @@ namespace DynamicFoam::Sim2D {
 
         // Recompute viewport height from current aspect ratio before rendering.
         camera_.height = camera_.width * (float(windowSize_.y) / float(windowSize_.x));
-        renderSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry, foamTransforms, camera_, windowSize_, overlayParams);
+        renderSubsystem.update(foamAABBs, gpuSlab, foamTransforms,
+                               camera_, windowSize_, overlayParams);
     }
 
     void Simulation::step(const UserInput& input, float deltaTime) {
         handleUserInput(input, deltaTime);
         updateTopology(foamAABBs, foamBVHs, foamAdjacencyLists);
+
+        // Compact dead slab regions accumulated from prior resizes.
+        // compact() D->D packs BVH/CSR/particle data and resets watermarks,
+        // but invalidates the biased CSR node_offsets (they were biased by the
+        // old csr_edge_offsets); rebuildAllSlabCsr() rewrites them correctly.
+        // BVH nodes contain only foam-local indices so their D->D move is valid
+        // as-is; no BVH rebuild is needed after compaction.
+        if (gpuSlab.needsCompaction()) {
+            gpuSlab.compact();
+            rebuildAllSlabCsr();
+        }
+
         updatePhysics(foamAABBs, foamBVHs, deltaTime);
-        render(foamAABBs, foamBVHs, foamAdjacencyLists, particleRegistry);
+        // Re-sample the cursor position after the expensive subsystems so that
+        // Controller foam is placed at its true on-screen location when the GPU
+        // kernel fires, minimising input-to-display latency.
+        applyControllerCursor(ImGui::GetIO().MousePos);
+        render();
     }
 };

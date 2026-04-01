@@ -253,11 +253,95 @@ void BVH::free_device() {
     auto f = [](void* p) { if (p) cudaFree(p); };
 
     f(d_primitives_);     d_primitives_     = nullptr;
-    f(d_nodes_);          d_nodes_          = nullptr;
+    // Only free d_nodes_ when this BVH owns it (i.e. not a slab slice).
+    if (d_nodes_owned_) { f(d_nodes_); }
+    d_nodes_ = nullptr;  d_nodes_owned_ = true;
     f(d_morton_codes_);   d_morton_codes_   = nullptr;
     f(d_morton_sorted_);  d_morton_sorted_  = nullptr;
     f(d_indices_);        d_indices_        = nullptr;
     f(d_indices_sorted_); d_indices_sorted_ = nullptr;
     f(d_flags_);          d_flags_          = nullptr;
     f(d_scene_bbox_);     d_scene_bbox_     = nullptr;
+}
+
+// Slab variant: identical pipeline but writes nodes into a pre-assigned slice.
+void BVH::build(const AABB* primitives_host, int n, BVHNode* d_nodes_slice, int slice_capacity) {
+    assert(n > 0);
+    assert(d_nodes_slice != nullptr);
+    n_ = n;
+
+    // Free any privately owned node buffer from a previous build, then adopt
+    // the slice without taking ownership.
+    free_device(); // also frees temporaries from any prior build
+    d_nodes_       = d_nodes_slice;
+    d_nodes_owned_ = false;
+
+    // (Re-)allocate private temporaries only — d_nodes_ is the slab slice.
+    const int num_nodes = (n > 1) ? 2 * n - 1 : 1;
+    assert(num_nodes <= slice_capacity && "BVH::build: node count exceeds slab slice capacity — call needsResize before building");
+    CUDA_CHECK(cudaMalloc(&d_primitives_,     n                    * sizeof(AABB)));
+    CUDA_CHECK(cudaMemset(d_nodes_,   0xFF,   num_nodes            * sizeof(BVHNode)));
+    CUDA_CHECK(cudaMalloc(&d_morton_codes_,   n                    * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_morton_sorted_,  n                    * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_indices_,        n                    * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_indices_sorted_, n                    * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_flags_,          (n > 1 ? n - 1 : 1) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_scene_bbox_,     sizeof(AABB)));
+
+    CUDA_CHECK(cudaMemcpy(d_primitives_, primitives_host,
+                          n * sizeof(AABB), cudaMemcpyHostToDevice));
+
+    const int block = 256;
+
+    AABB identity{};
+    CUB_CALL(cub::DeviceReduce::Reduce,
+             d_primitives_, d_scene_bbox_, n, AABBUnion{}, identity);
+
+    AABB scene_bbox;
+    CUDA_CHECK(cudaMemcpy(&scene_bbox, d_scene_bbox_,
+                          sizeof(AABB), cudaMemcpyDeviceToHost));
+
+    const glm::vec3 extent = scene_bbox.max_pt - scene_bbox.min_pt;
+    const glm::vec3 extent_inv = {
+        extent.x > 0.f ? 1.f / extent.x : 1.f,
+        extent.y > 0.f ? 1.f / extent.y : 1.f,
+        extent.z > 0.f ? 1.f / extent.z : 1.f
+    };
+
+    k_compute_morton<<<grid_size(n, block), block>>>(
+        d_primitives_, d_morton_codes_, d_indices_, n,
+        scene_bbox.min_pt, extent_inv);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUB_CALL(cub::DeviceRadixSort::SortPairs,
+             d_morton_codes_, d_morton_sorted_,
+             d_indices_,      d_indices_sorted_,
+             n);
+
+    k_init_leaves<<<grid_size(n, block), block>>>(
+        d_primitives_, d_indices_sorted_, d_nodes_, n);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (n > 1) {
+        k_build_topology<<<grid_size(n - 1, block), block>>>(
+            d_morton_sorted_, d_nodes_, n);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUDA_CHECK(cudaMemset(d_flags_, 0, (n - 1) * sizeof(int)));
+        k_propagate_bboxes<<<grid_size(n, block), block>>>(
+            d_nodes_, d_flags_, n);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Free private temporaries; leave d_nodes_ pointing at the slab slice.
+    auto fr = [](void*& p) { if (p) { cudaFree(p); p = nullptr; } };
+    fr(reinterpret_cast<void*&>(d_primitives_));
+    fr(reinterpret_cast<void*&>(d_morton_codes_));
+    fr(reinterpret_cast<void*&>(d_morton_sorted_));
+    fr(reinterpret_cast<void*&>(d_indices_));
+    fr(reinterpret_cast<void*&>(d_indices_sorted_));
+    fr(reinterpret_cast<void*&>(d_flags_));
+    fr(reinterpret_cast<void*&>(d_scene_bbox_));
 }

@@ -89,17 +89,33 @@ triangulateVoronoiCells(
         points.emplace_back(positions[i].x, positions[i].y, positions[i].z);
     dt.insert(points.begin(), points.end());
 
+    // Build an O(1) position → index lookup so the subsequent vertex-handle
+    // mapping is O(n) rather than O(n²).  The previous inner linear scan was
+    // unnoticeable for small foams but causes multi-second stalls for large
+    // particle grids (e.g. the floor plane with ~31k particles).
+    struct TripleHash {
+        size_t operator()(const std::tuple<double, double, double>& t) const noexcept {
+            size_t h = 0;
+            auto combine = [&](double v) {
+                h ^= std::hash<double>{}(v) + 0x9e3779b9ull + (h << 6) + (h >> 2);
+            };
+            combine(std::get<0>(t));
+            combine(std::get<1>(t));
+            combine(std::get<2>(t));
+            return h;
+        }
+    };
+    std::unordered_map<std::tuple<double, double, double>, size_t, TripleHash> posToIndex;
+    posToIndex.reserve(numParticles);
+    for (size_t i = 0; i < numParticles; ++i)
+        posToIndex[{positions[i].x, positions[i].y, positions[i].z}] = i;
+
     for (auto vh = dt.finite_vertices_begin();
               vh != dt.finite_vertices_end(); ++vh) {
         const auto& p = vh->point();
-        for (size_t i = 0; i < numParticles; ++i) {
-            if (p.x() == positions[i].x &&
-                p.y() == positions[i].y &&
-                p.z() == positions[i].z) {
-                vertexToIndex[vh] = i;
-                break;
-            }
-        }
+        auto it = posToIndex.find({p.x(), p.y(), p.z()});
+        if (it != posToIndex.end())
+            vertexToIndex[vh] = it->second;
     }
 
     // ------------------------------------------------------------------

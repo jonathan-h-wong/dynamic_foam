@@ -28,6 +28,7 @@ set (DYNAMIC_FOAM_SOURCES
     Sim2D/collision.cu
     Sim2D/physics.cpp
     Sim2D/simulation.cpp
+    Sim2D/simulation_gpu.cu
     Sim2D/topology.cpp
     Sim2D/user_input.cpp
     Sim2D/sample_scene.cpp

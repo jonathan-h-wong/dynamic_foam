@@ -342,214 +342,54 @@ Render::~Render() {
 }
 
 void Render::update(
-    const std::unordered_map<int, AABB>&                         foamAABBs,
-    const std::unordered_map<int, BVH>&                          foamBVHs,
-    const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
-    const entt::registry&                                        particleRegistry,
-    const std::unordered_map<int, glm::mat4>&                    foamTransforms,
-    const CameraParams&                                          camera,
-    const glm::ivec2&                                            windowSize,
-    const RenderOverlayParams&                                   overlay
+    const std::unordered_map<int, AABB>&      foamAABBs,
+    const GpuSlabAllocator&                   slab,
+    const std::unordered_map<int, glm::mat4>& foamTransforms,
+    const CameraParams&                       camera,
+    const glm::ivec2&                         windowSize,
+    const RenderOverlayParams&                overlay
 ) {
     const int num_rays  = windowSize.x * windowSize.y;
-    const int num_foams = static_cast<int>(foamAABBs.size());
+    const int num_foams = slab.num_foams; // authoritative count from slab
 
     // ------------------------------------------------------------------
-    // Flat particle buffers + adjacency
-    //
-    // All foams are concatenated in foam iteration order. For each foam we
-    // walk its ordered node list (getOrderedNodeIds), which gives the same
-    // order used by buildGPUAdjacencyList when no Morton sort is provided.
-    // This guarantees that foam-local sorted position i maps to global flat
-    // index (foam_particle_offsets[fid] + i) with no extra indirection.
-    //
-    // foam_particle_offsets[fid] — start of foam fid in the flat arrays.
-    // csr_offsets[fid]           — start of foam fid's node_offsets block
-    //                              in the flat csr_node_offsets array.
-    //
-    // Rebuilt in full every frame (positions always move; colors/mask only
-    // on topology change, but at <=100k particles the memcpy is cheap).
-    // ------------------------------------------------------------------
-
-    // Build CSR, renderer is only place in application where GPU CSR is needed
-    for (const auto& [foam_id, adj] : foamAdjacencyLists) {
-        auto& gpu_adj = foam_gpu_adj_[foam_id];
-        if (gpu_adj.num_nodes == 0)
-            adj.buildGPUAdjacencyList(gpu_adj);
-    }
-
-    // Compute per-foam offsets (prefix sum over particle counts).
-    std::vector<int> h_foam_particle_offsets(num_foams, 0);
-    std::vector<int> h_csr_offsets(num_foams, 0);
-    int total_particles = 0;
-    int total_csr_nodes = 0;
-    {
-        int poffset = 0;
-        int coffset = 0;
-        for (const auto& [foam_id, adj] : foamAdjacencyLists) {
-            h_foam_particle_offsets[foam_id] = poffset;
-            h_csr_offsets[foam_id]           = coffset;
-            const uint32_t n = adj.nodeCount();
-            poffset += static_cast<int>(n);
-            coffset += static_cast<int>(n) + 1; // node_offsets has N+1 entries
-        }
-        total_particles = poffset;
-        total_csr_nodes = coffset;
-    }
-
-    // Build flat host buffers by iterating each foam's ordered node list.
-    std::vector<glm::vec3> h_positions(total_particles,    glm::vec3(0.f));
-    std::vector<glm::vec4> h_colors(total_particles,       glm::vec4(1.f));
-    std::vector<uint8_t>   h_surface_mask(total_particles, 0);
-    std::vector<uint32_t>  h_csr_node_offsets(total_csr_nodes, 0);
-    std::vector<uint32_t>  h_csr_nbrs;
-    h_csr_nbrs.reserve(total_particles * 6); // rough upper bound
-
-    {
-        for (const auto& [foam_id, adj] : foamAdjacencyLists) {
-            const int pbase  = h_foam_particle_offsets[foam_id];
-            const int cbase  = h_csr_offsets[foam_id];
-            const auto& gpu  = foam_gpu_adj_[foam_id];
-            const auto nodes = adj.getOrderedNodeIds(); // host-side ordered list
-
-            // Positions, colors, surface mask — in sorted order.
-            for (int li = 0; li < static_cast<int>(nodes.size()); ++li) {
-                const entt::entity e = nodes[li];
-                const int gidx = pbase + li;
-
-                if (const auto* p = particleRegistry.try_get<ParticleWorldPosition>(e))
-                    h_positions[gidx] = p->value;
-                if (const auto* c = particleRegistry.try_get<ParticleColor>(e))
-                    if (const auto* o = particleRegistry.try_get<ParticleOpacity>(e))
-                        h_colors[gidx] = glm::vec4(c->rgb, o->value);
-                if (particleRegistry.all_of<Surface>(e))
-                    h_surface_mask[gidx] = 1;
-            }
-
-            // CSR node_offsets — pull from GPU, fix up nbr base offset into
-            // h_csr_nbrs, then append nbrs.
-            if (gpu.num_nodes > 0) {
-                // Download node_offsets (N+1 entries) from this foam's GPU CSR.
-                std::vector<uint32_t> local_offsets(gpu.num_nodes + 1);
-                CUDA_CHECK(cudaMemcpy(local_offsets.data(), gpu.node_offsets,
-                    (gpu.num_nodes + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-                // The local offsets are relative to the start of this foam's
-                // nbrs block. Bias them by the current size of h_csr_nbrs so
-                // they index correctly into the global flat nbrs array.
-                const uint32_t nbrs_base = static_cast<uint32_t>(h_csr_nbrs.size());
-                for (uint32_t ni = 0; ni <= gpu.num_nodes; ++ni)
-                    h_csr_node_offsets[cbase + ni] = local_offsets[ni] + nbrs_base;
-
-                // Download and append this foam's nbrs.
-                std::vector<uint32_t> local_nbrs(gpu.num_edges);
-                CUDA_CHECK(cudaMemcpy(local_nbrs.data(), gpu.nbrs,
-                    gpu.num_edges * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-                h_csr_nbrs.insert(h_csr_nbrs.end(), local_nbrs.begin(), local_nbrs.end());
-            }
-        }
-    }
-
-    // Upload flat particle buffers.
-    cuda_realloc_if_needed(&d_particle_positions_, &cap_particles_,       total_particles);
-    cuda_realloc_if_needed(&d_particle_colors_,    &cap_particle_colors_, total_particles);
-    cuda_realloc_if_needed(&d_surface_mask_,       &cap_surface_mask_, total_particles);
-    CUDA_CHECK(cudaMemcpy(d_particle_positions_, h_positions.data(),
-                          total_particles * sizeof(glm::vec3), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_particle_colors_, h_colors.data(),
-                          total_particles * sizeof(glm::vec4), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_surface_mask_, h_surface_mask.data(),
-                          total_particles * sizeof(uint8_t),   cudaMemcpyHostToDevice));
-
-    // Upload flat CSR.
-    const size_t nbrs_count = h_csr_nbrs.size();
-    cuda_realloc_if_needed(&d_csr_node_offsets_, &cap_csr_node_offsets_, total_csr_nodes);
-    cuda_realloc_if_needed(&d_csr_nbrs_,         &cap_csr_nbrs_,         nbrs_count);
-    CUDA_CHECK(cudaMemcpy(d_csr_node_offsets_, h_csr_node_offsets.data(),
-                          total_csr_nodes * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_csr_nbrs_, h_csr_nbrs.data(),
-                          nbrs_count * sizeof(uint32_t), cudaMemcpyHostToDevice));
-
-    // Upload offset tables.
-    cuda_realloc_if_needed(&d_foam_particle_offsets_, &cap_foam_offsets_, num_foams);
-    cuda_realloc_if_needed(&d_csr_offsets_,           &cap_csr_offsets_,  num_foams);
-    CUDA_CHECK(cudaMemcpy(d_foam_particle_offsets_, h_foam_particle_offsets.data(),
-                          num_foams * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_csr_offsets_, h_csr_offsets.data(),
-                          num_foams * sizeof(int), cudaMemcpyHostToDevice));
-
-    // ------------------------------------------------------------------
-    // Foam AABBs
+    // Foam AABBs (per-frame: dynamic foams move)
     // ------------------------------------------------------------------
 
     std::vector<AABB> h_foam_aabbs(num_foams);
-    std::vector<int>  h_foam_ids(num_foams);
-    {
-        int i = 0;
-        for (const auto& [id, aabb] : foamAABBs) {
-            h_foam_aabbs[i] = aabb;
-            h_foam_ids[i]   = id;
-            ++i;
-        }
+    std::vector<int>  h_foam_ids;
+    h_foam_ids.reserve(foamAABBs.size());
+    for (const auto& [id, aabb] : foamAABBs) {
+        if (id < num_foams) h_foam_aabbs[id] = aabb;
+        h_foam_ids.push_back(id);
     }
+    const int num_visible_foams = static_cast<int>(h_foam_ids.size());
 
     cuda_realloc_if_needed(&d_foam_aabbs_, &cap_foams_,    num_foams);
-    cuda_realloc_if_needed(&d_foam_ids_,   &cap_foam_ids_, num_foams);
+    cuda_realloc_if_needed(&d_foam_ids_,   &cap_foam_ids_, num_visible_foams);
     CUDA_CHECK(cudaMemcpy(d_foam_aabbs_, h_foam_aabbs.data(),
                           num_foams * sizeof(AABB), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_foam_ids_,   h_foam_ids.data(),
-                          num_foams * sizeof(int),  cudaMemcpyHostToDevice));
+                          num_visible_foams * sizeof(int),  cudaMemcpyHostToDevice));
 
     // ------------------------------------------------------------------
-    // Per-foam inverse transforms
+    // Per-foam inverse transforms (per-frame: dynamic foams rotate/translate)
     // ------------------------------------------------------------------
 
     std::vector<glm::mat4> h_foam_inv_transforms(num_foams, glm::mat4(1.0f));
-    for (const auto& [id, mat] : foamTransforms) {
+    for (const auto& [id, mat] : foamTransforms)
         if (id >= 0 && id < num_foams)
             h_foam_inv_transforms[id] = glm::inverse(mat);
-    }
 
     cuda_realloc_if_needed(&d_foam_inv_transforms_, &cap_foam_inv_transforms_, num_foams);
     CUDA_CHECK(cudaMemcpy(d_foam_inv_transforms_, h_foam_inv_transforms.data(),
                           num_foams * sizeof(glm::mat4), cudaMemcpyHostToDevice));
 
     // ------------------------------------------------------------------
-    // BVH nodes consolidated into a single flat buffer
-    // ------------------------------------------------------------------
-
-    std::vector<BVHNode> all_bvh_nodes;
-    std::vector<int>     h_bvh_offsets(num_foams + 1, 0);
-    {
-        int current_offset = 0;
-        for (const auto& [id, bvh] : foamBVHs) {
-            h_bvh_offsets[id] = current_offset;
-            const int num_nodes = (bvh.num_primitives() > 1)
-                                  ? 2 * bvh.num_primitives() - 1 : 1;
-            std::vector<BVHNode> host_nodes(num_nodes);
-            CUDA_CHECK(cudaMemcpy(host_nodes.data(), bvh.export_nodes(),
-                                  num_nodes * sizeof(BVHNode),
-                                  cudaMemcpyDeviceToHost));
-            all_bvh_nodes.insert(all_bvh_nodes.end(),
-                                 host_nodes.begin(), host_nodes.end());
-            current_offset += num_nodes;
-        }
-    }
-
-    cuda_realloc_if_needed(&d_bvh_nodes_,   &cap_bvh_nodes_,   all_bvh_nodes.size());
-    cuda_realloc_if_needed(&d_bvh_offsets_, &cap_bvh_offsets_, h_bvh_offsets.size());
-    CUDA_CHECK(cudaMemcpy(d_bvh_nodes_, all_bvh_nodes.data(),
-                          all_bvh_nodes.size() * sizeof(BVHNode),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_bvh_offsets_, h_bvh_offsets.data(),
-                          h_bvh_offsets.size() * sizeof(int),
-                          cudaMemcpyHostToDevice));
-
-    // ------------------------------------------------------------------
     // Broadphase
     // ------------------------------------------------------------------
 
-    const size_t max_broadphase_hits = (size_t)num_rays * num_foams;
+    const size_t max_broadphase_hits = (size_t)num_rays * num_visible_foams;
     cuda_realloc_if_needed(&d_broadphase_hits_, &cap_broadphase_hits_,
                            max_broadphase_hits);
     CUDA_CHECK(cudaMemset(d_broadphase_hit_counter_, 0, sizeof(int)));
@@ -558,7 +398,7 @@ void Render::update(
         camera, windowSize.x, windowSize.y,
         d_foam_aabbs_,  d_foam_ids_,
         d_broadphase_hits_, d_broadphase_hit_counter_,
-        num_rays, num_foams
+        num_rays, num_visible_foams
     );
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -568,7 +408,7 @@ void Render::update(
     if (num_broadphase_hits == 0) return;
 
     // ------------------------------------------------------------------
-    // Narrowphase — surface particles only
+    // Narrowphase — surface particles only; BVH/mask live in slab
     // ------------------------------------------------------------------
 
     const size_t max_narrowphase_hits = (size_t)num_broadphase_hits * 32;
@@ -579,10 +419,10 @@ void Render::update(
     k_narrowphase_collision<<<grid_size(num_broadphase_hits), 256>>>(
         camera, windowSize.x, windowSize.y,
         d_broadphase_hits_, num_broadphase_hits,
-        d_bvh_nodes_,   d_bvh_offsets_,
-        d_surface_mask_,
+        slab.d_bvh_nodes,   slab.d_bvh_offsets,
+        slab.d_surface_mask,
         d_foam_inv_transforms_,
-        d_foam_particle_offsets_,
+        slab.d_particle_offsets,
         d_narrowphase_hits_, d_narrowphase_hit_counter_
     );
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -598,7 +438,7 @@ void Render::update(
 
     cuda_realloc_if_needed(&d_sort_keys_in_,  &cap_sort_keys_,     num_narrowphase_hits);
     cuda_realloc_if_needed(&d_sort_keys_out_, &cap_sort_keys_out_, num_narrowphase_hits);
-    cuda_realloc_if_needed(&d_hits_sorted_,   &cap_hits_sorted_, num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_hits_sorted_,   &cap_hits_sorted_,   num_narrowphase_hits);
 
     k_pack_sort_key<<<grid_size(num_narrowphase_hits), 256>>>(
         d_narrowphase_hits_, d_sort_keys_in_, num_narrowphase_hits);
@@ -613,10 +453,9 @@ void Render::update(
     // Extract ray indices, run-length encode → per-ray hit counts
     // ------------------------------------------------------------------
 
-    cuda_realloc_if_needed(&d_ray_idx_keys_,   &cap_rle_,        num_narrowphase_hits);
+    cuda_realloc_if_needed(&d_ray_idx_keys_,   &cap_rle_,            num_narrowphase_hits);
     cuda_realloc_if_needed(&d_unique_ray_ids_, &cap_unique_ray_ids_, num_narrowphase_hits);
-    cuda_realloc_if_needed(&d_rle_counts_,     &cap_rle_counts_, num_narrowphase_hits);
-    // d_num_unique_ is a single device int — allocate once on first use.
+    cuda_realloc_if_needed(&d_rle_counts_,     &cap_rle_counts_,     num_narrowphase_hits);
     if (!d_num_unique_) { CUDA_CHECK(cudaMalloc(&d_num_unique_, sizeof(int))); }
 
     k_extract_ray_idx<<<grid_size(num_narrowphase_hits), 256>>>(
@@ -649,7 +488,7 @@ void Render::update(
     CUDA_CHECK(cudaMemset(d_output_buffer_, 0, num_rays * sizeof(glm::vec4)));
 
     // ------------------------------------------------------------------
-    // Exact Voronoi slab test
+    // Exact Voronoi slab test — CSR and particle data live in slab
     // ------------------------------------------------------------------
 
     k_exact_collision<<<grid_size(num_unique), 256>>>(
@@ -658,12 +497,12 @@ void Render::update(
         d_unique_ray_ids_,
         d_ray_hit_offsets_,
         d_rle_counts_,
-        d_csr_node_offsets_,
-        d_csr_nbrs_,
-        d_csr_offsets_,
-        d_foam_particle_offsets_,
-        d_particle_positions_,
-        d_particle_colors_,
+        slab.d_csr_node_offsets,
+        slab.d_csr_nbrs,
+        slab.d_csr_offsets,
+        slab.d_particle_offsets,
+        slab.d_particle_positions,
+        slab.d_particle_colors,
         d_output_buffer_,
         num_unique,
         overlay
@@ -680,9 +519,6 @@ void Render::free_device_memory() {
 
     f(d_foam_aabbs_);                d_foam_aabbs_                = nullptr;
     f(d_foam_ids_);                  d_foam_ids_                  = nullptr;
-    f(d_bvh_nodes_);                 d_bvh_nodes_                 = nullptr;
-    f(d_bvh_offsets_);               d_bvh_offsets_               = nullptr;
-    f(d_surface_mask_);              d_surface_mask_              = nullptr;
     f(d_broadphase_hits_);           d_broadphase_hits_           = nullptr;
     f(d_broadphase_hit_counter_);    d_broadphase_hit_counter_    = nullptr;
     f(d_narrowphase_hits_);          d_narrowphase_hits_          = nullptr;
@@ -695,18 +531,8 @@ void Render::free_device_memory() {
     f(d_rle_counts_);                d_rle_counts_                = nullptr;
     f(d_num_unique_);                d_num_unique_                = nullptr;
     f(d_ray_hit_offsets_);           d_ray_hit_offsets_           = nullptr;
-    f(d_particle_positions_);        d_particle_positions_        = nullptr;
-    f(d_particle_colors_);           d_particle_colors_           = nullptr;
-    f(d_csr_node_offsets_);          d_csr_node_offsets_          = nullptr;
-    f(d_csr_nbrs_);                  d_csr_nbrs_                  = nullptr;
-    f(d_csr_offsets_);               d_csr_offsets_               = nullptr;
-    f(d_foam_particle_offsets_);     d_foam_particle_offsets_     = nullptr;
     f(d_foam_inv_transforms_);       d_foam_inv_transforms_       = nullptr;
     f(d_output_buffer_);             d_output_buffer_             = nullptr;
-
-    for (auto& [id, gpu_adj] : foam_gpu_adj_)
-        gpu_adj.free();
-    foam_gpu_adj_.clear();
 }
 
 } // namespace DynamicFoam::Sim2D

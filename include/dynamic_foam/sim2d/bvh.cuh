@@ -164,6 +164,7 @@ public:
     // Move constructor: transfer ownership, null-out source.
     BVH(BVH&& o) noexcept
         : n_(o.n_),
+          d_nodes_owned_(o.d_nodes_owned_),
           d_primitives_(o.d_primitives_),
           d_nodes_(o.d_nodes_),
           d_morton_codes_(o.d_morton_codes_),
@@ -179,6 +180,7 @@ public:
         if (this != &o) {
             free_device();
             n_                = o.n_;
+            d_nodes_owned_    = o.d_nodes_owned_;
             d_primitives_     = o.d_primitives_;
             d_nodes_          = o.d_nodes_;
             d_morton_codes_   = o.d_morton_codes_;
@@ -193,10 +195,20 @@ public:
     }
 
     // Upload primitives and build the BVH entirely on the GPU.
+    // Allocates d_nodes_ privately; BVH takes ownership.
     void build(const AABB* primitives_host, int n);
 
+    // Slab variant: build into a pre-allocated slice provided by the caller.
+    // d_nodes_ is set to d_nodes_slice but NOT owned — the destructor will not
+    // free it.  All other temporaries (morton codes, indices, flags, etc.) are
+    // still allocated and freed privately.
+    // slice_capacity is the number of BVHNodes the slice can hold; an assert
+    // fires if (2n-1) > slice_capacity (overflow would corrupt the slab).
+    void build(const AABB* primitives_host, int n, BVHNode* d_nodes_slice, int slice_capacity);
+
     // Returns the raw device pointer to the node array.
-    // Caller must not free this pointer; lifetime is managed by BVH.
+    // Caller must not free this pointer; lifetime is managed by BVH (or the
+    // slab allocator when using the slice-based build overload).
     BVHNode* export_nodes() const;
 
     int num_primitives() const { return n_; }
@@ -206,6 +218,7 @@ private:
     void free_device();
     void null_ptrs() noexcept {
         n_ = 0;
+        d_nodes_owned_    = true;
         d_primitives_     = nullptr;
         d_nodes_          = nullptr;
         d_morton_codes_   = nullptr;
@@ -217,6 +230,7 @@ private:
     }
 
     int       n_                = 0;
+    bool      d_nodes_owned_    = true; ///< false when d_nodes_ is a slab slice.
     AABB*     d_primitives_     = nullptr;
     BVHNode*  d_nodes_          = nullptr;
     uint32_t* d_morton_codes_   = nullptr;

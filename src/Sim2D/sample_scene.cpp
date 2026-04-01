@@ -95,6 +95,65 @@ namespace DynamicFoam::Sim2D {
         return Foam(particleIds, positions, stencil, mutable_map, color, opacity, 1.0f);
     }
 
+    Foam generateFoamFloorPlane(
+        float widthX,
+        float widthZ,
+        int   xParticles,
+        int   zParticles,
+        float density,
+        const glm::vec3& color_param)
+    {
+        std::vector<int>                       particleIds;
+        std::vector<glm::vec3>                 positions;
+        std::unordered_map<int, bool>          stencil;
+        std::unordered_map<int, bool>          mutable_map;
+        std::unordered_map<int, glm::vec3>     color;
+        std::unordered_map<int, float>         opacity;
+
+        // Padded grid: one ghost ring in XZ, plus one ghost cap above/below in Y.
+        //   paddedX = xParticles + 2  (ghost at i=0 and i=paddedX-1)
+        //   paddedZ = zParticles + 2  (ghost at k=0 and k=paddedZ-1)
+        //   paddedY = 3               (j=0 ghost below, j=1 real layer at y=0,
+        //                              j=2 ghost above)
+        const int paddedX = xParticles + 2;
+        const int paddedZ = zParticles + 2;
+        const int paddedY = 3;
+
+        const float dx = widthX / static_cast<float>(xParticles - 1);
+        const float dz = widthZ / static_cast<float>(zParticles - 1);
+        // Y ghost offset is the average in-plane spacing so the ghost caps sit
+        // just one cell-width away from the main layer.
+        const float dy = (dx + dz) * 0.5f;
+
+        for (int i = 0; i < paddedX; ++i) {
+            for (int j = 0; j < paddedY; ++j) {
+                for (int k = 0; k < paddedZ; ++k) {
+                    const int id = i * (paddedY * paddedZ) + j * paddedZ + k;
+                    particleIds.push_back(id);
+
+                    // (i-1) so that i=1 maps to x=-widthX/2, i=xParticles maps
+                    // to x=+widthX/2.  Same convention as generateFoamBar.
+                    const float x = static_cast<float>(i - 1) * dx - widthX * 0.5f;
+                    const float y = static_cast<float>(j - 1) * dy; // j=0→-dy, j=1→0, j=2→+dy
+                    const float z = static_cast<float>(k - 1) * dz - widthZ * 0.5f;
+                    positions.push_back(glm::vec3(x, y, z));
+
+                    const bool isGhost =
+                        (i == 0 || i == paddedX - 1 ||
+                         j == 0 || j == paddedY - 1 ||
+                         k == 0 || k == paddedZ - 1);
+
+                    stencil[id]     = false;       // non-stencil
+                    mutable_map[id] = false;       // immutable
+                    color[id]       = color_param; // grey
+                    opacity[id]     = isGhost ? 0.0f : 1.0f;
+                }
+            }
+        }
+
+        return Foam(particleIds, positions, stencil, mutable_map, color, opacity, density);
+    }
+
     SceneGraph createSampleSceneGraph() {
         std::unordered_map<int, Foam> foams;
         std::unordered_map<int, glm::mat4> transforms;
@@ -110,6 +169,17 @@ namespace DynamicFoam::Sim2D {
         transforms[1] = glm::translate(glm::mat4(1.0f), glm::vec3(0.5f, 0.0f, 0.0f)); // Positioned to the right of the bar
         controller_map[1] = true; // Controller foam
         dynamic_map[1] = false; // Not dynamic
+
+        // Floor plane — immobile, immutable, static, non-controller.
+        // 20x20 interior particles centred at the origin at y=0.
+        foams[2]          = generateFoamFloorPlane(
+            10.0f, 10.0f,                    // 10 m × 10 m
+            20, 20,                           // 20 × 20 interior centres
+            1.0f,                             // density
+            glm::vec3(0.5f, 0.5f, 0.5f));    // grey
+        transforms[2]     = glm::mat4(1.0f); // identity — already at origin
+        controller_map[2] = false;           // not a controller
+        dynamic_map[2]    = false;           // static
 
         return SceneGraph(foams, transforms, controller_map, dynamic_map);
     }
