@@ -9,6 +9,8 @@
 #include <cuda_runtime.h>
 #ifdef __CUDACC__
 #include <cub/cub.cuh>
+#include <thrust/copy.h>
+#include <thrust/iterator/zip_iterator.h>
 #include <thrust/scatter.h>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
@@ -279,16 +281,19 @@ public:
     void buildGPUAdjacencyList(
         AdjacencyListGPU<T>& out,
         const uint32_t*      d_morton_sorted_ids = nullptr,
+        uint32_t             num_sorted_ids = 0,
         cudaStream_t         stream = 0) const
     {
 
-        const uint32_t N = static_cast<uint32_t>(nodeHeads.size());
-        const uint32_t E = static_cast<uint32_t>(coo_src.size());
+        const bool     use_subset = (d_morton_sorted_ids != nullptr) && (num_sorted_ids > 0);
+        const uint32_t N_all      = static_cast<uint32_t>(nodeHeads.size());
+        const uint32_t N          = use_subset ? num_sorted_ids : N_all;
+        const uint32_t E_all      = static_cast<uint32_t>(coo_src.size());
 
-        if (N == 0 || E == 0) return;
+        if (N == 0 || E_all == 0) return;
 
         out.num_nodes = N;
-        out.num_edges = E;
+        // out.num_edges is set after COO filtering below
 
         // ------------------------------------------------------------------
         // Grow persistent output buffers as needed.
@@ -297,9 +302,9 @@ public:
         // ------------------------------------------------------------------
         cuda_realloc_if_needed(&out.nodes, &out.nodes_capacity, N);
         if (out.nbrs_owned) {
-            cuda_realloc_if_needed(&out.nbrs, &out.nbrs_capacity, E);
+            cuda_realloc_if_needed(&out.nbrs, &out.nbrs_capacity, E_all);
         } else {
-            assert(out.nbrs_capacity >= E &&
+            assert(out.nbrs_capacity >= E_all &&
                    "slab nbrs slice is too small for this foam");
         }
         if (out.node_offsets_owned) {
@@ -315,16 +320,14 @@ public:
         // Build h_nodes unconditionally so we can compute max_entity_id below
         // (entity IDs are globally assigned by entt and may be much larger than N).
         // ------------------------------------------------------------------
-        std::vector<T> h_nodes;
-        h_nodes.reserve(N);
         if (d_morton_sorted_ids) {
-            h_nodes.resize(N);
-            CUDA_CHECK(cudaMemcpy(h_nodes.data(), d_morton_sorted_ids,
-                N * sizeof(T), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(
+            // Stay entirely on device — no D2H transfer needed.
+            CUDA_CHECK(cudaMemcpyAsync(
                 out.nodes, d_morton_sorted_ids,
-                N * sizeof(T), cudaMemcpyDeviceToDevice));
+                N * sizeof(T), cudaMemcpyDeviceToDevice, stream));
         } else {
+            std::vector<T> h_nodes;
+            h_nodes.reserve(N);
             for (const auto& [node, _] : nodeHeads)
                 h_nodes.push_back(node);
             CUDA_CHECK(cudaMemcpy(
@@ -339,14 +342,20 @@ public:
         // ID can be >> N. Allocate the map to max_entity_id + 1 and zero-fill
         // unused slots to avoid out-of-bounds writes from buildInverseMapKernel.
         // ------------------------------------------------------------------
+        // Size the inverse map to cover ALL node IDs (not just the subset),
+        // since the COO contains edges from the full graph and remapCOOKernel
+        // will index into this map with any node ID present in the COO.
         uint32_t max_entity_id = 0;
-        for (const auto& v : h_nodes)
-            max_entity_id = std::max(max_entity_id, static_cast<uint32_t>(v));
+        for (const auto& [node, _] : nodeHeads)
+            max_entity_id = std::max(max_entity_id, static_cast<uint32_t>(node));
 
         uint32_t* d_inverse_map = nullptr;
         const uint32_t inv_map_size = max_entity_id + 1;
         CUDA_CHECK(cudaMalloc(&d_inverse_map, inv_map_size * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemset(d_inverse_map, 0, inv_map_size * sizeof(uint32_t)));
+        // When building for a subset, fill with 0xFF (UINT32_MAX per slot) so
+        // out-of-subset nodes produce a sentinel detectable in step 3b.
+        CUDA_CHECK(cudaMemset(d_inverse_map, use_subset ? 0xFF : 0x00,
+            inv_map_size * sizeof(uint32_t)));
 
         buildInverseMapKernel<<<grid_size(N), 256, 0, stream>>>(
             reinterpret_cast<const uint32_t*>(out.nodes),
@@ -365,10 +374,49 @@ public:
         CUDA_CHECK(cudaMemcpy(d_coo_dst, coo_dst.data(),
             E * sizeof(T), cudaMemcpyHostToDevice));
 
-        remapCOOKernel<T><<<grid_size(E), 256, 0, stream>>>(
-            reinterpret_cast<const T*>(d_coo_src), d_coo_src, d_inverse_map, E);
-        remapCOOKernel<T><<<grid_size(E), 256, 0, stream>>>(
-            reinterpret_cast<const T*>(d_coo_dst), d_coo_dst, d_inverse_map, E);
+        remapCOOKernel<T><<<grid_size(E_all), 256, 0, stream>>>(
+            reinterpret_cast<const T*>(d_coo_src), d_coo_src, d_inverse_map, E_all);
+        remapCOOKernel<T><<<grid_size(E_all), 256, 0, stream>>>(
+            reinterpret_cast<const T*>(d_coo_dst), d_coo_dst, d_inverse_map, E_all);
+
+        // ------------------------------------------------------------------
+        // Step 3b — filter COO to subset (only when use_subset)
+        //
+        // Nodes outside the subset have d_inverse_map entries == UINT32_MAX.
+        // Discard any edge where either remapped endpoint is UINT32_MAX.
+        // ------------------------------------------------------------------
+        uint32_t E = E_all;
+        if (use_subset) {
+            uint32_t* d_coo_src_filt = nullptr;
+            uint32_t* d_coo_dst_filt = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_coo_src_filt, E_all * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_coo_dst_filt, E_all * sizeof(uint32_t)));
+
+            auto src_in  = thrust::device_ptr<uint32_t>(d_coo_src);
+            auto dst_in  = thrust::device_ptr<uint32_t>(d_coo_dst);
+            auto src_out = thrust::device_ptr<uint32_t>(d_coo_src_filt);
+            auto dst_out = thrust::device_ptr<uint32_t>(d_coo_dst_filt);
+
+            auto in_begin  = thrust::make_zip_iterator(thrust::make_tuple(src_in,  dst_in));
+            auto out_begin = thrust::make_zip_iterator(thrust::make_tuple(src_out, dst_out));
+
+            auto new_end = thrust::copy_if(
+                thrust::cuda::par.on(stream),
+                in_begin, in_begin + E_all, out_begin,
+                [] __device__ (thrust::tuple<uint32_t, uint32_t> t) {
+                    return thrust::get<0>(t) != 0xFFFFFFFFu
+                        && thrust::get<1>(t) != 0xFFFFFFFFu;
+                });
+
+            E = static_cast<uint32_t>(new_end - out_begin);
+
+            CUDA_CHECK(cudaFree(d_coo_src));
+            CUDA_CHECK(cudaFree(d_coo_dst));
+            d_coo_src = d_coo_src_filt;
+            d_coo_dst = d_coo_dst_filt;
+        }
+
+        out.num_edges = E;
 
         // ------------------------------------------------------------------
         // Step 4 — radix sort COO by source
@@ -474,6 +522,7 @@ public:
         uint32_t*            d_node_offsets_slice,
         size_t               node_offsets_cap,
         const uint32_t*      d_morton_sorted_ids = nullptr,
+        uint32_t             num_sorted_ids = 0,
         cudaStream_t         stream = 0) const
     {
         // Free any previously owned nbrs / node_offsets buffers, then adopt
@@ -491,7 +540,7 @@ public:
 
         // Delegate to the main builder which will skip realloc for non-owned
         // buffers (capacity is already set to the slice size).
-        buildGPUAdjacencyList(out, d_morton_sorted_ids, stream);
+        buildGPUAdjacencyList(out, d_morton_sorted_ids, num_sorted_ids, stream);
     }
 #endif // __CUDACC__
 
