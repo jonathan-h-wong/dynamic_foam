@@ -4,7 +4,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <stack>
 
 #include <cuda_runtime.h>
 #ifdef __CUDACC__
@@ -100,16 +99,11 @@ __global__ void buildInverseMapKernel(
 // =============================================================================
 // AdjacencyList
 //
-// Stores an undirected graph. Each undirected edge is stored as two half-edges
-// (one per direction) in a flat array. Deleted edge slots are pushed onto a
-// free list and reclaimed by subsequent additions, so the array stays near its
-// high-water mark when adds and deletes are balanced -- no compaction needed.
+// Stores an undirected graph as an adjacency set map plus a flat COO cache.
 //
-// Three supporting structures are kept in sync with the edge array:
-//
-//   nodeHeads   — node -> index of its first outgoing half-edge (-1 if none)
+//   adj         — node -> unordered_set of neighbor IDs
 //   edgeIndex   — packed 64-bit key set for O(1) existence checks
-//   coo_src/dst — flat directed edge list rebuilt lazily for GPU upload
+//   coo_src/dst — flat directed edge list kept current by all mutations
 // =============================================================================
 template <typename T>
 class AdjacencyList {
@@ -140,8 +134,7 @@ public:
     // -------------------------------------------------------------------------
 
     void addNode(T nodeId) {
-        if (nodeHeads.find(nodeId) == nodeHeads.end())
-            nodeHeads[nodeId] = -1;
+        adj.try_emplace(nodeId);
     }
 
     // Add an undirected edge between a and b. No-op if already exists.
@@ -153,15 +146,8 @@ public:
         if (edgeIndex.count(key)) return;
         edgeIndex.insert(key);
 
-        // Allocate two half-edge slots, reusing free list slots first
-        int idxAB = allocSlot();
-        int idxBA = allocSlot();
-
-        edges[idxAB] = { a, b, idxBA, nodeHeads[a], true };
-        edges[idxBA] = { b, a, idxAB, nodeHeads[b], true };
-
-        nodeHeads[a] = idxAB;
-        nodeHeads[b] = idxBA;
+        adj[a].insert(b);
+        adj[b].insert(a);
 
         coo_src.push_back(a);
         coo_dst.push_back(b);
@@ -176,33 +162,22 @@ public:
 
     // Delete a node and all its incident edges.
     void deleteNode(T nodeId) {
-        auto it = nodeHeads.find(nodeId);
-        if (it == nodeHeads.end()) return;
+        auto it = adj.find(nodeId);
+        if (it == adj.end()) return;
 
-        // Snapshot neighbor list before modifying it
-        std::vector<T> neighbors;
-        int idx = it->second;
-        while (idx != -1) {
-            neighbors.push_back(edges[idx].dst);
-            idx = edges[idx].next_out;
+        for (T nbr : it->second) {
+            adj[nbr].erase(nodeId);
+            edgeIndex.erase(edgeKey(nodeId, nbr));
         }
-
-        for (T nbr : neighbors)
-            removeEdge(nodeId, nbr);
-
-        nodeHeads.erase(it);
+        adj.erase(it);
+        rebuildCOO();
     }
 
     // Merge another adjacency list into this one
     void graphEdit(const AdjacencyList<T>& other) {
-        for (const auto& [node, head] : other.nodeHeads) {
-            int idx = head;
-            while (idx != -1) {
-                const HalfEdge& e = other.edges[idx];
-                addEdge(e.src, e.dst);
-                idx = e.next_out;
-            }
-        }
+        for (const auto& [node, neighbors] : other.adj)
+            for (T nbr : neighbors)
+                addEdge(node, nbr);
     }
 
     // -------------------------------------------------------------------------
@@ -215,28 +190,14 @@ public:
 
     template <typename Func>
     void forEachNeighbor(T nodeId, Func fn) const {
-        auto it = nodeHeads.find(nodeId);
-        if (it == nodeHeads.end()) return;
-        int idx = it->second;
-        while (idx != -1) {
-            fn(edges[idx].dst);
-            idx = edges[idx].next_out;
-        }
+        auto it = adj.find(nodeId);
+        if (it == adj.end()) return;
+        for (T nbr : it->second)
+            fn(nbr);
     }
 
-    // Reconstructs an unordered_map view for compatibility. Allocates -- avoid
-    // calling this every frame.
-    std::unordered_map<T, std::unordered_set<T>> getAdjList() const {
-        std::unordered_map<T, std::unordered_set<T>> result;
-        for (const auto& [node, head] : nodeHeads) {
-            result[node] = {};
-            int idx = head;
-            while (idx != -1) {
-                result[node].insert(edges[idx].dst);
-                idx = edges[idx].next_out;
-            }
-        }
-        return result;
+    const std::unordered_map<T, std::unordered_set<T>>& getAdjList() const {
+        return adj;
     }
 
     // Returns the flat directed COO edge arrays. Always current — no lazy
@@ -252,13 +213,13 @@ public:
     // buffer when d_morton_sorted_ids is null).
     std::vector<T> getOrderedNodeIds() const {
         std::vector<T> ids;
-        ids.reserve(nodeHeads.size());
-        for (const auto& [node, _] : nodeHeads)
+        ids.reserve(adj.size());
+        for (const auto& [node, _] : adj)
             ids.push_back(node);
         return ids;
     }
 
-    uint32_t nodeCount() const { return static_cast<uint32_t>(nodeHeads.size()); }
+    uint32_t nodeCount() const { return static_cast<uint32_t>(adj.size()); }
 
     // Returns the subset of the COO where both endpoints are in subset_ids.
     // Call this on the CPU before buildGPUAdjacencyList to avoid uploading and
@@ -304,7 +265,7 @@ public:
         const bool     use_subset = !sorted_ids.empty();
         const uint32_t N = use_subset
                            ? static_cast<uint32_t>(sorted_ids.size())
-                           : static_cast<uint32_t>(nodeHeads.size());
+                           : static_cast<uint32_t>(adj.size());
 
         // Filter edges on the CPU — only intra-subset edges are uploaded.
         // For the full-graph path the internal coo_src/coo_dst are used as-is.
@@ -350,7 +311,7 @@ public:
         } else {
             std::vector<T> h_nodes;
             h_nodes.reserve(N);
-            for (const auto& [node, _] : nodeHeads)
+            for (const auto& [node, _] : adj)
                 h_nodes.push_back(node);
             CUDA_CHECK(cudaMemcpy(
                 out.nodes, h_nodes.data(),
@@ -364,11 +325,11 @@ public:
         // ID can be >> N. Allocate the map to max_entity_id + 1 and zero-fill
         // unused slots to avoid out-of-bounds writes from buildInverseMapKernel.
         // When using a subset the COO only contains subset IDs, so sizing to
-        // the subset max is sufficient. We still scan nodeHeads as a safe
+        // the subset max is sufficient. We still scan adj as a safe
         // upper bound that covers both paths.
         // ------------------------------------------------------------------
         uint32_t max_entity_id = 0;
-        for (const auto& [node, _] : nodeHeads)
+        for (const auto& [node, _] : adj)
             max_entity_id = std::max(max_entity_id, static_cast<uint32_t>(node));
 
         uint32_t* d_inverse_map = nullptr;
@@ -528,25 +489,10 @@ public:
 
 private:
 
-    // -------------------------------------------------------------------------
-    // Half-edge storage
-    // -------------------------------------------------------------------------
+    // node -> set of neighbor IDs
+    std::unordered_map<T, std::unordered_set<T>> adj;
 
-    struct HalfEdge {
-        T    src;
-        T    dst;
-        int  twin;      // index of reverse half-edge in edges[]
-        int  next_out;  // next outgoing half-edge from src (-1 if last)
-        bool alive;
-    };
-
-    std::vector<HalfEdge> edges;
-    std::stack<int>       freeList;  // indices of dead slots ready to reuse
-
-    // node -> index of first outgoing half-edge (-1 if isolated)
-    std::unordered_map<T, int> nodeHeads;
-
-    // O(1) existence check. Does not store neighbor data.
+    // O(1) existence check (canonical undirected key)
     std::unordered_set<uint64_t> edgeIndex;
 
     // COO cache — kept current eagerly by all mutation methods
@@ -563,64 +509,24 @@ private:
         return (uint64_t(a) << 32) | uint64_t(b);
     }
 
-    // Return a slot index, reusing from free list before appending
-    int allocSlot() {
-        if (!freeList.empty()) {
-            int idx = freeList.top();
-            freeList.pop();
-            return idx;
-        }
-        edges.push_back({});
-        return static_cast<int>(edges.size()) - 1;
-    }
-
-    // Remove a single undirected edge (a, b), unlinking both half-edges and
-    // returning their slots to the free list.
+    // Remove a single undirected edge (a, b).
     void removeEdge(T a, T b) {
         uint64_t key = edgeKey(a, b);
         if (!edgeIndex.count(key)) return;
         edgeIndex.erase(key);
-
-        // Walk a's outgoing list to find the a->b half-edge, then splice it
-        // out. Simultaneously locate and splice the b->a twin from b's list.
-        int* cursor = &nodeHeads[a];
-        while (*cursor != -1) {
-            HalfEdge& e = edges[*cursor];
-            if (e.dst == b) {
-                int idxAB = *cursor;
-                int idxBA = e.twin;
-
-                // Unlink a->b from a's list
-                *cursor = e.next_out;
-
-                // Unlink b->a from b's list
-                int* bcursor = &nodeHeads[b];
-                while (*bcursor != -1 && *bcursor != idxBA)
-                    bcursor = &edges[*bcursor].next_out;
-                if (*bcursor == idxBA)
-                    *bcursor = edges[idxBA].next_out;
-
-                edges[idxAB].alive = false;
-                edges[idxBA].alive = false;
-                freeList.push(idxAB);
-                freeList.push(idxBA);
-
-                rebuildCOO();
-                return;
-            }
-            cursor = &e.next_out;
-        }
+        adj[a].erase(b);
+        adj[b].erase(a);
+        rebuildCOO();
     }
 
     void rebuildCOO() {
         coo_src.clear();
         coo_dst.clear();
-        for (const auto& e : edges) {
-            if (e.alive) {
-                coo_src.push_back(e.src);
-                coo_dst.push_back(e.dst);
+        for (const auto& [node, neighbors] : adj)
+            for (T nbr : neighbors) {
+                coo_src.push_back(node);
+                coo_dst.push_back(nbr);
             }
-        }
     }
 };
 
