@@ -23,12 +23,13 @@ FetchContent_MakeAvailable(imgui_backends)
 
 # Source files
 set (DYNAMIC_FOAM_SOURCES
+    Sim2D/adjacency.cu
     Sim2D/bvh.cu
     Sim2D/render.cu
     Sim2D/collision.cu
+    Sim2D/gpu_slab.cu
     Sim2D/physics.cpp
     Sim2D/simulation.cpp
-    Sim2D/simulation_gpu.cu
     Sim2D/topology.cpp
     Sim2D/user_input.cpp
     Sim2D/sample_scene.cpp

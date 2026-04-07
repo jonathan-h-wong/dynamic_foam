@@ -622,7 +622,7 @@ std::vector<FoamCollision> detectCollisions(
     const std::unordered_map<int, AABB>&                         foamAABBs,
     const std::unordered_map<int, BVH>&                          foamBVHs,
     const std::unordered_map<int, glm::mat4>&                    foamTransforms,
-    const std::unordered_map<int, AdjacencyList<entt::entity>>&  foamAdjacencyLists,
+    const std::unordered_map<int, AdjacencyList>&                foamAdjacencyLists,
     const entt::registry&                                        particleRegistry)
 {
     std::vector<FoamCollision> results;
@@ -649,7 +649,7 @@ std::vector<FoamCollision> detectCollisions(
         hostBVHs[id] = bvhToHost(foamBVHs.at(id));
 
     // Cache ordered particle lists (used to resolve prim_idx → entity).
-    std::unordered_map<int, std::vector<entt::entity>> orderedParticles;
+    std::unordered_map<int, std::vector<uint32_t>> orderedParticles;
     orderedParticles.reserve(N);
     for (int id : foamIds)
         orderedParticles[id] = foamAdjacencyLists.at(id).getOrderedNodeIds();
@@ -685,8 +685,8 @@ std::vector<FoamCollision> detectCollisions(
                 if (primA < 0 || primA >= static_cast<int>(ordA.size())) continue;
                 if (primB < 0 || primB >= static_cast<int>(ordB.size())) continue;
 
-                const entt::entity eA = ordA[primA];
-                const entt::entity eB = ordB[primB];
+                const entt::entity eA = static_cast<entt::entity>(ordA[primA]);
+                const entt::entity eB = static_cast<entt::entity>(ordB[primB]);
 
                 const auto* cpA = particleRegistry.try_get<ParticleVertices>(eA);
                 const auto* cpB = particleRegistry.try_get<ParticleVertices>(eB);

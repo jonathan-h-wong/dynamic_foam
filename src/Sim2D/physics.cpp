@@ -4,7 +4,7 @@ namespace DynamicFoam::Sim2D {
     std::vector<entt::entity> Physics::update(
         const std::unordered_map<int, AABB>&                         foamAABBs,
         const std::unordered_map<int, BVH>&                          foamBVHs,
-        const std::unordered_map<int, AdjacencyList<entt::entity>>& foamAdjacencyLists,
+        const std::unordered_map<int, AdjacencyList>& foamAdjacencyLists,
         entt::registry&                                              foamRegistry,
         const entt::registry&                                        particleRegistry,
         float                                                        deltaTime

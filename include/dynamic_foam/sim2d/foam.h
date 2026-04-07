@@ -15,31 +15,31 @@ namespace DynamicFoam::Sim2D {
         Foam() = default;
 
         // Topology
-        AdjacencyList<int> adjacencyList;
-        std::unordered_map<int, bool> isStencil;
-        std::unordered_map<int, bool> isMutable;
+        AdjacencyList adjacencyList;
+        std::unordered_map<uint32_t, bool> isStencil;
+        std::unordered_map<uint32_t, bool> isMutable;
 
         // Local Space Geometry
-        std::unordered_map<int, glm::vec3> particlePosition;
-        std::unordered_map<int, std::vector<glm::vec3>> particleVertices;
+        std::unordered_map<uint32_t, glm::vec3> particlePosition;
+        std::unordered_map<uint32_t, std::vector<glm::vec3>> particleVertices;
 
         // Physics
         float density;
-        std::unordered_map<int, float> particleMass;
+        std::unordered_map<uint32_t, float> particleMass;
         glm::mat3 intertiaTensor;
 
         // Rendering
-        std::unordered_map<int, glm::vec3> particleColor;
-        std::unordered_map<int, float> particleOpacity;
+        std::unordered_map<uint32_t, glm::vec3> particleColor;
+        std::unordered_map<uint32_t, float> particleOpacity;
 
 #ifndef __CUDACC__
         Foam(
-            const std::vector<int>& particleIds,
+            const std::vector<uint32_t>& particleIds,
             const std::vector<glm::vec3>& positions,
-            const std::unordered_map<int, bool>& stencil,
-            const std::unordered_map<int, bool>& mutable_map,
-            const std::unordered_map<int, glm::vec3>& color,
-            const std::unordered_map<int, float>& opacity,
+            const std::unordered_map<uint32_t, bool>& stencil,
+            const std::unordered_map<uint32_t, bool>& mutable_map,
+            const std::unordered_map<uint32_t, glm::vec3>& color,
+            const std::unordered_map<uint32_t, float>& opacity,
             float density = 1.0f
         ) : isStencil(stencil),
             isMutable(mutable_map),
@@ -53,7 +53,7 @@ namespace DynamicFoam::Sim2D {
 
             // Build position and mass maps
             for (size_t i = 0; i < particleIds.size(); ++i) {
-                int id = particleIds[i];
+                uint32_t id = particleIds[i];
                 particlePosition[id] = positions[i];
                 particleMass[id] = (volumeMap.count(id) && volumeMap.at(id) > 0.0f)
                     ? volumeMap.at(id) * density

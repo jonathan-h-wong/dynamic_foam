@@ -28,7 +28,7 @@ class Simulation {
         void updateTopology(
             const std::unordered_map<int, AABB>&                         foamAABBs,
             const std::unordered_map<int, BVH>&                          foamBVHs,
-            std::unordered_map<int, AdjacencyList<entt::entity>>&        foamAdjacencyLists);
+            std::unordered_map<int, AdjacencyList>&                      foamAdjacencyLists);
         void updatePhysics(
             const std::unordered_map<int, AABB>&                         foamAABBs,
             const std::unordered_map<int, BVH>&                          foamBVHs,
@@ -83,7 +83,7 @@ class Simulation {
         
         entt::registry foamRegistry;
         entt::registry particleRegistry;
-        std::unordered_map<int, AdjacencyList<entt::entity>> foamAdjacencyLists;
+        std::unordered_map<int, AdjacencyList> foamAdjacencyLists;
         std::unordered_map<int, BVH>  foamBVHs;
         std::unordered_map<int, AABB> foamAABBs;
 
@@ -92,7 +92,7 @@ class Simulation {
         // incrementally when topology changes.
         GpuSlabAllocator gpuSlab;
         // Per-foam GPU adjacency list handles (nbrs/node_offsets are slab slices).
-        std::unordered_map<int, AdjacencyListGPU<entt::entity>> foamGpuAdj;
+        std::unordered_map<int, AdjacencyListGPU> foamGpuAdj;
         
         glm::ivec2 windowSize_;
 

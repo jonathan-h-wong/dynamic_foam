@@ -48,7 +48,7 @@ namespace DynamicFoam::Sim2D {
         std::vector<TopologyUpdateResult> update(
             const std::unordered_map<int, AABB>&                         foamAABBs,
             const std::unordered_map<int, BVH>&                          foamBVHs,
-            std::unordered_map<int, AdjacencyList<entt::entity>>&        foamAdjacencyLists,
+            std::unordered_map<int, AdjacencyList>&                      foamAdjacencyLists,
             entt::registry&                                              foamRegistry,
             entt::registry&                                              particleRegistry
         );

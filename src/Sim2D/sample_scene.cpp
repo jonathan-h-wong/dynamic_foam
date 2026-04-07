@@ -11,12 +11,12 @@ namespace DynamicFoam::Sim2D {
         float density, 
         const glm::vec3& color_param) {
         
-        std::vector<int> particleIds;
+        std::vector<uint32_t> particleIds;
         std::vector<glm::vec3> positions;
-        std::unordered_map<int, bool> stencil;
-        std::unordered_map<int, bool> mutable_map;
-        std::unordered_map<int, glm::vec3> color;
-        std::unordered_map<int, float> opacity;
+        std::unordered_map<uint32_t, bool> stencil;
+        std::unordered_map<uint32_t, bool> mutable_map;
+        std::unordered_map<uint32_t, glm::vec3> color;
+        std::unordered_map<uint32_t, float> opacity;
 
         int paddedWidth = widthParticles + 2;
         int paddedHeight = heightParticles + 2;
@@ -29,7 +29,7 @@ namespace DynamicFoam::Sim2D {
             for (int j = 0; j < paddedHeight; ++j) {
                 for (int k = 0; k < paddedDepth; ++k) {
                     int id = i * (paddedHeight * paddedDepth) + j * paddedDepth + k;
-                    particleIds.push_back(id);
+                    particleIds.push_back(static_cast<uint32_t>(id));
                     positions.push_back(glm::vec3(
                         (i - 1) * dx - width / 2.0f,
                         (j - 1) * dy - height / 2.0f,
@@ -38,10 +38,10 @@ namespace DynamicFoam::Sim2D {
 
                     bool isPadding = (i == 0 || i == paddedWidth - 1 || j == 0 || j == paddedHeight - 1 || k == 0 || k == paddedDepth - 1);
 
-                    stencil[id] = false;
-                    mutable_map[id] = true;
-                    color[id] = color_param;
-                    opacity[id] = isPadding ? 0.0f : 1.0f;
+                    stencil[static_cast<uint32_t>(id)] = false;
+                    mutable_map[static_cast<uint32_t>(id)] = true;
+                    color[static_cast<uint32_t>(id)] = color_param;
+                    opacity[static_cast<uint32_t>(id)] = isPadding ? 0.0f : 1.0f;
                 }
             }
         }
@@ -50,15 +50,15 @@ namespace DynamicFoam::Sim2D {
     }
 
     Foam generateFoamPointCursor() {
-        std::vector<int> particleIds;
+        std::vector<uint32_t> particleIds;
         std::vector<glm::vec3> positions;
-        std::unordered_map<int, bool> stencil;
-        std::unordered_map<int, bool> mutable_map;
-        std::unordered_map<int, glm::vec3> color;
-        std::unordered_map<int, float> opacity;
+        std::unordered_map<uint32_t, bool> stencil;
+        std::unordered_map<uint32_t, bool> mutable_map;
+        std::unordered_map<uint32_t, glm::vec3> color;
+        std::unordered_map<uint32_t, float> opacity;
 
         // Central particle
-        int centerId = 0;
+        uint32_t centerId = 0;
         particleIds.push_back(centerId);
         positions.push_back(glm::vec3(0.0f, 0.0f, 0.0f));
         opacity[centerId] = 1.0f;
@@ -66,7 +66,7 @@ namespace DynamicFoam::Sim2D {
         // Surrounding particles on a sphere
         int numSurrounding = 32;
         float radius = 0.2f;
-        int id_counter = 1;
+        uint32_t id_counter = 1;
 
         // Use Fibonacci sphere algorithm for evenly distributed points
         float phi = glm::pi<float>() * (3.0f - sqrt(5.0f)); // Golden angle in radians
@@ -80,7 +80,7 @@ namespace DynamicFoam::Sim2D {
             float x = cos(theta) * radius_at_y;
             float z = sin(theta) * radius_at_y;
 
-            int id = id_counter++;
+            uint32_t id = id_counter++;
             particleIds.push_back(id);
             positions.push_back(glm::vec3(x * radius, y * radius, z * radius));
             opacity[id] = 0.0f; // Padding particles
@@ -103,12 +103,12 @@ namespace DynamicFoam::Sim2D {
         float density,
         const glm::vec3& color_param)
     {
-        std::vector<int>                       particleIds;
+        std::vector<uint32_t>                       particleIds;
         std::vector<glm::vec3>                 positions;
-        std::unordered_map<int, bool>          stencil;
-        std::unordered_map<int, bool>          mutable_map;
-        std::unordered_map<int, glm::vec3>     color;
-        std::unordered_map<int, float>         opacity;
+        std::unordered_map<uint32_t, bool>          stencil;
+        std::unordered_map<uint32_t, bool>          mutable_map;
+        std::unordered_map<uint32_t, glm::vec3>     color;
+        std::unordered_map<uint32_t, float>         opacity;
 
         // Padded grid: one ghost ring in XZ, plus one ghost cap above/below in Y.
         //   paddedX = xParticles + 2  (ghost at i=0 and i=paddedX-1)
@@ -128,7 +128,7 @@ namespace DynamicFoam::Sim2D {
         for (int i = 0; i < paddedX; ++i) {
             for (int j = 0; j < paddedY; ++j) {
                 for (int k = 0; k < paddedZ; ++k) {
-                    const int id = i * (paddedY * paddedZ) + j * paddedZ + k;
+                    const uint32_t id = static_cast<uint32_t>(i * (paddedY * paddedZ) + j * paddedZ + k);
                     particleIds.push_back(id);
 
                     // (i-1) so that i=1 maps to x=-widthX/2, i=xParticles maps

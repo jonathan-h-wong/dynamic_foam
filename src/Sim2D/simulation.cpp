@@ -5,18 +5,6 @@
 
 namespace DynamicFoam::Sim2D {
 
-// Forward declarations for the CUDA helpers implemented in simulation_gpu.cu.
-// These are free functions that wrap __CUDACC__-guarded template methods so
-// they can be called from MSVC-compiled simulation.cpp without triggering the
-// nvcc/entt registry compatibility issue.
-void buildAdjacencyIntoSlabSlice(
-    AdjacencyList<entt::entity>& adj,
-    AdjacencyListGPU<entt::entity>& out,
-    uint32_t* d_nbrs_slice,         size_t nbrs_cap,
-    uint32_t* d_node_offsets_slice, size_t node_offsets_cap);
-
-void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
-
     Simulation::Simulation(
         const SceneGraph& sceneGraph, 
         const glm::ivec2& windowSize
@@ -48,19 +36,17 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
             foamRegistry.emplace<Density>(rigidBody, foam.density);
             foamRegistry.emplace<InertiaTensor>(rigidBody, foam.intertiaTensor);
 
-            std::unordered_map<int, entt::entity> particleMap;
+            std::unordered_map<uint32_t, entt::entity> particleMap;
             for (const auto& [particleId, localPos] : foam.particlePosition) {
                 particleMap[particleId] = particleRegistry.create();
             }
 
-            // Add RB to central Adjacency List registry
-            foamAdjacencyLists[static_cast<int>(rigidBody)] = AdjacencyList<entt::entity>(
-                foam.adjacencyList,
-                std::function<entt::entity(int)>([&](int p_id) { return particleMap.at(p_id); })
-            );
+            std::unordered_map<uint32_t, uint32_t> particleRemap;
+            for (const auto& [particleId, entity] : particleMap)
+                particleRemap[particleId] = static_cast<uint32_t>(entity);
 
-            std::unordered_map<int, glm::vec3> local_positions;
-            std::unordered_map<int, float> masses;
+            // Add RB to central Adjacency List registry
+            foamAdjacencyLists[static_cast<int>(rigidBody)] = foam.adjacencyList.remap(particleRemap);
 
             // Set Particle components
             for (const auto& [particleId, localPos] : foam.particlePosition) {
@@ -72,13 +58,11 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
                 
                 float mass = foam.particleMass.at(particleId);
                 particleRegistry.emplace<ParticleMass>(particle, mass);
-                masses[particleId] = mass;
                 const auto& p_verts = foam.particleVertices.at(particleId);
                 particleRegistry.emplace<ParticleVertices>(particle, p_verts);
 
                 glm::vec3 worldPos = glm::vec3(transform * glm::vec4(localPos, 1.0f));
                 particleRegistry.emplace<ParticleWorldPosition>(particle, worldPos);
-                local_positions[particleId] = localPos;
 
                 if (foam.isStencil.at(particleId)) {
                     particleRegistry.emplace<Stencil>(particle);
@@ -114,7 +98,7 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
         std::vector<glm::vec3> world_positions;
         world_positions.reserve(ordered.size());
         for (auto e : ordered)
-            world_positions.push_back(particleRegistry.get<ParticleWorldPosition>(e).value);
+            world_positions.push_back(particleRegistry.get<ParticleWorldPosition>(static_cast<entt::entity>(e)).value);
         if (!world_positions.empty()) {
             auto [min, max] = calculateAABB(world_positions);
             foamAABBs[static_cast<int>(foamEntity)] = AABB(min, max);
@@ -164,7 +148,7 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
             std::vector<AABB> ordered_aabbs;
             ordered_aabbs.reserve(N);
             for (auto e : ordered) {
-                const auto& verts = particleRegistry.get<ParticleVertices>(e).vertices;
+                const auto& verts = particleRegistry.get<ParticleVertices>(static_cast<entt::entity>(e)).vertices;
                 auto [mn, mx] = calculateAABB(verts);
                 ordered_aabbs.push_back(AABB(mn, mx));
             }
@@ -174,23 +158,20 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
                 slot.bvh_capacity);
 
             // Build GPU CSR into slab slices and bias offsets.
-            // Uses free-function wrappers in simulation_gpu.cu (nvcc-compiled)
-            // to avoid entt/nvcc registry incompatibility in .cu files.
-            buildAdjacencyIntoSlabSlice(
-                adj,
+            adj.buildGPUAdjacencyListIntoSlice(
                 foamGpuAdj[foam_id],
                 gpuSlab.d_csr_nbrs         + slot.csr_edge_offset,
                 static_cast<size_t>(slot.csr_edge_capacity),
                 gpuSlab.d_csr_node_offsets + slot.csr_node_offset,
                 static_cast<size_t>(slot.csr_node_capacity));
 
-            biasSlabCsrOffsets(gpuSlab, foam_id);
+            gpuSlab.biasCsrOffsets(foam_id);
 
             // Upload static particle data (colors + surface mask) once.
             std::vector<glm::vec4> h_colors(N);
             std::vector<uint8_t>   h_mask(N, 0);
             for (int li = 0; li < N; ++li) {
-                const entt::entity e = ordered[li];
+                const entt::entity e = static_cast<entt::entity>(ordered[li]);
                 const auto* c = particleRegistry.try_get<ParticleColor>(e);
                 const auto* o = particleRegistry.try_get<ParticleOpacity>(e);
                 if (c && o) h_colors[li] = glm::vec4(c->rgb, o->value);
@@ -219,13 +200,13 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
             auto it = gpuSlab.slots.find(foam_id);
             if (it == gpuSlab.slots.end() || it->second.dead) continue;
             const FoamSlot& slot = it->second;
-            buildAdjacencyIntoSlabSlice(
-                adj, foamGpuAdj[foam_id],
+            adj.buildGPUAdjacencyListIntoSlice(
+                foamGpuAdj[foam_id],
                 gpuSlab.d_csr_nbrs         + slot.csr_edge_offset,
                 static_cast<size_t>(slot.csr_edge_capacity),
                 gpuSlab.d_csr_node_offsets + slot.csr_node_offset,
                 static_cast<size_t>(slot.csr_node_capacity));
-            biasSlabCsrOffsets(gpuSlab, foam_id);
+            gpuSlab.biasCsrOffsets(foam_id);
         }
     }
 
@@ -239,7 +220,7 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
         std::vector<AABB> ordered_aabbs;
         ordered_aabbs.reserve(N);
         for (auto e : ordered) {
-            const auto& verts = particleRegistry.get<ParticleVertices>(e).vertices;
+            const auto& verts = particleRegistry.get<ParticleVertices>(static_cast<entt::entity>(e)).vertices;
             auto [mn, mx] = calculateAABB(verts);
             ordered_aabbs.push_back(AABB(mn, mx));
         }
@@ -254,13 +235,13 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
             if (gpuSlab.needsResize(foam_id, num_bvh_nodes, N + 1, E, N)) {
                 gpuSlab.resize(foam_id, num_bvh_nodes, N + 1, E, N);
                 const FoamSlot& newSlot = gpuSlab.slots.at(foam_id);
-                buildAdjacencyIntoSlabSlice(
-                    adj, foamGpuAdj[foam_id],
+                adj.buildGPUAdjacencyListIntoSlice(
+                    foamGpuAdj[foam_id],
                     gpuSlab.d_csr_nbrs         + newSlot.csr_edge_offset,
                     static_cast<size_t>(newSlot.csr_edge_capacity),
                     gpuSlab.d_csr_node_offsets + newSlot.csr_node_offset,
                     static_cast<size_t>(newSlot.csr_node_capacity));
-                biasSlabCsrOffsets(gpuSlab, foam_id);
+                gpuSlab.biasCsrOffsets(foam_id);
             }
 
             const FoamSlot& slot = gpuSlab.slots.at(foam_id);
@@ -291,28 +272,29 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
         if (!foamAdjacencyLists.count(foamId)) return;
 
         const auto& adjList = foamAdjacencyLists.at(foamId);
-        const auto allParticles = adjList.getOrderedNodeIds();
+        const auto allParticles = adjList.getOrderedNodeIds();  // std::vector<uint32_t>
 
         // Build the update buffer: validate and use the subset if provided, otherwise use all particles.
-        const std::unordered_set<entt::entity> foamParticleSet(allParticles.begin(), allParticles.end());
-        const std::vector<entt::entity>* updateBuffer = &allParticles;
-        std::vector<entt::entity> subsetBuffer;
+        std::vector<uint32_t> effectiveBuffer;
         if (particleSubset.has_value()) {
+            const std::unordered_set<uint32_t> foamParticleSet(allParticles.begin(), allParticles.end());
             for (const auto& particle : *particleSubset) {
-                if (!foamParticleSet.count(particle)) {
+                uint32_t id = static_cast<uint32_t>(particle);
+                if (!foamParticleSet.count(id)) {
                     throw std::invalid_argument(
-                        "Particle entity " + std::to_string(static_cast<uint32_t>(particle)) +
+                        "Particle entity " + std::to_string(id) +
                         " does not belong to foam " + std::to_string(foamId)
                     );
                 }
+                effectiveBuffer.push_back(id);
             }
-            subsetBuffer.assign(particleSubset->begin(), particleSubset->end());
-            updateBuffer = &subsetBuffer;
+        } else {
+            effectiveBuffer = allParticles;
         }
 
-        for (const auto& particle : *updateBuffer) {
-            auto& worldPos = particleRegistry.get<ParticleWorldPosition>(particle);
-            const auto& localPos = particleRegistry.get<ParticleLocalPosition>(particle);
+        for (uint32_t pid : effectiveBuffer) {
+            auto& worldPos = particleRegistry.get<ParticleWorldPosition>(static_cast<entt::entity>(pid));
+            const auto& localPos = particleRegistry.get<ParticleLocalPosition>(static_cast<entt::entity>(pid));
             worldPos.value = glm::vec3(transform * glm::vec4(localPos.value, 1.0f));
         }
     }
@@ -375,7 +357,6 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
         foamRegistry.view<Controller, Position>().each([&](auto entity, auto& pos) {
             pos.value = glm::vec3(world_x, world_y, 0.0f);
             applyForwardKinematics(entity);
-            buildBVH(entity);   // keep narrowphase BVH in sync with particle world positions
             buildAABB(entity);  // keep broadphase AABB in sync with particle world positions
         });
     }
@@ -383,7 +364,7 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
     void Simulation::updateTopology(
         const std::unordered_map<int, AABB>&                         foamAABBs,
         const std::unordered_map<int, BVH>&                          foamBVHs,
-        std::unordered_map<int, AdjacencyList<entt::entity>>&        foamAdjacencyLists
+        std::unordered_map<int, AdjacencyList>&                      foamAdjacencyLists
     ) {
         const auto results = topologySubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, foamRegistry, particleRegistry);
         for (const auto& result : results) {
@@ -394,16 +375,13 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
 
             // Rebuild BVH from current ParticleVertices in the registry.
             buildBVH(result.foamId);
+            buildAABB(result.foamId);
 
             // A parent foam snapshot indicates a new foam was spawned from a topology change.
             if (result.parentFoamSnapshot.has_value()) {
                 const FoamSnapshot& snap = *result.parentFoamSnapshot;
 
-                // Rebuild AABB of the parent using already-updated world positions.
-                buildAABB(snap.foamId);
-
                 // --- Populate the new foam's rigid body components ---
-
                 // Gather per-particle data needed for several derived quantities.
                 std::unordered_map<entt::entity, glm::vec3> localPositions;
                 std::unordered_map<entt::entity, glm::vec3> worldPositions;
@@ -464,7 +442,7 @@ void biasSlabCsrOffsets(GpuSlabAllocator& slab, int foam_id);
             std::vector<glm::vec3> h_positions;
             h_positions.reserve(ordered.size());
             for (auto e : ordered)
-                h_positions.push_back(particleRegistry.get<ParticleWorldPosition>(e).value);
+                h_positions.push_back(particleRegistry.get<ParticleWorldPosition>(static_cast<entt::entity>(e)).value);
             gpuSlab.uploadParticlePositions(
                 foam_id, h_positions.data(), static_cast<int>(h_positions.size()));
         }

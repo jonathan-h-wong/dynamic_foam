@@ -75,7 +75,7 @@ std::vector<FoamCollision> detectCollisions(
     const std::unordered_map<int, AABB>&                         foamAABBs,
     const std::unordered_map<int, BVH>&                          foamBVHs,
     const std::unordered_map<int, glm::mat4>&                    foamTransforms,
-    const std::unordered_map<int, AdjacencyList<entt::entity>>&  foamAdjacencyLists,
+    const std::unordered_map<int, AdjacencyList>&                foamAdjacencyLists,
     const entt::registry&                                        particleRegistry
 );
 

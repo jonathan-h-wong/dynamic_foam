@@ -38,16 +38,7 @@
 
 namespace DynamicFoam::Sim2D {
 
-// Bias kernel — adds a scalar to every element of a uint32 device array.
-// Needed after buildGPUAdjacencyList writes 0-based node_offsets into a slab
-// slice: the values must be biased by the foam's edge-block start so that
-// k_exact_collision can index directly into the global d_csr_nbrs buffer.
-#ifdef __CUDACC__
-static __global__ void k_bias_u32(uint32_t* arr, int n, uint32_t bias) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) arr[i] += bias;
-}
-#endif
+
 
 // =============================================================================
 // FoamSlot — per-foam layout within each slab buffer.
@@ -258,18 +249,7 @@ public:
     // values are valid global indices into d_csr_nbrs.
     // Must be called once per foam immediately after buildGPUAdjacencyList.
     // -------------------------------------------------------------------------
-#ifdef __CUDACC__
-    void biasCsrOffsets(int foam_id) {
-        const FoamSlot& s = slots.at(foam_id);
-        const int n = s.csr_node_capacity; // N+1 entries written by buildGPUAdjacencyList
-        if (n <= 0 || s.csr_edge_offset == 0) return;
-        k_bias_u32<<<grid_size(n), 256>>>(
-            d_csr_node_offsets + s.csr_node_offset,
-            n,
-            static_cast<uint32_t>(s.csr_edge_offset));
-        CUDA_CHECK(cudaGetLastError());
-    }
-#endif
+    void biasCsrOffsets(int foam_id);
 
     // -------------------------------------------------------------------------
     // Per-frame particle position upload from a host array.

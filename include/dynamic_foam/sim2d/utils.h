@@ -47,15 +47,15 @@ using Point_3 = K::Point_3;
  * @return Tuple of (AdjacencyList, volume map, Voronoi vertex map).
  *         Unbounded cells have volume -1.
  */
-template <typename T, typename Vec3>
+template <typename Vec3>
 std::tuple<
-    AdjacencyList<T>,
-    std::unordered_map<T, float>,
-    std::unordered_map<T, std::vector<glm::vec3>>
+    AdjacencyList,
+    std::unordered_map<uint32_t, float>,
+    std::unordered_map<uint32_t, std::vector<glm::vec3>>
 >
 triangulateWithMetadata(
-    const std::vector<Vec3>& positions,
-    const std::vector<T>&    particleIds
+    const std::vector<Vec3>&     positions,
+    const std::vector<uint32_t>& particleIds
 ) {
     size_t numParticles = particleIds.size();
 
@@ -78,27 +78,27 @@ triangulateWithMetadata(
         }
     }
 
-    AdjacencyList<T> adjList(particleIds);
+    AdjacencyList adjList(particleIds);
     for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
         auto cell = eit->first;
         auto v1 = cell->vertex(eit->second);
         auto v2 = cell->vertex(eit->third);
         if (vertexToIndex.count(v1) && vertexToIndex.count(v2)) {
-            T id1 = particleIds[vertexToIndex[v1]];
-            T id2 = particleIds[vertexToIndex[v2]];
+            uint32_t id1 = particleIds[vertexToIndex[v1]];
+            uint32_t id2 = particleIds[vertexToIndex[v2]];
             adjList.addNodeEdges(id1, {id2});
         }
     }
 
-    std::unordered_map<T, float> volumeMap;
+    std::unordered_map<uint32_t, float> volumeMap;
     volumeMap.reserve(numParticles);
-    std::unordered_map<T, std::vector<glm::vec3>> voronoiVertices;
+    std::unordered_map<uint32_t, std::vector<glm::vec3>> voronoiVertices;
     voronoiVertices.reserve(numParticles);
 
     for (auto vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit) {
         if (!vertexToIndex.count(vit)) continue;
-        size_t i  = vertexToIndex[vit];
-        T      id = particleIds[i];
+        size_t   i  = vertexToIndex[vit];
+        uint32_t id = particleIds[i];
 
         glm::vec3 genPt(
             static_cast<float>(vit->point().x()),
@@ -172,30 +172,29 @@ triangulateWithMetadata(
  * @return A map from node IDs to their component ID. Nodes with 0.0f opacity
  *         or nodes that are not part of any component will not be in the map.
  */
-template <typename T>
-std::unordered_map<T, int> findConnectedComponents(
-    const AdjacencyList<T>& adjList,
-    const std::unordered_map<T, float>& opacityMap
+inline std::unordered_map<uint32_t, int> findConnectedComponents(
+    const AdjacencyList& adjList,
+    const std::unordered_map<uint32_t, float>& opacityMap
 ) {
-    std::unordered_map<T, int> componentLabels;
-    std::unordered_set<T> visited;
+    std::unordered_map<uint32_t, int> componentLabels;
+    std::unordered_set<uint32_t> visited;
     int componentId = 0;
 
     for (const auto& pair : opacityMap) {
-        const T& startNode = pair.first;
+        const uint32_t& startNode = pair.first;
         float opacity = pair.second;
 
         if (opacity > 0.0f && visited.find(startNode) == visited.end()) {
             componentId++;
-            std::vector<T> stack;
+            std::vector<uint32_t> stack;
             stack.push_back(startNode);
             visited.insert(startNode);
             componentLabels[startNode] = componentId;
 
             while (!stack.empty()) {
-                T currentNode = stack.back();
+                uint32_t currentNode = stack.back();
                 stack.pop_back();
-                adjList.forEachNeighbor(currentNode, [&](const T& neighbor) {
+                adjList.forEachNeighbor(currentNode, [&](const uint32_t& neighbor) {
                     auto it = opacityMap.find(neighbor);
                     if (it != opacityMap.end() && it->second > 0.0f
                             && visited.find(neighbor) == visited.end()) {
@@ -221,17 +220,16 @@ std::unordered_map<T, int> findConnectedComponents(
  * @param opacityMap A map from node IDs to their opacity values (0.0f to 1.0f).
  * @return A vector of IDs of the surface cells.
  */
-template <typename T>
-std::vector<T> findSurfaceCells(
-    const AdjacencyList<T>& adjList,
-    const std::unordered_map<T, float>& opacityMap
+inline std::vector<uint32_t> findSurfaceCells(
+    const AdjacencyList& adjList,
+    const std::unordered_map<uint32_t, float>& opacityMap
 ) {
-    std::vector<T> surfaceCells;
+    std::vector<uint32_t> surfaceCells;
     for (const auto& pair : opacityMap) {
-        const T& nodeId = pair.first;
+        const uint32_t& nodeId = pair.first;
         if (pair.second > 0.0f) {
             bool isSurfaceCell = false;
-            adjList.forEachNeighbor(nodeId, [&](const T& neighborId) {
+            adjList.forEachNeighbor(nodeId, [&](const uint32_t& neighborId) {
                 auto it = opacityMap.find(neighborId);
                 if (it == opacityMap.end() || it->second == 0.0f)
                     isSurfaceCell = true;
@@ -337,15 +335,14 @@ inline std::pair<glm::vec3, glm::vec3> calculateAABB(
  * @param opacityMap A map from node IDs to their opacity values (0.0f to 1.0f).
  * @return The cycle count (number of independent cycles in the air cell subgraph).
  */
-template <typename T>
-int countCycles(
-    const AdjacencyList<T>& adjList,
-    const std::vector<T>& surfaceIds,
-    const std::unordered_map<T, float>& opacityMap
+inline int countCycles(
+    const AdjacencyList& adjList,
+    const std::vector<uint32_t>& surfaceIds,
+    const std::unordered_map<uint32_t, float>& opacityMap
 ) {
-    std::unordered_set<T> airCells;
-    for (const T& surfaceId : surfaceIds) {
-        adjList.forEachNeighbor(surfaceId, [&](const T& neighborId) {
+    std::unordered_set<uint32_t> airCells;
+    for (const uint32_t& surfaceId : surfaceIds) {
+        adjList.forEachNeighbor(surfaceId, [&](const uint32_t& neighborId) {
             auto it = opacityMap.find(neighborId);
             if (it != opacityMap.end() && it->second == 0.0f)
                 airCells.insert(neighborId);
@@ -355,8 +352,8 @@ int countCycles(
 
     int V = static_cast<int>(airCells.size());
     int E = 0;
-    for (const T& airCell : airCells) {
-        adjList.forEachNeighbor(airCell, [&](const T& neighborId) {
+    for (const uint32_t& airCell : airCells) {
+        adjList.forEachNeighbor(airCell, [&](const uint32_t& neighborId) {
             if (airCells.count(neighborId) && airCell < neighborId)
                 E++;
         });

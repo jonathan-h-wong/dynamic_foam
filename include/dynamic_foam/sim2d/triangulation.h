@@ -56,7 +56,6 @@ inline float signedTetVolume(
  * Boundary particles (incident to at least one infinite Delaunay cell) are
  * assigned volume -1 and an empty vertex list.
  *
- * @tparam T       Particle ID type (e.g. int).
  * @tparam Vec3    Position type exposing .x / .y / .z members.
  * @param positions   Particle positions in world / local space.
  * @param particleIds Particle IDs, one-to-one with positions.
@@ -65,15 +64,15 @@ inline float signedTetVolume(
  *         - per-particle volume map (volume = -1 for unbounded cells),
  *         - per-particle vertex buffer (empty for unbounded cells).
  */
-template <typename T, typename Vec3>
+template <typename Vec3>
 std::tuple<
-    AdjacencyList<T>,
-    std::unordered_map<T, float>,
-    std::unordered_map<T, std::vector<glm::vec3>>
+    AdjacencyList,
+    std::unordered_map<uint32_t, float>,
+    std::unordered_map<uint32_t, std::vector<glm::vec3>>
 >
 triangulateVoronoiCells(
-    const std::vector<Vec3>& positions,
-    const std::vector<T>&    particleIds)
+    const std::vector<Vec3>&     positions,
+    const std::vector<uint32_t>& particleIds)
 {
     size_t numParticles = particleIds.size();
 
@@ -121,7 +120,7 @@ triangulateVoronoiCells(
     // ------------------------------------------------------------------
     // 2. Adjacency list from finite Delaunay edges
     // ------------------------------------------------------------------
-    AdjacencyList<T> adjList(particleIds);
+    AdjacencyList adjList(particleIds);
 
     for (auto eit = dt.finite_edges_begin();
               eit != dt.finite_edges_end(); ++eit) {
@@ -129,8 +128,8 @@ triangulateVoronoiCells(
         auto v1   = cell->vertex(eit->second);
         auto v2   = cell->vertex(eit->third);
         if (vertexToIndex.count(v1) && vertexToIndex.count(v2)) {
-            T id1 = particleIds[vertexToIndex[v1]];
-            T id2 = particleIds[vertexToIndex[v2]];
+            uint32_t id1 = particleIds[vertexToIndex[v1]];
+            uint32_t id2 = particleIds[vertexToIndex[v2]];
             adjList.addNodeEdges(id1, {id2});
         }
     }
@@ -138,8 +137,8 @@ triangulateVoronoiCells(
     // ------------------------------------------------------------------
     // 3. Per-particle Voronoi volume + vertex buffer
     // ------------------------------------------------------------------
-    std::unordered_map<T, float>                  volumeMap;
-    std::unordered_map<T, std::vector<glm::vec3>> voronoiVertices;
+    std::unordered_map<uint32_t, float>                  volumeMap;
+    std::unordered_map<uint32_t, std::vector<glm::vec3>> voronoiVertices;
     volumeMap.reserve(numParticles);
     voronoiVertices.reserve(numParticles);
 
@@ -147,8 +146,8 @@ triangulateVoronoiCells(
               vit != dt.finite_vertices_end(); ++vit) {
         if (!vertexToIndex.count(vit)) continue;
 
-        size_t i  = vertexToIndex[vit];
-        T      id = particleIds[i];
+        size_t   i  = vertexToIndex[vit];
+        uint32_t id = particleIds[i];
 
         glm::vec3 genPt(
             static_cast<float>(vit->point().x()),
