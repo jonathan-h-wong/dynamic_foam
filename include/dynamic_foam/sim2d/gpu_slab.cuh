@@ -92,16 +92,16 @@ public:
         grow_csr_edges(total_csr_edges);
         grow_particles(total_particles);
 
-        // Initial offset-table device buffers (grown on demand).
-        CUDA_CHECK(cudaMalloc(&d_bvh_offsets,      8 * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_csr_offsets,       8 * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_particle_offsets,  8 * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_csr_edge_offsets,  8 * sizeof(int)));
+        // Initial per-foam slab start tables (grown on demand).
+        CUDA_CHECK(cudaMalloc(&d_foam_bvh_start,      8 * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_foam_rowptr_start,   8 * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_foam_particle_start, 8 * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_foam_colidx_start,   8 * sizeof(int)));
         offset_table_cap = 8;
-        h_bvh_offsets.assign(8, 0);
-        h_csr_offsets.assign(8, 0);
-        h_particle_offsets.assign(8, 0);
-        h_csr_edge_offsets.assign(8, 0);
+        h_foam_bvh_start.assign(8, 0);
+        h_foam_rowptr_start.assign(8, 0);
+        h_foam_particle_start.assign(8, 0);
+        h_foam_colidx_start.assign(8, 0);
     }
 
     // -------------------------------------------------------------------------
@@ -213,14 +213,14 @@ public:
             s.bvh_offset = bw;  bw += s.bvh_capacity;
 
             if (s.csr_node_offset != cnw)
-                CUDA_CHECK(cudaMemcpy(d_csr_node_offsets + cnw,
-                    d_csr_node_offsets + s.csr_node_offset,
+                CUDA_CHECK(cudaMemcpy(d_csr_rowptr + cnw,
+                    d_csr_rowptr + s.csr_node_offset,
                     s.csr_node_capacity * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
             s.csr_node_offset = cnw;  cnw += s.csr_node_capacity;
 
             if (s.csr_edge_offset != cew)
-                CUDA_CHECK(cudaMemcpy(d_csr_nbrs + cew,
-                    d_csr_nbrs + s.csr_edge_offset,
+                CUDA_CHECK(cudaMemcpy(d_csr_colidx + cew,
+                    d_csr_colidx + s.csr_edge_offset,
                     s.csr_edge_capacity * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
             s.csr_edge_offset = cew;  cew += s.csr_edge_capacity;
 
@@ -246,7 +246,7 @@ public:
     // -------------------------------------------------------------------------
     // biasCsrOffsets — after buildGPUAdjacencyList writes 0-based node_offsets
     // into a slab slice, this kernel adds the foam's csr_edge_offset so the
-    // values are valid global indices into d_csr_nbrs.
+    // values are valid global indices into d_csr_colidx.
     // Must be called once per foam immediately after buildGPUAdjacencyList.
     // -------------------------------------------------------------------------
     void biasCsrOffsets(int foam_id);
@@ -278,22 +278,22 @@ public:
     // -------------------------------------------------------------------------
     // Flat device buffers — owned by the allocator, lifetime = simulation.
     // -------------------------------------------------------------------------
-    BVHNode*   d_bvh_nodes          = nullptr; ///< All foams' BVH nodes packed end-to-end.
-    uint32_t*  d_csr_node_offsets   = nullptr; ///< All foams' CSR node_offsets packed end-to-end.
-    uint32_t*  d_csr_nbrs           = nullptr; ///< All foams' CSR neighbor indices packed end-to-end.
+    BVHNode*   d_bvh_nodes  = nullptr; ///< All foams' BVH nodes packed end-to-end.
+    uint32_t*  d_csr_rowptr = nullptr; ///< All foams' CSR row pointers (per-particle neighbor-list start) packed end-to-end.
+    uint32_t*  d_csr_colidx = nullptr; ///< All foams' CSR column indices (neighbor particle ids) packed end-to-end.
     glm::vec3* d_particle_positions = nullptr; ///< Flat particle world-space positions.
     glm::vec4* d_particle_colors    = nullptr; ///< Flat particle RGBA colors.
     uint8_t*   d_surface_mask       = nullptr; ///< 1 = surface particle, 0 = interior.
 
-    // Device offset tables — one int per foam, indexed by foam_id.
-    // d_bvh_offsets[fid]      = slot.bvh_offset
-    // d_csr_offsets[fid]      = slot.csr_node_offset  (start in d_csr_node_offsets)
-    // d_csr_edge_offsets[fid] = slot.csr_edge_offset  (start in d_csr_nbrs — not currently used by kernels but available)
-    // d_particle_offsets[fid] = slot.particle_offset
-    int* d_bvh_offsets      = nullptr;
-    int* d_csr_offsets      = nullptr;
-    int* d_csr_edge_offsets = nullptr;
-    int* d_particle_offsets = nullptr;
+    // Per-foam slab start tables — one int per foam, indexed by foam_id.
+    // d_foam_bvh_start[fid]      = slot.bvh_offset       (start in d_bvh_nodes)
+    // d_foam_rowptr_start[fid]   = slot.csr_node_offset  (start in d_csr_rowptr)
+    // d_foam_colidx_start[fid]   = slot.csr_edge_offset  (start in d_csr_colidx — not currently used by kernels but available)
+    // d_foam_particle_start[fid] = slot.particle_offset  (start in d_particle_positions etc.)
+    int* d_foam_bvh_start      = nullptr;
+    int* d_foam_rowptr_start   = nullptr;
+    int* d_foam_colidx_start   = nullptr;
+    int* d_foam_particle_start = nullptr;
 
     int num_foams = 0; ///< Max foam_id + 1 (offset table stride).
 
@@ -313,11 +313,11 @@ private:
     size_t csr_edge_cap = 0;
     size_t particle_cap = 0;
 
-    // Host mirrors of the device offset tables.
-    std::vector<int> h_bvh_offsets;
-    std::vector<int> h_csr_offsets;
-    std::vector<int> h_csr_edge_offsets;
-    std::vector<int> h_particle_offsets;
+    // Host mirrors of the per-foam slab start tables.
+    std::vector<int> h_foam_bvh_start;
+    std::vector<int> h_foam_rowptr_start;
+    std::vector<int> h_foam_colidx_start;
+    std::vector<int> h_foam_particle_start;
     size_t offset_table_cap = 0;
 
     // -------------------------------------------------------------------------
@@ -338,22 +338,22 @@ private:
         const size_t nc = std::max<size_t>(required * 2, 64);
         uint32_t* d_new = nullptr;
         CUDA_CHECK(cudaMalloc(&d_new, nc * sizeof(uint32_t)));
-        if (d_csr_node_offsets && csr_node_watermark > 0)
-            CUDA_CHECK(cudaMemcpy(d_new, d_csr_node_offsets,
+        if (d_csr_rowptr && csr_node_watermark > 0)
+            CUDA_CHECK(cudaMemcpy(d_new, d_csr_rowptr,
                 csr_node_watermark * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-        if (d_csr_node_offsets) CUDA_CHECK(cudaFree(d_csr_node_offsets));
-        d_csr_node_offsets = d_new;  csr_node_cap = nc;
+        if (d_csr_rowptr) CUDA_CHECK(cudaFree(d_csr_rowptr));
+        d_csr_rowptr = d_new;  csr_node_cap = nc;
     }
 
     void grow_csr_edges(int required) {
         const size_t nc = std::max<size_t>(required * 2, 64);
         uint32_t* d_new = nullptr;
         CUDA_CHECK(cudaMalloc(&d_new, nc * sizeof(uint32_t)));
-        if (d_csr_nbrs && csr_edge_watermark > 0)
-            CUDA_CHECK(cudaMemcpy(d_new, d_csr_nbrs,
+        if (d_csr_colidx && csr_edge_watermark > 0)
+            CUDA_CHECK(cudaMemcpy(d_new, d_csr_colidx,
                 csr_edge_watermark * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-        if (d_csr_nbrs) CUDA_CHECK(cudaFree(d_csr_nbrs));
-        d_csr_nbrs = d_new;  csr_edge_cap = nc;
+        if (d_csr_colidx) CUDA_CHECK(cudaFree(d_csr_colidx));
+        d_csr_colidx = d_new;  csr_edge_cap = nc;
     }
 
     void grow_particles(int required) {
@@ -390,14 +390,14 @@ private:
             if (ptr) CUDA_CHECK(cudaFree(ptr));
             ptr = d_new;
         };
-        realloc_ints(d_bvh_offsets);
-        realloc_ints(d_csr_offsets);
-        realloc_ints(d_csr_edge_offsets);
-        realloc_ints(d_particle_offsets);
-        h_bvh_offsets.resize(nc, 0);
-        h_csr_offsets.resize(nc, 0);
-        h_csr_edge_offsets.resize(nc, 0);
-        h_particle_offsets.resize(nc, 0);
+        realloc_ints(d_foam_bvh_start);
+        realloc_ints(d_foam_rowptr_start);
+        realloc_ints(d_foam_colidx_start);
+        realloc_ints(d_foam_particle_start);
+        h_foam_bvh_start.resize(nc, 0);
+        h_foam_rowptr_start.resize(nc, 0);
+        h_foam_colidx_start.resize(nc, 0);
+        h_foam_particle_start.resize(nc, 0);
         offset_table_cap = nc;
     }
 
@@ -405,33 +405,33 @@ private:
         grow_offset_tables(num_foams);
         for (auto& [id, s] : slots) {
             if (s.dead) continue;
-            h_bvh_offsets[id]       = s.bvh_offset;
-            h_csr_offsets[id]       = s.csr_node_offset;
-            h_csr_edge_offsets[id]  = s.csr_edge_offset;
-            h_particle_offsets[id]  = s.particle_offset;
+            h_foam_bvh_start[id]      = s.bvh_offset;
+            h_foam_rowptr_start[id]   = s.csr_node_offset;
+            h_foam_colidx_start[id]   = s.csr_edge_offset;
+            h_foam_particle_start[id] = s.particle_offset;
         }
-        CUDA_CHECK(cudaMemcpy(d_bvh_offsets, h_bvh_offsets.data(),
+        CUDA_CHECK(cudaMemcpy(d_foam_bvh_start, h_foam_bvh_start.data(),
             num_foams * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_csr_offsets, h_csr_offsets.data(),
+        CUDA_CHECK(cudaMemcpy(d_foam_rowptr_start, h_foam_rowptr_start.data(),
             num_foams * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_csr_edge_offsets, h_csr_edge_offsets.data(),
+        CUDA_CHECK(cudaMemcpy(d_foam_colidx_start, h_foam_colidx_start.data(),
             num_foams * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_particle_offsets, h_particle_offsets.data(),
+        CUDA_CHECK(cudaMemcpy(d_foam_particle_start, h_foam_particle_start.data(),
             num_foams * sizeof(int), cudaMemcpyHostToDevice));
     }
 
     void free_all() {
         auto f = [](void* p) { if (p) cudaFree(p); };
-        f(d_bvh_nodes);          d_bvh_nodes          = nullptr;
-        f(d_csr_node_offsets);   d_csr_node_offsets   = nullptr;
-        f(d_csr_nbrs);           d_csr_nbrs           = nullptr;
-        f(d_particle_positions); d_particle_positions = nullptr;
-        f(d_particle_colors);    d_particle_colors    = nullptr;
-        f(d_surface_mask);       d_surface_mask       = nullptr;
-        f(d_bvh_offsets);        d_bvh_offsets        = nullptr;
-        f(d_csr_offsets);        d_csr_offsets        = nullptr;
-        f(d_csr_edge_offsets);   d_csr_edge_offsets   = nullptr;
-        f(d_particle_offsets);   d_particle_offsets   = nullptr;
+        f(d_bvh_nodes);           d_bvh_nodes           = nullptr;
+        f(d_csr_rowptr);          d_csr_rowptr          = nullptr;
+        f(d_csr_colidx);          d_csr_colidx          = nullptr;
+        f(d_particle_positions);  d_particle_positions  = nullptr;
+        f(d_particle_colors);     d_particle_colors     = nullptr;
+        f(d_surface_mask);        d_surface_mask        = nullptr;
+        f(d_foam_bvh_start);      d_foam_bvh_start      = nullptr;
+        f(d_foam_rowptr_start);   d_foam_rowptr_start   = nullptr;
+        f(d_foam_colidx_start);   d_foam_colidx_start   = nullptr;
+        f(d_foam_particle_start); d_foam_particle_start = nullptr;
         bvh_cap = csr_node_cap = csr_edge_cap = particle_cap = offset_table_cap = 0;
     }
 };

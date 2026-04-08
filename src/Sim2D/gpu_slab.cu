@@ -14,7 +14,7 @@ namespace DynamicFoam::Sim2D {
 
 // Adds a scalar bias to every element of a uint32 device array.
 // Used to convert 0-based node_offsets written by buildGPUAdjacencyList into
-// global indices into d_csr_nbrs after they are placed in a slab slice.
+// global indices into d_csr_colidx after they are placed in a slab slice.
 static __global__ void k_bias_u32(uint32_t* arr, int n, uint32_t bias) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) arr[i] += bias;
@@ -25,7 +25,7 @@ void GpuSlabAllocator::biasCsrOffsets(int foam_id) {
     const int n = s.csr_node_capacity; // N+1 entries written by buildGPUAdjacencyList
     if (n <= 0 || s.csr_edge_offset == 0) return;
     k_bias_u32<<<grid_size(n), 256>>>(
-        d_csr_node_offsets + s.csr_node_offset,
+        d_csr_rowptr + s.csr_node_offset,
         n,
         static_cast<uint32_t>(s.csr_edge_offset));
     CUDA_CHECK(cudaGetLastError());

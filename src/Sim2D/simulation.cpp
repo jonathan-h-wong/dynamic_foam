@@ -160,9 +160,9 @@ namespace DynamicFoam::Sim2D {
             // Build GPU CSR into slab slices and bias offsets.
             adj.buildGPUAdjacencyListIntoSlice(
                 foamGpuAdj[foam_id],
-                gpuSlab.d_csr_nbrs         + slot.csr_edge_offset,
+                gpuSlab.d_csr_colidx + slot.csr_edge_offset,
                 static_cast<size_t>(slot.csr_edge_capacity),
-                gpuSlab.d_csr_node_offsets + slot.csr_node_offset,
+                gpuSlab.d_csr_rowptr + slot.csr_node_offset,
                 static_cast<size_t>(slot.csr_node_capacity));
 
             gpuSlab.biasCsrOffsets(foam_id);
@@ -202,9 +202,9 @@ namespace DynamicFoam::Sim2D {
             const FoamSlot& slot = it->second;
             adj.buildGPUAdjacencyListIntoSlice(
                 foamGpuAdj[foam_id],
-                gpuSlab.d_csr_nbrs         + slot.csr_edge_offset,
+                gpuSlab.d_csr_colidx + slot.csr_edge_offset,
                 static_cast<size_t>(slot.csr_edge_capacity),
-                gpuSlab.d_csr_node_offsets + slot.csr_node_offset,
+                gpuSlab.d_csr_rowptr + slot.csr_node_offset,
                 static_cast<size_t>(slot.csr_node_capacity));
             gpuSlab.biasCsrOffsets(foam_id);
         }
@@ -237,9 +237,9 @@ namespace DynamicFoam::Sim2D {
                 const FoamSlot& newSlot = gpuSlab.slots.at(foam_id);
                 adj.buildGPUAdjacencyListIntoSlice(
                     foamGpuAdj[foam_id],
-                    gpuSlab.d_csr_nbrs         + newSlot.csr_edge_offset,
+                    gpuSlab.d_csr_colidx + newSlot.csr_edge_offset,
                     static_cast<size_t>(newSlot.csr_edge_capacity),
-                    gpuSlab.d_csr_node_offsets + newSlot.csr_node_offset,
+                    gpuSlab.d_csr_rowptr + newSlot.csr_node_offset,
                     static_cast<size_t>(newSlot.csr_node_capacity));
                 gpuSlab.biasCsrOffsets(foam_id);
             }
