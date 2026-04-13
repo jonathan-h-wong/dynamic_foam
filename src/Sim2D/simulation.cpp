@@ -222,18 +222,12 @@ namespace DynamicFoam::Sim2D {
         const int   N       = static_cast<int>(ordered.size());
         if (N == 0) return;
 
-        // Build local-index map: entity_id → position in ordered[].
-        std::unordered_map<uint32_t, uint32_t> localIndexMap;
-        localIndexMap.reserve(N);
-        for (int li = 0; li < N; ++li)
-            localIndexMap[ordered[li]] = static_cast<uint32_t>(li);
-
         // Build all per-particle arrays in the same getOrderedNodeIds() order.
         std::vector<AABB>      h_aabbs(N);
         std::vector<glm::vec4> h_colors(N);
         std::vector<glm::vec3> h_positions(N);
         std::vector<uint8_t>   h_surface(N, 0);
-        std::vector<uint8_t>   h_active(N, 0);
+        std::vector<uint32_t>  h_active_ids(N);
 
         for (int li = 0; li < N; ++li) {
             const entt::entity e = static_cast<entt::entity>(ordered[li]);
@@ -249,17 +243,8 @@ namespace DynamicFoam::Sim2D {
             h_positions[li] = particleRegistry.get<ParticleWorldPosition>(e).value;
 
             if (particleRegistry.all_of<Surface>(e)) h_surface[li] = 1;
-        }
 
-        // Active mask: surface particles + their immediate graph neighbours.
-        for (int li = 0; li < N; ++li) {
-            if (!h_surface[li]) continue;
-            h_active[li] = 1;
-            adj.forEachNeighbor(ordered[li], [&](uint32_t nbr_id) {
-                auto nit = localIndexMap.find(nbr_id);
-                if (nit != localIndexMap.end())
-                    h_active[nit->second] = 1;
-            });
+            h_active_ids[li] = ordered[li];
         }
 
         // Bulk upload to slab in getOrderedNodeIds() order.
@@ -267,11 +252,12 @@ namespace DynamicFoam::Sim2D {
         gpuSlab.stageParticleColors(foam_id, h_colors.data(), N);
         gpuSlab.stageParticlePositions(foam_id, h_positions.data(), N);
         gpuSlab.stageParticleSurfaceMask(foam_id, h_surface.data(), N);
+        gpuSlab.stageParticleActiveIds(foam_id, h_active_ids.data(), N);
 
-        // Bulk Morton sort: reorders all slab buffers together, compacts active
-        // IDs, and returns the permutation for per-frame position uploads.
+        // Bulk Morton sort: reorders all slab buffers together (including
+        // d_active_ids) and returns the permutation for per-frame position uploads.
         foamMortonPerms[foam_id].resize(N);
-        gpuSlab.bulkMortonSort(foam_id, N, h_active.data(), foamMortonPerms[foam_id]);
+        gpuSlab.bulkMortonSort(foam_id, N, foamMortonPerms[foam_id]);
     }
 
     void Simulation::buildBVH(entt::entity foamEntity) {

@@ -94,7 +94,6 @@ static __global__ void k_gather(
 }
 
 void GpuSlabAllocator::bulkMortonSort(int foam_id, int n_particles,
-                                       const uint8_t* h_active_mask,
                                        std::vector<uint32_t>& h_perm_out)
 {
     if (n_particles <= 0) return;
@@ -145,10 +144,12 @@ void GpuSlabAllocator::bulkMortonSort(int foam_id, int n_particles,
     glm::vec4* d_col_tmp  = nullptr;
     glm::vec3* d_pos_tmp  = nullptr;
     uint8_t*   d_mask_tmp = nullptr;
+    uint32_t*  d_ids_tmp  = nullptr;
     CUDA_CHECK(cudaMalloc(&d_aabb_tmp, n_particles * sizeof(AABB)));
     CUDA_CHECK(cudaMalloc(&d_col_tmp,  n_particles * sizeof(glm::vec4)));
     CUDA_CHECK(cudaMalloc(&d_pos_tmp,  n_particles * sizeof(glm::vec3)));
     CUDA_CHECK(cudaMalloc(&d_mask_tmp, n_particles * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&d_ids_tmp,  n_particles * sizeof(uint32_t)));
 
     k_gather<AABB>    <<<grid_size(n_particles), 256>>>(
         d_particle_aabbs     + s.particle_offset, d_perm_out, d_aabb_tmp, n_particles);
@@ -158,6 +159,8 @@ void GpuSlabAllocator::bulkMortonSort(int foam_id, int n_particles,
         d_particle_positions + s.particle_offset, d_perm_out, d_pos_tmp,  n_particles);
     k_gather<uint8_t>  <<<grid_size(n_particles), 256>>>(
         d_surface_mask       + s.particle_offset, d_perm_out, d_mask_tmp, n_particles);
+    k_gather<uint32_t> <<<grid_size(n_particles), 256>>>(
+        d_active_ids         + s.active_offset,   d_perm_out, d_ids_tmp,  n_particles);
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cudaMemcpy(d_particle_aabbs     + s.particle_offset, d_aabb_tmp,
@@ -168,28 +171,17 @@ void GpuSlabAllocator::bulkMortonSort(int foam_id, int n_particles,
         n_particles * sizeof(glm::vec3), cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(d_surface_mask       + s.particle_offset, d_mask_tmp,
         n_particles * sizeof(uint8_t),   cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(d_active_ids         + s.active_offset,   d_ids_tmp,
+        n_particles * sizeof(uint32_t),  cudaMemcpyDeviceToDevice));
 
-    // Step 6: compact active IDs from the permutation on the host.
-    // h_perm_out[i] is the original particle index at Morton-sorted position i.
-    // A particle is active if h_active_mask[original_index] == 1.
-    std::vector<uint32_t> active_ids;
-    active_ids.reserve(n_particles);
-    for (int i = 0; i < n_particles; ++i) {
-        if (h_active_mask[h_perm_out[i]])
-            active_ids.push_back(static_cast<uint32_t>(i));
-    }
-    const int n_active = static_cast<int>(active_ids.size());
-    assert(n_active <= s.active_capacity && "bulkMortonSort: active count exceeds slab capacity");
-    if (n_active > 0)
-        CUDA_CHECK(cudaMemcpy(d_active_ids + s.active_offset, active_ids.data(),
-            n_active * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    slots.at(foam_id).active_count = n_active;
+    slots.at(foam_id).active_count = n_particles;
 
     // Free all temporaries.
     CUDA_CHECK(cudaFree(d_morton_in));    CUDA_CHECK(cudaFree(d_morton_out));
     CUDA_CHECK(cudaFree(d_perm_in));      CUDA_CHECK(cudaFree(d_perm_out));
     CUDA_CHECK(cudaFree(d_aabb_tmp));     CUDA_CHECK(cudaFree(d_col_tmp));
     CUDA_CHECK(cudaFree(d_pos_tmp));      CUDA_CHECK(cudaFree(d_mask_tmp));
+    CUDA_CHECK(cudaFree(d_ids_tmp));
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 

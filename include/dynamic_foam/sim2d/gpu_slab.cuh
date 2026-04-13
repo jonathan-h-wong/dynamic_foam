@@ -299,6 +299,18 @@ public:
                               h_mask, n * sizeof(uint8_t), cudaMemcpyHostToDevice));
     }
 
+    // Upload the per-particle entity ID array (one uint32_t per particle in
+    // getOrderedNodeIds() order).  bulkMortonSort will reorder this buffer
+    // through the same permutation as all other particle arrays, so that after
+    // sorting d_active_ids[i] is the entt entity ID of the particle at Morton
+    // position i.  active_count is set to n_particles by bulkMortonSort.
+    void stageParticleActiveIds(int foam_id, const uint32_t* h_ids, int n) {
+        const FoamSlot& s = slots.at(foam_id);
+        assert(n <= s.active_capacity && "stageParticleActiveIds: count exceeds slab capacity");
+        CUDA_CHECK(cudaMemcpy(d_active_ids + s.active_offset,
+                              h_ids, n * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    }
+
     // Upload local-space per-particle AABB array (one AABB per particle,
     // indexed by local sorted position).  Must be called whenever
     // ParticleVertices change (init and after topology updates).
@@ -312,23 +324,21 @@ public:
     // Bulk Morton sort — the single entry point for all foam data ordering.
     //
     // Requires that d_particle_aabbs, d_particle_colors, d_particle_positions,
-    // and d_surface_mask have already been staged via stageParticle* helpers.
+    // d_surface_mask, and d_active_ids have already been staged via the
+    // stageParticle* helpers.
     //
     // This routine:
     //   1. Computes Morton codes for all n_particles from their local-space AABB
     //      centroids, normalized against the foam's own AABB.
-    //   2. Sorts all per-particle slab buffers (AABBs, colors, positions, mask)
-    //      in Morton order via a gather permutation.
-    //   3. Compacts active particle positions (h_active_mask[perm[i]] == 1) into
-    //      d_active_ids and records the count in slot.active_count.
+    //   2. Gathers all per-particle slab buffers (AABBs, colors, positions,
+    //      surface mask, active IDs) into Morton order via a single permutation.
+    //   3. Sets slot.active_count = n_particles.
     //   4. Writes the permutation to h_perm_out so callers (e.g. render()) can
     //      rebuild the host-side sorted order for per-frame position uploads.
     //
-    // h_active_mask: host array of length n_particles; 1 = active, 0 = inactive.
     // h_perm_out: host vector resized to n_particles on return.
     // Implemented in gpu_slab.cu (requires nvcc).
     void bulkMortonSort(int foam_id, int n_particles,
-                        const uint8_t* h_active_mask,
                         std::vector<uint32_t>& h_perm_out);
 
     // Reduce all n per-particle local-space AABBs for foam_id into a single
