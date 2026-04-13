@@ -278,22 +278,22 @@ public:
     // -------------------------------------------------------------------------
     // Per-frame particle position upload from a host array.
     // Called by the render subsystem once per frame per foam.
-    // Colors and surface_mask are uploaded separately (once at creation / on
-    // topology change) via uploadParticleColors / uploadSurfaceMask.
+    // Colors and surface_mask are staged separately (once at creation / on
+    // topology change) via stageParticleColors / stageParticleSurfaceMask.
     // -------------------------------------------------------------------------
-    void uploadParticlePositions(int foam_id, const glm::vec3* h_positions, int n) {
+    void stageParticlePositions(int foam_id, const glm::vec3* h_positions, int n) {
         const FoamSlot& s = slots.at(foam_id);
         CUDA_CHECK(cudaMemcpy(d_particle_positions + s.particle_offset,
                               h_positions, n * sizeof(glm::vec3), cudaMemcpyHostToDevice));
     }
 
-    void uploadParticleColors(int foam_id, const glm::vec4* h_colors, int n) {
+    void stageParticleColors(int foam_id, const glm::vec4* h_colors, int n) {
         const FoamSlot& s = slots.at(foam_id);
         CUDA_CHECK(cudaMemcpy(d_particle_colors + s.particle_offset,
                               h_colors, n * sizeof(glm::vec4), cudaMemcpyHostToDevice));
     }
 
-    void uploadSurfaceMask(int foam_id, const uint8_t* h_mask, int n) {
+    void stageParticleSurfaceMask(int foam_id, const uint8_t* h_mask, int n) {
         const FoamSlot& s = slots.at(foam_id);
         CUDA_CHECK(cudaMemcpy(d_surface_mask + s.particle_offset,
                               h_mask, n * sizeof(uint8_t), cudaMemcpyHostToDevice));
@@ -303,7 +303,7 @@ public:
     // indexed by local sorted position).  Must be called whenever
     // ParticleVertices change (init and after topology updates).
     // Used as BVH primitives and as centroids for active-ID Morton sort.
-    void uploadParticleAABBs(int foam_id, const AABB* h_aabbs, int n) {
+    void stageParticleAABBs(int foam_id, const AABB* h_aabbs, int n) {
         const FoamSlot& s = slots.at(foam_id);
         CUDA_CHECK(cudaMemcpy(d_particle_aabbs + s.particle_offset,
                               h_aabbs, n * sizeof(AABB), cudaMemcpyHostToDevice));
@@ -312,7 +312,7 @@ public:
     // Bulk Morton sort — the single entry point for all foam data ordering.
     //
     // Requires that d_particle_aabbs, d_particle_colors, d_particle_positions,
-    // and d_surface_mask have already been uploaded via uploadParticle* helpers.
+    // and d_surface_mask have already been staged via stageParticle* helpers.
     //
     // This routine:
     //   1. Computes Morton codes for all n_particles from their local-space AABB

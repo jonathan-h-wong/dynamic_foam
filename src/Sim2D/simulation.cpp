@@ -128,7 +128,7 @@ namespace DynamicFoam::Sim2D {
 
             // Bulk-upload all particle data (AABBs, colors, positions, surface mask)
             // and Morton-sort every buffer together in a single pass.
-            uploadParticleData(static_cast<entt::entity>(foam_id));
+            stageParticleData(static_cast<entt::entity>(foam_id));
 
             // Build BVH using the now Morton-sorted particle AABBs.
             foamBVHs[foam_id].build(
@@ -199,15 +199,7 @@ namespace DynamicFoam::Sim2D {
     }
 
     // -------------------------------------------------------------------------
-    // uploadParticleData
-    //
-    // Collects the local indices (0-based position within getOrderedNodeIds())
-    // of all Surface particles and their immediate graph neighbours for a foam,
-    // uploads them to the GPU slab's active-IDs buffer, then Morton-sorts the
-    // slice using the foam's particle positions already present on the device.
-    // -------------------------------------------------------------------------
-    // -------------------------------------------------------------------------
-    // uploadParticleData
+    // stageParticleData
     //
     // Single entry point for all per-particle GPU data for one foam.
     // Builds CPU arrays for local-space AABBs, RGBA colors, world positions,
@@ -220,7 +212,7 @@ namespace DynamicFoam::Sim2D {
     //   - writes the permutation to foamMortonPerms[foam_id] so render() can
     //     upload per-frame positions in the same Morton-sorted order.
     // -------------------------------------------------------------------------
-    void Simulation::uploadParticleData(entt::entity foamEntity) {
+    void Simulation::stageParticleData(entt::entity foamEntity) {
         const int foam_id = static_cast<int>(foamEntity);
         const auto it = gpuSlab.slots.find(foam_id);
         if (it == gpuSlab.slots.end() || it->second.dead) return;
@@ -271,10 +263,10 @@ namespace DynamicFoam::Sim2D {
         }
 
         // Bulk upload to slab in getOrderedNodeIds() order.
-        gpuSlab.uploadParticleAABBs(foam_id, h_aabbs.data(), N);
-        gpuSlab.uploadParticleColors(foam_id, h_colors.data(), N);
-        gpuSlab.uploadParticlePositions(foam_id, h_positions.data(), N);
-        gpuSlab.uploadSurfaceMask(foam_id, h_surface.data(), N);
+        gpuSlab.stageParticleAABBs(foam_id, h_aabbs.data(), N);
+        gpuSlab.stageParticleColors(foam_id, h_colors.data(), N);
+        gpuSlab.stageParticlePositions(foam_id, h_positions.data(), N);
+        gpuSlab.stageParticleSurfaceMask(foam_id, h_surface.data(), N);
 
         // Bulk Morton sort: reorders all slab buffers together, compacts active
         // IDs, and returns the permutation for per-frame position uploads.
@@ -310,7 +302,7 @@ namespace DynamicFoam::Sim2D {
 
         // Bulk-upload all particle data (AABBs, colors, positions, surface mask)
         // and Morton-sort every buffer together in a single pass.
-        uploadParticleData(foamEntity);
+        stageParticleData(foamEntity);
 
         // Build BVH using the now Morton-sorted particle AABBs.
         const FoamSlot& slot = gpuSlab.slots.at(foam_id);
@@ -437,7 +429,7 @@ namespace DynamicFoam::Sim2D {
             applyForwardKinematics(result.foamId, particleSubset);
 
             // Rebuild BVH from current ParticleVertices in the registry.
-            // buildBVH also calls uploadParticleData which reorders all slab
+            // buildBVH also calls stageParticleData which reorders all slab
             // buffers by Morton, refreshes active IDs, and writes the foam's
             // local AABB into slab.d_foam_aabbs (via computeFoamAABB).
             buildBVH(result.foamId);
@@ -505,7 +497,7 @@ namespace DynamicFoam::Sim2D {
             for (int i = 0; i < N; ++i)
                 h_positions[i] = particleRegistry.get<ParticleWorldPosition>(
                     static_cast<entt::entity>(ordered[perm[i]])).value;
-            gpuSlab.uploadParticlePositions(foam_id, h_positions.data(), N);
+            gpuSlab.stageParticlePositions(foam_id, h_positions.data(), N);
         }
 
         // Build per-foam world transforms from position and orientation.
