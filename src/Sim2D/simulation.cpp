@@ -199,18 +199,28 @@ namespace DynamicFoam::Sim2D {
     }
 
     // -------------------------------------------------------------------------
+    // updateParticleData
+    //
+    // Delegates the FoamUpdate (deletions then insertions) to the GPU slab.
+    // The caller is responsible for rebuilding the BVH (buildBVH) and CSR
+    // (rebuildSlabCsrMortonOrder) for the affected foam after this call.
+    // -------------------------------------------------------------------------
+    void Simulation::updateParticleData(int foam_id, const FoamUpdate& update) {
+        gpuSlab.updateFoamData(foam_id, update);
+    }
+
+    // -------------------------------------------------------------------------
     // stageParticleData
     //
     // Single entry point for all per-particle GPU data for one foam.
     // Builds CPU arrays for local-space AABBs, RGBA colors, world positions,
-    // surface mask, and active mask (surface + 1-hop neighbours), uploads all
-    // four static buffers to the GPU slab in getOrderedNodeIds() order, then
-    // calls gpuSlab.bulkMortonSort which:
-    //   - reorders every slab buffer (AABBs, colors, positions, surface mask)
-    //     together by local-space Morton code in a single pass,
-    //   - compacts active particle positions into d_active_ids,
+    // surface mask, and active IDs, uploads all five buffers to the GPU slab
+    // via gpuSlab.stageParticleData in getOrderedNodeIds() order, then calls
+    // gpuSlab.bulkMortonSort which:
+    //   - reorders every slab buffer (AABBs, colors, positions, surface mask,
+    //     active IDs) together by local-space Morton code in a single pass,
     //   - writes the permutation to foamMortonPerms[foam_id] so render() can
-    //     upload per-frame positions in the same Morton-sorted order.
+    //     rebuild all five arrays in Morton-sorted order each frame.
     // -------------------------------------------------------------------------
     void Simulation::stageParticleData(entt::entity foamEntity) {
         const int foam_id = static_cast<int>(foamEntity);
@@ -247,12 +257,10 @@ namespace DynamicFoam::Sim2D {
             h_active_ids[li] = ordered[li];
         }
 
-        // Bulk upload to slab in getOrderedNodeIds() order.
-        gpuSlab.stageParticleAABBs(foam_id, h_aabbs.data(), N);
-        gpuSlab.stageParticleColors(foam_id, h_colors.data(), N);
-        gpuSlab.stageParticlePositions(foam_id, h_positions.data(), N);
-        gpuSlab.stageParticleSurfaceMask(foam_id, h_surface.data(), N);
-        gpuSlab.stageParticleActiveIds(foam_id, h_active_ids.data(), N);
+        // Bulk upload all per-particle arrays to the slab in getOrderedNodeIds() order.
+        gpuSlab.stageParticleData(foam_id,
+                                  h_aabbs.data(), h_colors.data(), h_positions.data(),
+                                  h_surface.data(), h_active_ids.data(), N);
 
         // Bulk Morton sort: reorders all slab buffers together (including
         // d_active_ids) and returns the permutation for per-frame position uploads.
@@ -471,21 +479,6 @@ namespace DynamicFoam::Sim2D {
     }
 
     void Simulation::render() {
-        // Upload per-frame particle world positions to the slab in Morton-sorted
-        // order so the layout matches the sorted AABBs/colors/mask already on device.
-        // foamMortonPerms[foam_id][i] is the original getOrderedNodeIds() index of
-        // the particle at Morton-sorted slab position i.
-        for (const auto& [foam_id, adj] : foamAdjacencyLists) {
-            const auto& ordered = adj.getOrderedNodeIds();
-            const int   N       = static_cast<int>(ordered.size());
-            const auto& perm    = foamMortonPerms.at(foam_id);
-            std::vector<glm::vec3> h_positions(N);
-            for (int i = 0; i < N; ++i)
-                h_positions[i] = particleRegistry.get<ParticleWorldPosition>(
-                    static_cast<entt::entity>(ordered[perm[i]])).value;
-            gpuSlab.stageParticlePositions(foam_id, h_positions.data(), N);
-        }
-
         // Build per-foam world transforms from position and orientation.
         std::unordered_map<int, glm::mat4> foamTransforms;
         foamRegistry.view<const Position, const Orientation>().each(

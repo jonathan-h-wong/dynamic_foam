@@ -61,12 +61,10 @@ class Simulation {
         void buildBVH(entt::entity foamEntity);
 
         // Bulk upload for a single foam: builds CPU arrays for AABBs, colors,
-        // world positions, and surface/active masks from the particle registry,
-        // uploads all four buffers to the GPU slab in getOrderedNodeIds() order,
-        // then calls gpuSlab.bulkMortonSort to reorder every buffer together by
-        // local-space Morton code.  Stores the resulting permutation in
-        // foamMortonPerms[foam_id] so render() can upload per-frame positions
-        // in the same sorted order without re-sorting.
+        // world positions, surface mask, and active IDs from the particle registry,
+        // uploads all five buffers to the GPU slab via gpuSlab.stageParticleData in
+        // getOrderedNodeIds() order, then calls gpuSlab.bulkMortonSort to reorder
+        // every buffer together by local-space Morton code.
         // Must be called after a foam's particle data is fully populated and
         // after gpuSlab.allocate() has reserved a valid slot for the foam.
         void stageParticleData(entt::entity foamEntity);
@@ -89,6 +87,12 @@ class Simulation {
         // called after gpuSlab.compact() to fix the CSR node_offsets, which are
         // invalidated when csr_edge_offsets shift during compaction.
         void rebuildAllSlabCsr();
+
+        // Applies a FoamUpdate (deletions then insertions) to the GPU particle
+        // slab buffers for the given foam.  Delegates to gpuSlab.updateFoamData.
+        // The caller is responsible for rebuilding the BVH and CSR adjacency
+        // after this call if the particle set has changed.
+        void updateParticleData(int foam_id, const FoamUpdate& update);
         
         entt::registry foamRegistry;
         entt::registry particleRegistry;
@@ -103,8 +107,8 @@ class Simulation {
         GpuSlabAllocator gpuSlab;
         // Per-foam Morton permutation: foamMortonPerms[foam_id][i] is the
         // original getOrderedNodeIds() index of the particle at Morton position i.
-        // Written by stageParticleData; consumed by render() to upload per-frame
-        // positions in the same sorted order.
+        // Written by stageParticleData; consumed by render() to rebuild all five
+        // per-particle arrays in Morton-sorted order for upload via stageParticleData.
         std::unordered_map<int, std::vector<uint32_t>> foamMortonPerms;
         // Per-foam GPU adjacency list handles (nbrs/node_offsets are slab slices).
         std::unordered_map<int, AdjacencyListGPU> foamGpuAdj;

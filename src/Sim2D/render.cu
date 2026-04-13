@@ -466,7 +466,7 @@ void Render::update(
         camera, windowSize.x, windowSize.y,
         d_broadphase_hits_, num_broadphase_hits,
         slab.d_bvh_nodes,        slab.d_foam_bvh_start,
-        slab.d_surface_mask,
+        slab.d_particle_surface_mask,
         d_foam_inv_transforms_,
         slab.d_foam_particle_start,
         d_narrowphase_hits_, d_narrowphase_hit_counter_

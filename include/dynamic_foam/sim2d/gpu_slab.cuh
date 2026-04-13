@@ -30,6 +30,7 @@
 #include <glm/glm.hpp>
 
 #include <algorithm>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -67,6 +68,50 @@ struct FoamSlot {
     int active_count    = 0;
 
     bool dead = false; // Tombstoned by resize(); ignored by kernels and compact().
+};
+
+// =============================================================================
+// FoamUpdate — describes a batch of particle insertions and deletions for one
+// foam.  All insertion buffers must be the same length; this is enforced by
+// the constructor.
+// =============================================================================
+struct FoamUpdate {
+    // Insertion buffers (one entry per new particle):
+    std::vector<glm::vec3> particle_position_ins;
+    std::vector<glm::vec4> particle_color_ins;
+    std::vector<uint8_t>   particle_surface_mask_ins;
+    std::vector<AABB>      particle_aabb_ins;
+    std::vector<uint32_t>  particle_active_ids_ins;
+
+    // Deletion buffer — entity IDs of particles to remove:
+    std::vector<uint32_t> particle_id_dels;
+
+    FoamUpdate() = default;
+
+    FoamUpdate(
+        std::vector<glm::vec3> positions,
+        std::vector<glm::vec4> colors,
+        std::vector<uint8_t>   surface_masks,
+        std::vector<AABB>      aabbs,
+        std::vector<uint32_t>  active_ids,
+        std::vector<uint32_t>  del_ids)
+        : particle_position_ins    (std::move(positions))
+        , particle_color_ins       (std::move(colors))
+        , particle_surface_mask_ins(std::move(surface_masks))
+        , particle_aabb_ins        (std::move(aabbs))
+        , particle_active_ids_ins  (std::move(active_ids))
+        , particle_id_dels         (std::move(del_ids))
+    {
+        const size_t n = particle_position_ins.size();
+        if (particle_color_ins.size()         != n ||
+            particle_surface_mask_ins.size()  != n ||
+            particle_aabb_ins.size()          != n ||
+            particle_active_ids_ins.size()    != n)
+        {
+            throw std::invalid_argument(
+                "FoamUpdate: all insertion buffers must be the same length");
+        }
+    }
 };
 
 // =============================================================================
@@ -245,8 +290,8 @@ public:
                 CUDA_CHECK(cudaMemcpy(d_particle_colors + pw,
                     d_particle_colors + s.particle_offset,
                     s.particle_capacity * sizeof(glm::vec4), cudaMemcpyDeviceToDevice));
-                CUDA_CHECK(cudaMemcpy(d_surface_mask + pw,
-                    d_surface_mask + s.particle_offset,
+                CUDA_CHECK(cudaMemcpy(d_particle_surface_mask + pw,
+                    d_particle_surface_mask + s.particle_offset,
                     s.particle_capacity * sizeof(uint8_t), cudaMemcpyDeviceToDevice));
                 CUDA_CHECK(cudaMemcpy(d_particle_aabbs + pw,
                     d_particle_aabbs + s.particle_offset,
@@ -276,56 +321,54 @@ public:
     void biasCsrOffsets(int foam_id);
 
     // -------------------------------------------------------------------------
-    // Per-frame particle position upload from a host array.
-    // Called by the render subsystem once per frame per foam.
-    // Colors and surface_mask are staged separately (once at creation / on
-    // topology change) via stageParticleColors / stageParticleSurfaceMask.
+    // Bulk upload of all per-particle data arrays for one foam in a single
+    // call.  All five buffers must always be uploaded together to guarantee
+    // that every slab array is consistent before bulkMortonSort runs.
+    //
+    //   h_aabbs     — local-space per-particle AABBs (BVH primitives / Morton centroids).
+    //   h_colors    — per-particle RGBA color.
+    //   h_positions — per-particle world-space position.
+    //   h_mask      — per-particle surface mask (1 = surface, 0 = interior).
+    //   h_ids       — per-particle entity IDs; reordered by bulkMortonSort so
+    //                 d_active_ids[i] is the entity at Morton position i.
+    //   n           — particle count (must match the slot's particle_capacity).
     // -------------------------------------------------------------------------
-    void stageParticlePositions(int foam_id, const glm::vec3* h_positions, int n) {
+    void stageParticleData(int foam_id,
+                           const AABB*      h_aabbs,
+                           const glm::vec4* h_colors,
+                           const glm::vec3* h_positions,
+                           const uint8_t*   h_mask,
+                           const uint32_t*  h_ids,
+                           int n) {
         const FoamSlot& s = slots.at(foam_id);
-        CUDA_CHECK(cudaMemcpy(d_particle_positions + s.particle_offset,
-                              h_positions, n * sizeof(glm::vec3), cudaMemcpyHostToDevice));
+        assert(n <= s.active_capacity && "stageParticleData: count exceeds slab capacity");
+        CUDA_CHECK(cudaMemcpy(d_particle_aabbs     + s.particle_offset, h_aabbs,     n * sizeof(AABB),       cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_particle_colors    + s.particle_offset, h_colors,    n * sizeof(glm::vec4),  cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_particle_positions + s.particle_offset, h_positions, n * sizeof(glm::vec3),  cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_particle_surface_mask + s.particle_offset, h_mask,      n * sizeof(uint8_t),    cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_active_ids         + s.active_offset,   h_ids,       n * sizeof(uint32_t),   cudaMemcpyHostToDevice));
     }
 
-    void stageParticleColors(int foam_id, const glm::vec4* h_colors, int n) {
-        const FoamSlot& s = slots.at(foam_id);
-        CUDA_CHECK(cudaMemcpy(d_particle_colors + s.particle_offset,
-                              h_colors, n * sizeof(glm::vec4), cudaMemcpyHostToDevice));
-    }
-
-    void stageParticleSurfaceMask(int foam_id, const uint8_t* h_mask, int n) {
-        const FoamSlot& s = slots.at(foam_id);
-        CUDA_CHECK(cudaMemcpy(d_surface_mask + s.particle_offset,
-                              h_mask, n * sizeof(uint8_t), cudaMemcpyHostToDevice));
-    }
-
-    // Upload the per-particle entity ID array (one uint32_t per particle in
-    // getOrderedNodeIds() order).  bulkMortonSort will reorder this buffer
-    // through the same permutation as all other particle arrays, so that after
-    // sorting d_active_ids[i] is the entt entity ID of the particle at Morton
-    // position i.  active_count is set to n_particles by bulkMortonSort.
-    void stageParticleActiveIds(int foam_id, const uint32_t* h_ids, int n) {
-        const FoamSlot& s = slots.at(foam_id);
-        assert(n <= s.active_capacity && "stageParticleActiveIds: count exceeds slab capacity");
-        CUDA_CHECK(cudaMemcpy(d_active_ids + s.active_offset,
-                              h_ids, n * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    }
-
-    // Upload local-space per-particle AABB array (one AABB per particle,
-    // indexed by local sorted position).  Must be called whenever
-    // ParticleVertices change (init and after topology updates).
-    // Used as BVH primitives and as centroids for active-ID Morton sort.
-    void stageParticleAABBs(int foam_id, const AABB* h_aabbs, int n) {
-        const FoamSlot& s = slots.at(foam_id);
-        CUDA_CHECK(cudaMemcpy(d_particle_aabbs + s.particle_offset,
-                              h_aabbs, n * sizeof(AABB), cudaMemcpyHostToDevice));
-    }
+    // -------------------------------------------------------------------------
+    // updateFoamData — applies a FoamUpdate to the particle slab buffers for
+    // foam_id.  Deletions are resolved by searching d_active_ids for matching
+    // entity IDs and compacting all five particle arrays.  Insertions are
+    // appended after the surviving particles; if the post-update count would
+    // exceed the slot's particle_capacity the slot is tombstoned and a larger
+    // one is allocated at the watermark before insertion.
+    //
+    // Note: this method only updates the raw particle data arrays.  The caller
+    // is responsible for rebuilding the BVH and CSR adjacency afterwards if
+    // particle counts changed.
+    // Implemented in gpu_slab.cu (requires nvcc).
+    // -------------------------------------------------------------------------
+    void updateFoamData(int foam_id, const FoamUpdate& update);
 
     // Bulk Morton sort — the single entry point for all foam data ordering.
     //
     // Requires that d_particle_aabbs, d_particle_colors, d_particle_positions,
-    // d_surface_mask, and d_active_ids have already been staged via the
-    // stageParticle* helpers.
+    // d_particle_surface_mask, and d_active_ids have already been staged via
+    // stageParticleData.
     //
     // This routine:
     //   1. Computes Morton codes for all n_particles from their local-space AABB
@@ -355,7 +398,7 @@ public:
     uint32_t*  d_csr_colidx = nullptr; ///< All foams' CSR column indices (neighbor particle ids) packed end-to-end.
     glm::vec3* d_particle_positions = nullptr; ///< Flat particle world-space positions.
     glm::vec4* d_particle_colors    = nullptr; ///< Flat particle RGBA colors.
-    uint8_t*   d_surface_mask       = nullptr; ///< 1 = surface particle, 0 = interior.
+    uint8_t*   d_particle_surface_mask = nullptr; ///< 1 = surface particle, 0 = interior.
     AABB*      d_particle_aabbs     = nullptr; ///< Local-space per-particle AABB (BVH primitives). Indexed by particle_offset.
     uint32_t*  d_active_ids         = nullptr; ///< Active particle positions (indices into the Morton-sorted particle arrays).
     AABB*      d_foam_aabbs         = nullptr; ///< Local-space AABB for each foam, indexed directly by foam_id (size = num_foams).
@@ -451,18 +494,18 @@ private:
                 particle_watermark * sizeof(glm::vec3), cudaMemcpyDeviceToDevice));
             CUDA_CHECK(cudaMemcpy(dc, d_particle_colors,
                 particle_watermark * sizeof(glm::vec4), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(ds, d_surface_mask,
+            CUDA_CHECK(cudaMemcpy(ds, d_particle_surface_mask,
                 particle_watermark * sizeof(uint8_t), cudaMemcpyDeviceToDevice));
             CUDA_CHECK(cudaMemcpy(da, d_particle_aabbs,
                 particle_watermark * sizeof(AABB), cudaMemcpyDeviceToDevice));
         }
         if (d_particle_positions) CUDA_CHECK(cudaFree(d_particle_positions));
         if (d_particle_colors)    CUDA_CHECK(cudaFree(d_particle_colors));
-        if (d_surface_mask)       CUDA_CHECK(cudaFree(d_surface_mask));
+        if (d_particle_surface_mask) CUDA_CHECK(cudaFree(d_particle_surface_mask));
         if (d_particle_aabbs)     CUDA_CHECK(cudaFree(d_particle_aabbs));
         d_particle_positions = dp;
         d_particle_colors    = dc;
-        d_surface_mask       = ds;
+        d_particle_surface_mask = ds;
         d_particle_aabbs     = da;
         particle_cap = nc;
     }
@@ -545,7 +588,7 @@ private:
         f(d_csr_colidx);          d_csr_colidx          = nullptr;
         f(d_particle_positions);  d_particle_positions  = nullptr;
         f(d_particle_colors);     d_particle_colors     = nullptr;
-        f(d_surface_mask);        d_surface_mask        = nullptr;
+        f(d_particle_surface_mask); d_particle_surface_mask = nullptr;
         f(d_particle_aabbs);      d_particle_aabbs      = nullptr;
         f(d_active_ids);          d_active_ids          = nullptr;
         f(d_foam_aabbs);          d_foam_aabbs          = nullptr;
