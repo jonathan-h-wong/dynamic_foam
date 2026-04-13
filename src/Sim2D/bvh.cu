@@ -166,93 +166,13 @@ BVH::~BVH() {
     free_device();
 }
 
-void BVH::build(const AABB* primitives_host, int n) {
-    assert(n > 0);
-    n_ = n;
-
-    free_device();
-    alloc_device(n);
-
-    CUDA_CHECK(cudaMemcpy(d_primitives_, primitives_host,
-                          n * sizeof(AABB), cudaMemcpyHostToDevice));
-
-    const int block = 256;
-
-    // Step 1: reduce all primitive AABBs to a single scene AABB
-    AABB identity{};
-    CUB_CALL(cub::DeviceReduce::Reduce,
-             d_primitives_, d_scene_bbox_, n, AABBUnion{}, identity);
-
-    AABB scene_bbox;
-    CUDA_CHECK(cudaMemcpy(&scene_bbox, d_scene_bbox_,
-                          sizeof(AABB), cudaMemcpyDeviceToHost));
-
-    const glm::vec3 extent = scene_bbox.max_pt - scene_bbox.min_pt;
-    const glm::vec3 extent_inv = {
-        extent.x > 0.f ? 1.f / extent.x : 1.f,
-        extent.y > 0.f ? 1.f / extent.y : 1.f,
-        extent.z > 0.f ? 1.f / extent.z : 1.f
-    };
-
-    // Step 2: compute Morton codes
-    k_compute_morton<<<grid_size(n, block), block>>>(
-        d_primitives_, d_morton_codes_, d_indices_, n,
-        scene_bbox.min_pt, extent_inv);
-    CUDA_CHECK(cudaGetLastError());
-
-    // Step 3: sort by Morton code
-    CUB_CALL(cub::DeviceRadixSort::SortPairs,
-             d_morton_codes_, d_morton_sorted_,
-             d_indices_,      d_indices_sorted_,
-             n);
-
-    // Step 4: initialize leaf nodes
-    k_init_leaves<<<grid_size(n, block), block>>>(
-        d_primitives_, d_indices_sorted_, d_nodes_, n);
-    CUDA_CHECK(cudaGetLastError());
-
-    if (n > 1) {
-        // Step 5: build tree topology
-        k_build_topology<<<grid_size(n - 1, block), block>>>(
-            d_morton_sorted_, d_nodes_, n);
-        CUDA_CHECK(cudaGetLastError());
-
-        // Step 6: propagate bounding boxes bottom-up
-        CUDA_CHECK(cudaMemset(d_flags_, 0, (n - 1) * sizeof(int)));
-        k_propagate_bboxes<<<grid_size(n, block), block>>>(
-            d_nodes_, d_flags_, n);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
 BVHNode* BVH::export_nodes() const {
     return d_nodes_;
-}
-
-void BVH::alloc_device(int n) {
-    const int num_nodes = (n > 1) ? 2 * n - 1 : 1;
-
-    CUDA_CHECK(cudaMalloc(&d_primitives_,     n                    * sizeof(AABB)));
-    CUDA_CHECK(cudaMalloc(&d_nodes_,          num_nodes            * sizeof(BVHNode)));
-    // Pre-fill every int field (left, right, parent) to -1 (0xFFFFFFFF).
-    // k_build_topology sets children's parents but never touches the root's
-    // parent, so without this the root retains garbage and k_propagate_bboxes
-    // loops forever when a leaf thread climbs past the root.
-    CUDA_CHECK(cudaMemset(d_nodes_, 0xFF,     num_nodes            * sizeof(BVHNode)));
-    CUDA_CHECK(cudaMalloc(&d_morton_codes_,   n                    * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_morton_sorted_,  n                    * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_indices_,        n                    * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_indices_sorted_, n                    * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_flags_,          (n > 1 ? n - 1 : 1) * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_scene_bbox_,     sizeof(AABB)));
 }
 
 void BVH::free_device() {
     auto f = [](void* p) { if (p) cudaFree(p); };
 
-    f(d_primitives_);     d_primitives_     = nullptr;
     // Only free d_nodes_ when this BVH owns it (i.e. not a slab slice).
     if (d_nodes_owned_) { f(d_nodes_); }
     d_nodes_ = nullptr;  d_nodes_owned_ = true;
@@ -265,9 +185,10 @@ void BVH::free_device() {
 }
 
 // Slab variant: identical pipeline but writes nodes into a pre-assigned slice.
-void BVH::build(const AABB* primitives_host, int n, BVHNode* d_nodes_slice, int slice_capacity) {
+void BVH::build(const AABB* d_primitives, int n, BVHNode* d_nodes_slice, int slice_capacity) {
     assert(n > 0);
     assert(d_nodes_slice != nullptr);
+    assert(d_primitives  != nullptr);
     n_ = n;
 
     // Free any privately owned node buffer from a previous build, then adopt
@@ -276,10 +197,10 @@ void BVH::build(const AABB* primitives_host, int n, BVHNode* d_nodes_slice, int 
     d_nodes_       = d_nodes_slice;
     d_nodes_owned_ = false;
 
-    // (Re-)allocate private temporaries only — d_nodes_ is the slab slice.
+    // (Re-)allocate private temporaries only — d_nodes_ and d_primitives are
+    // both caller-owned device pointers; no H→D copy is needed.
     const int num_nodes = (n > 1) ? 2 * n - 1 : 1;
     assert(num_nodes <= slice_capacity && "BVH::build: node count exceeds slab slice capacity — call needsResize before building");
-    CUDA_CHECK(cudaMalloc(&d_primitives_,     n                    * sizeof(AABB)));
     CUDA_CHECK(cudaMemset(d_nodes_,   0xFF,   num_nodes            * sizeof(BVHNode)));
     CUDA_CHECK(cudaMalloc(&d_morton_codes_,   n                    * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_morton_sorted_,  n                    * sizeof(uint32_t)));
@@ -288,14 +209,11 @@ void BVH::build(const AABB* primitives_host, int n, BVHNode* d_nodes_slice, int 
     CUDA_CHECK(cudaMalloc(&d_flags_,          (n > 1 ? n - 1 : 1) * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_scene_bbox_,     sizeof(AABB)));
 
-    CUDA_CHECK(cudaMemcpy(d_primitives_, primitives_host,
-                          n * sizeof(AABB), cudaMemcpyHostToDevice));
-
     const int block = 256;
 
     AABB identity{};
     CUB_CALL(cub::DeviceReduce::Reduce,
-             d_primitives_, d_scene_bbox_, n, AABBUnion{}, identity);
+             d_primitives, d_scene_bbox_, n, AABBUnion{}, identity);
 
     AABB scene_bbox;
     CUDA_CHECK(cudaMemcpy(&scene_bbox, d_scene_bbox_,
@@ -309,7 +227,7 @@ void BVH::build(const AABB* primitives_host, int n, BVHNode* d_nodes_slice, int 
     };
 
     k_compute_morton<<<grid_size(n, block), block>>>(
-        d_primitives_, d_morton_codes_, d_indices_, n,
+        d_primitives, d_morton_codes_, d_indices_, n,
         scene_bbox.min_pt, extent_inv);
     CUDA_CHECK(cudaGetLastError());
 
@@ -319,7 +237,7 @@ void BVH::build(const AABB* primitives_host, int n, BVHNode* d_nodes_slice, int 
              n);
 
     k_init_leaves<<<grid_size(n, block), block>>>(
-        d_primitives_, d_indices_sorted_, d_nodes_, n);
+        d_primitives, d_indices_sorted_, d_nodes_, n);
     CUDA_CHECK(cudaGetLastError());
 
     if (n > 1) {
@@ -337,7 +255,6 @@ void BVH::build(const AABB* primitives_host, int n, BVHNode* d_nodes_slice, int 
 
     // Free private temporaries; leave d_nodes_ pointing at the slab slice.
     auto fr = [](void*& p) { if (p) { cudaFree(p); p = nullptr; } };
-    fr(reinterpret_cast<void*&>(d_primitives_));
     fr(reinterpret_cast<void*&>(d_morton_codes_));
     fr(reinterpret_cast<void*&>(d_morton_sorted_));
     fr(reinterpret_cast<void*&>(d_indices_));
