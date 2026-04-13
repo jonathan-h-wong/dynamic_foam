@@ -25,12 +25,8 @@ class Simulation {
 
         // Subsystems
         void handleUserInput(const UserInput& input, float deltaTime);
-        void updateTopology(
-            const std::unordered_map<int, BVH>&                          foamBVHs,
-            std::unordered_map<int, AdjacencyList>&                      foamAdjacencyLists);
-        void updatePhysics(
-            const std::unordered_map<int, BVH>&                          foamBVHs,
-            float deltaTime);
+        void updateTopology();
+        void updatePhysics(float deltaTime);
         void render();
         void step(const UserInput& input, float deltaTime);
 
@@ -63,12 +59,6 @@ class Simulation {
         // BVH prim_idx matches the foam-local sorted position used by the narrowphase kernel.
         // If a slab slot already exists for the foam, builds directly into the slab slice.
         void buildBVH(entt::entity foamEntity);
-
-        // Computes world-space AABBs for all live foams by downloading the
-        // per-foam local-space AABB from the GPU slab and applying the foam
-        // world transform (position + orientation).  Cheap for CPU callers
-        // (topology/physics) that need the map only when collision testing.
-        std::unordered_map<int, AABB> buildWorldAABBs() const;
 
         // Bulk upload for a single foam: builds CPU arrays for AABBs, colors,
         // world positions, and surface/active masks from the particle registry,

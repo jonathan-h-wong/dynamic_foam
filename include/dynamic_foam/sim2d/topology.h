@@ -3,7 +3,7 @@
 #include <vector>
 #include <entt/entity/registry.hpp>
 #include "dynamic_foam/Sim2D/adjacency.cuh"
-#include "dynamic_foam/Sim2D/bvh.cuh"
+#include "dynamic_foam/Sim2D/gpu_slab.cuh"
 #include "dynamic_foam/Sim2D/components.h"
 
 namespace DynamicFoam::Sim2D {
@@ -46,11 +46,10 @@ namespace DynamicFoam::Sim2D {
 
         // Returns one result per foam that was structurally modified this tick.
         std::vector<TopologyUpdateResult> update(
-            const std::unordered_map<int, AABB>&                         foamAABBs,
-            const std::unordered_map<int, BVH>&                          foamBVHs,
-            std::unordered_map<int, AdjacencyList>&                      foamAdjacencyLists,
-            entt::registry&                                              foamRegistry,
-            entt::registry&                                              particleRegistry
+            const GpuSlabAllocator&                              gpuSlab,
+            std::unordered_map<int, AdjacencyList>&              foamAdjacencyLists,
+            entt::registry&                                      foamRegistry,
+            entt::registry&                                      particleRegistry
         );
     };
 }

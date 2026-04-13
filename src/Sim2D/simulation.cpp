@@ -428,50 +428,8 @@ namespace DynamicFoam::Sim2D {
         });
     }
 
-    // -------------------------------------------------------------------------
-    // buildWorldAABBs
-    //
-    // Downloads per-foam local-space AABBs from the GPU slab (d_foam_aabbs,
-    // written by computeFoamAABB inside bulkMortonSort) and applies each foam's
-    // world transform to produce world-space AABBs for collision/topology.
-    // -------------------------------------------------------------------------
-    std::unordered_map<int, AABB> Simulation::buildWorldAABBs() const {
-        std::unordered_map<int, AABB> result;
-        const int num_foams = gpuSlab.num_foams;
-        if (num_foams <= 0 || !gpuSlab.d_foam_aabbs) return result;
-
-        std::vector<AABB> h_local(num_foams);
-        CUDA_CHECK(cudaMemcpy(h_local.data(), gpuSlab.d_foam_aabbs,
-                              num_foams * sizeof(AABB), cudaMemcpyDeviceToHost));
-
-        for (const auto& [foam_id, slot] : gpuSlab.slots) {
-            if (slot.dead || foam_id >= num_foams) continue;
-            const auto foamEntity = static_cast<entt::entity>(foam_id);
-            const auto& pos    = foamRegistry.get<Position>(foamEntity);
-            const auto& orient = foamRegistry.get<Orientation>(foamEntity);
-            const glm::mat4 tx =
-                glm::translate(glm::mat4(1.f), pos.value) * glm::mat4_cast(orient.value);
-            const AABB&     local = h_local[foam_id];
-            const glm::vec3 mn    = local.min_pt, mx = local.max_pt;
-            glm::vec3 c0   = glm::vec3(tx * glm::vec4(mn, 1.f));
-            glm::vec3 wmin = c0, wmax = c0;
-            for (int i = 1; i < 8; ++i) {
-                glm::vec3 c(i & 1 ? mx.x : mn.x, i & 2 ? mx.y : mn.y, i & 4 ? mx.z : mn.z);
-                c    = glm::vec3(tx * glm::vec4(c, 1.f));
-                wmin = glm::min(wmin, c);
-                wmax = glm::max(wmax, c);
-            }
-            result[foam_id] = AABB(wmin, wmax);
-        }
-        return result;
-    }
-
-    void Simulation::updateTopology(
-        const std::unordered_map<int, BVH>&          foamBVHs,
-        std::unordered_map<int, AdjacencyList>&      foamAdjacencyLists
-    ) {
-        const auto worldAABBs = buildWorldAABBs();
-        const auto results = topologySubsystem.update(worldAABBs, foamBVHs, foamAdjacencyLists, foamRegistry, particleRegistry);
+    void Simulation::updateTopology() {
+        const auto results = topologySubsystem.update(gpuSlab, foamAdjacencyLists, foamRegistry, particleRegistry);
         for (const auto& result : results) {
             // Refresh world positions for the affected particles.
             const std::unordered_set<entt::entity> particleSubset(
@@ -530,13 +488,8 @@ namespace DynamicFoam::Sim2D {
         }
     }
 
-    void Simulation::updatePhysics(
-        const std::unordered_map<int, BVH>&   foamBVHs,
-        float deltaTime) {
-        const auto worldAABBs = buildWorldAABBs();
-        const auto updatedFoams = physicsSubsystem.update(worldAABBs, foamBVHs, foamAdjacencyLists, foamRegistry, particleRegistry, deltaTime);
-        // Local-space AABBs are unaffected by rigid-body motion; no slab update needed.
-        (void)updatedFoams;
+    void Simulation::updatePhysics(float deltaTime) {
+        const auto updatedFoams = physicsSubsystem.update(gpuSlab, foamAdjacencyLists, foamRegistry, particleRegistry, deltaTime);
     }
 
     void Simulation::render() {
@@ -572,7 +525,7 @@ namespace DynamicFoam::Sim2D {
 
     void Simulation::step(const UserInput& input, float deltaTime) {
         handleUserInput(input, deltaTime);
-        updateTopology(foamBVHs, foamAdjacencyLists);
+        updateTopology();
 
         // Compact dead slab regions accumulated from prior resizes.
         // compact() D->D packs BVH/CSR/particle data and resets watermarks,
@@ -585,7 +538,7 @@ namespace DynamicFoam::Sim2D {
             rebuildAllSlabCsr();
         }
 
-        updatePhysics(foamBVHs, deltaTime);
+        updatePhysics(deltaTime);
         // Re-sample the cursor position after the expensive subsystems so that
         // Controller foam is placed at its true on-screen location when the GPU
         // kernel fires, minimising input-to-display latency.
