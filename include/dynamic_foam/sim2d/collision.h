@@ -66,8 +66,10 @@ struct FoamCollision {
  *                           Leaf prim_idx values index into the ordered particle
  *                           sequence returned by foamAdjacencyLists[id].getOrderedNodeIds().
  * @param foamTransforms     World transforms (T * R, glm::mat4) for each foam.
- * @param foamAdjacencyLists Adjacency lists whose getOrderedNodeIds() yields the
- *                           particle entities in the same order the BVH was built.
+ * @param foamAdjacencyLists Adjacency lists.  NOTE: leaf prim_idx values from
+ *                           the BVH are Morton-sorted positions, not raw
+ *                           getOrderedNodeIds() indices.  Callers must supply
+ *                           foamMortonPerms and remap accordingly (see TODO).
  * @param particleRegistry   Read-only registry used to fetch ParticleVertices per particle.
  * @return                   All penetrating Voronoi-cell pairs across all foam pairs.
  */

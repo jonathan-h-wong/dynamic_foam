@@ -44,7 +44,7 @@ __global__ void buildInverseMapKernel(
 
 } // anonymous namespace
 
-void AdjacencyList::buildGPUAdjacencyList(
+void AdjacencyList::buildGPUAdjacencyListImpl(
     AdjacencyListGPU&            out,
     const std::vector<uint32_t>& sorted_ids,
     cudaStream_t                 stream) const
@@ -53,6 +53,9 @@ void AdjacencyList::buildGPUAdjacencyList(
     const uint32_t N = use_subset
                        ? static_cast<uint32_t>(sorted_ids.size())
                        : static_cast<uint32_t>(adj.size());
+
+    // Ensure the COO cache is current before we read it.
+    if (coo_dirty) rebuildCOO();
 
     // Filter edges on the CPU — only intra-subset edges are uploaded.
     // For the full-graph path the internal coo_src/coo_dst are used as-is.
@@ -230,7 +233,7 @@ void AdjacencyList::buildGPUAdjacencyList(
     CUDA_CHECK(cudaFree(d_degrees));
 }
 
-void AdjacencyList::buildGPUAdjacencyListIntoSlice(
+void AdjacencyList::buildGPUAdjacencyList(
     AdjacencyListGPU&            out,
     uint32_t*                    d_nbrs_slice,
     size_t                       nbrs_cap,
@@ -252,9 +255,7 @@ void AdjacencyList::buildGPUAdjacencyListIntoSlice(
     out.node_offsets_capacity = node_offsets_cap;
     out.node_offsets_owned    = false;
 
-    // Delegate to the main builder which will skip realloc for non-owned
-    // buffers (capacity is already set to the slice size).
-    buildGPUAdjacencyList(out, sorted_ids, stream);
+    buildGPUAdjacencyListImpl(out, sorted_ids, stream);
 }
 
 } // namespace DynamicFoam::Sim2D

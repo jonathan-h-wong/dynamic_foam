@@ -18,6 +18,35 @@
 namespace DynamicFoam::Sim2D {
 
 // -----------------------------------------------------------------------------
+// AABB transform kernel — one thread per foam.
+// Reads the local-space AABB from the slab (indexed by foam_id), applies the
+// foam's world transform (8-corner method), and writes the world-space AABB
+// into world_aabbs_out[foam_id].  Runs before broadphase each frame so that
+// no D→H→D copy is needed for geometry data.
+// -----------------------------------------------------------------------------
+__global__ void k_transform_foam_aabbs(
+    const AABB*      local_aabbs,
+    const glm::mat4* transforms,
+    AABB*            world_aabbs_out,
+    int              num_foams
+) {
+    int fid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (fid >= num_foams) return;
+    const AABB&      local = local_aabbs[fid];
+    const glm::mat4& tx    = transforms[fid];
+    const glm::vec3  mn    = local.min_pt, mx = local.max_pt;
+    glm::vec3 c0   = glm::vec3(tx * glm::vec4(mn, 1.f));
+    glm::vec3 wmin = c0, wmax = c0;
+    for (int j = 1; j < 8; ++j) {
+        glm::vec3 c(j & 1 ? mx.x : mn.x, j & 2 ? mx.y : mn.y, j & 4 ? mx.z : mn.z);
+        c    = glm::vec3(tx * glm::vec4(c, 1.f));
+        wmin = glm::min(wmin, c);
+        wmax = glm::max(wmax, c);
+    }
+    world_aabbs_out[fid] = AABB(wmin, wmax);
+}
+
+// -----------------------------------------------------------------------------
 // Broadphase — one thread per ray, iterates over all foam AABBs
 // -----------------------------------------------------------------------------
 
@@ -342,7 +371,6 @@ Render::~Render() {
 }
 
 void Render::update(
-    const std::unordered_map<int, AABB>&      foamAABBs,
     const GpuSlabAllocator&                   slab,
     const std::unordered_map<int, glm::mat4>& foamTransforms,
     const CameraParams&                       camera,
@@ -353,37 +381,55 @@ void Render::update(
     const int num_foams = slab.num_foams; // authoritative count from slab
 
     // ------------------------------------------------------------------
-    // Foam AABBs (per-frame: dynamic foams move)
+    // Collect live foam IDs (cheap host-side metadata walk; no geometry).
     // ------------------------------------------------------------------
 
-    std::vector<AABB> h_foam_aabbs(num_foams);
-    std::vector<int>  h_foam_ids;
-    h_foam_ids.reserve(foamAABBs.size());
-    for (const auto& [id, aabb] : foamAABBs) {
-        if (id < num_foams) h_foam_aabbs[id] = aabb;
-        h_foam_ids.push_back(id);
+    std::vector<int> h_foam_ids;
+    h_foam_ids.reserve(slab.slots.size());
+    for (const auto& [id, slot] : slab.slots) {
+        if (!slot.dead && id >= 0 && id < num_foams)
+            h_foam_ids.push_back(id);
     }
     const int num_visible_foams = static_cast<int>(h_foam_ids.size());
 
     cuda_realloc_if_needed(&d_foam_aabbs_, &cap_foams_,    num_foams);
     cuda_realloc_if_needed(&d_foam_ids_,   &cap_foam_ids_, num_visible_foams);
-    CUDA_CHECK(cudaMemcpy(d_foam_aabbs_, h_foam_aabbs.data(),
-                          num_foams * sizeof(AABB), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_foam_ids_,   h_foam_ids.data(),
-                          num_visible_foams * sizeof(int),  cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_foam_ids_, h_foam_ids.data(),
+                          num_visible_foams * sizeof(int), cudaMemcpyHostToDevice));
 
     // ------------------------------------------------------------------
-    // Per-foam inverse transforms (per-frame: dynamic foams rotate/translate)
+    // Per-foam transforms (per-frame: dynamic foams rotate/translate).
+    // Upload both the forward transform (for AABB) and its inverse (for rays).
     // ------------------------------------------------------------------
 
+    std::vector<glm::mat4> h_foam_transforms    (num_foams, glm::mat4(1.0f));
     std::vector<glm::mat4> h_foam_inv_transforms(num_foams, glm::mat4(1.0f));
-    for (const auto& [id, mat] : foamTransforms)
-        if (id >= 0 && id < num_foams)
+    for (const auto& [id, mat] : foamTransforms) {
+        if (id >= 0 && id < num_foams) {
+            h_foam_transforms[id]     = mat;
             h_foam_inv_transforms[id] = glm::inverse(mat);
+        }
+    }
 
+    cuda_realloc_if_needed(&d_foam_transforms_,     &cap_foam_transforms_,     num_foams);
     cuda_realloc_if_needed(&d_foam_inv_transforms_, &cap_foam_inv_transforms_, num_foams);
+    CUDA_CHECK(cudaMemcpy(d_foam_transforms_, h_foam_transforms.data(),
+                          num_foams * sizeof(glm::mat4), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_foam_inv_transforms_, h_foam_inv_transforms.data(),
                           num_foams * sizeof(glm::mat4), cudaMemcpyHostToDevice));
+
+    // ------------------------------------------------------------------
+    // World-space AABB computation — entirely on GPU, no D→H copy.
+    // k_transform_foam_aabbs reads local AABBs from the slab and writes
+    // world-space results into d_foam_aabbs_, ready for broadphase.
+    // ------------------------------------------------------------------
+
+    if (num_foams > 0) {
+        k_transform_foam_aabbs<<<grid_size(num_foams), 256>>>(
+            slab.d_foam_aabbs, d_foam_transforms_,
+            d_foam_aabbs_, num_foams);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     // ------------------------------------------------------------------
     // Broadphase
@@ -519,6 +565,7 @@ void Render::free_device_memory() {
 
     f(d_foam_aabbs_);                d_foam_aabbs_                = nullptr;
     f(d_foam_ids_);                  d_foam_ids_                  = nullptr;
+    f(d_foam_transforms_);           d_foam_transforms_           = nullptr;
     f(d_broadphase_hits_);           d_broadphase_hits_           = nullptr;
     f(d_broadphase_hit_counter_);    d_broadphase_hit_counter_    = nullptr;
     f(d_narrowphase_hits_);          d_narrowphase_hits_          = nullptr;

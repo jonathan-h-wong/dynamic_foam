@@ -221,7 +221,6 @@ public:
     //                narrowphase kernel can transform rays into each foam's local
     //                BVH space.
     void update(
-        const std::unordered_map<int, AABB>&      foamAABBs,
         const GpuSlabAllocator&                   slab,
         const std::unordered_map<int, glm::mat4>& foamTransforms,
         const CameraParams&                       camera,
@@ -281,6 +280,12 @@ private:
     // foam's local BVH coordinate space.
     glm::mat4* d_foam_inv_transforms_   = nullptr;
     size_t     cap_foam_inv_transforms_ = 0;
+
+    // Per-foam forward (local-to-world) transforms — one mat4 per foam, indexed
+    // by foam_id. Used by k_transform_foam_aabbs to compute world-space AABBs
+    // from the slab's local-space d_foam_aabbs on the GPU each frame.
+    glm::mat4* d_foam_transforms_   = nullptr;
+    size_t     cap_foam_transforms_ = 0;
 
     // Final pixel output
     glm::vec4* d_output_buffer_   = nullptr;

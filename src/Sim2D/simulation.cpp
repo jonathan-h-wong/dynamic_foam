@@ -73,12 +73,6 @@ namespace DynamicFoam::Sim2D {
                 }
             }
 
-            // Build BVH for the foam's particles.
-            buildBVH(rigidBody);
-
-            // Define worldspace AABB
-            buildAABB(rigidBody);
-
             // Find and emplace surface particles
             auto surface_cells = findSurfaceCells(foam.adjacencyList, foam.particleOpacity);
             for(const auto& p_id : surface_cells){
@@ -88,31 +82,11 @@ namespace DynamicFoam::Sim2D {
 
         // Initialise the GPU slab (allocates device buffers, builds BVH and
         // CSR adjacency into slab slices, uploads static particle data).
-        // Must be called after all foams have been fully constructed above.
-        // Implemented in simulation_gpu.cu (requires nvcc / __CUDACC__).
         initSlab();
-    }
-
-    void Simulation::buildAABB(entt::entity foamEntity) {
-        const auto& ordered = foamAdjacencyLists.at(static_cast<int>(foamEntity)).getOrderedNodeIds();
-        std::vector<glm::vec3> world_positions;
-        world_positions.reserve(ordered.size());
-        for (auto e : ordered)
-            world_positions.push_back(particleRegistry.get<ParticleWorldPosition>(static_cast<entt::entity>(e)).value);
-        if (!world_positions.empty()) {
-            auto [min, max] = calculateAABB(world_positions);
-            foamAABBs[static_cast<int>(foamEntity)] = AABB(min, max);
-        }
     }
 
     // -------------------------------------------------------------------------
     // initSlab
-    //
-    // Allocates and populates the GpuSlabAllocator from the CPU-side with foam data
-    // structures built during the constructor. This function is intentionally
-    // in simulation.cpp (MSVC) so it can access entt registry members; the two
-    // CUDA-kernel-guarded calls are delegated to free functions in
-    // simulation_gpu.cu via the forward declarations at the top of this file.
     // -------------------------------------------------------------------------
     void Simulation::initSlab() {
         // Tally buffer totals across all foams.
@@ -143,118 +117,211 @@ namespace DynamicFoam::Sim2D {
             gpuSlab.allocate(foam_id, num_bvh_nodes, N + 1, E, N);
             const FoamSlot& slot = gpuSlab.slots.at(foam_id);
 
-            // Rebuild BVH into the slab slice.
-            const auto& ordered = adj.getOrderedNodeIds();
-            std::vector<AABB> ordered_aabbs;
-            ordered_aabbs.reserve(N);
-            for (auto e : ordered) {
-                const auto& verts = particleRegistry.get<ParticleVertices>(static_cast<entt::entity>(e)).vertices;
-                auto [mn, mx] = calculateAABB(verts);
-                ordered_aabbs.push_back(AABB(mn, mx));
-            }
-            foamBVHs.at(foam_id).build(
-                ordered_aabbs.data(), N,
-                gpuSlab.d_bvh_nodes + slot.bvh_offset,
-                slot.bvh_capacity);
-
-            // Build GPU CSR into slab slices and bias offsets.
-            adj.buildGPUAdjacencyListIntoSlice(
+            // Build GPU CSR into slab slice and bias offsets.
+            adj.buildGPUAdjacencyList(
                 foamGpuAdj[foam_id],
                 gpuSlab.d_csr_colidx + slot.csr_edge_offset,
                 static_cast<size_t>(slot.csr_edge_capacity),
                 gpuSlab.d_csr_rowptr + slot.csr_node_offset,
                 static_cast<size_t>(slot.csr_node_capacity));
-
             gpuSlab.biasCsrOffsets(foam_id);
 
-            // Upload static particle data (colors + surface mask) once.
-            std::vector<glm::vec4> h_colors(N);
-            std::vector<uint8_t>   h_mask(N, 0);
-            for (int li = 0; li < N; ++li) {
-                const entt::entity e = static_cast<entt::entity>(ordered[li]);
-                const auto* c = particleRegistry.try_get<ParticleColor>(e);
-                const auto* o = particleRegistry.try_get<ParticleOpacity>(e);
-                if (c && o) h_colors[li] = glm::vec4(c->rgb, o->value);
-                if (particleRegistry.all_of<Surface>(e)) h_mask[li] = 1;
-            }
-            gpuSlab.uploadParticleColors(foam_id, h_colors.data(), N);
-            gpuSlab.uploadSurfaceMask(foam_id, h_mask.data(), N);
+            // Bulk-upload all particle data (AABBs, colors, positions, surface mask)
+            // and Morton-sort every buffer together in a single pass.
+            uploadParticleData(static_cast<entt::entity>(foam_id));
+
+            // Build BVH using the now Morton-sorted particle AABBs.
+            foamBVHs[foam_id].build(
+                gpuSlab.d_particle_aabbs + slot.particle_offset, N,
+                gpuSlab.d_bvh_nodes + slot.bvh_offset,
+                slot.bvh_capacity);
+
+            // Rebuild the CSR in Morton order so that CSR row i and neighbor
+            // column indices are both Morton positions, matching prim_idx from
+            // the BVH leaves and the layout of all other slab particle arrays.
+            rebuildSlabCsrMortonOrder(foam_id);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // rebuildSlabCsrMortonOrder
+    //
+    // Rebuilds the GPU CSR for one foam using the Morton permutation stored in
+    // foamMortonPerms[foam_id].  After bulkMortonSort all particle slab buffers
+    // (AABBs, positions, colors, surface mask) are reordered so that GPU buffer
+    // index i corresponds to Morton position i.  The BVH is then built on top
+    // of that Morton-sorted AABB array, so every leaf's prim_idx is also a
+    // Morton position.  The CSR must use the same indexing convention:
+    //   - CSR row i  → node at Morton position i
+    //   - CSR column indices → Morton positions of neighbors
+    // buildGPUAdjacencyList accepts a sorted_ids parameter that re-orders the
+    // build entirely, so we pass the Morton-permuted node-ID list directly.
+    // -------------------------------------------------------------------------
+    void Simulation::rebuildSlabCsrMortonOrder(int foam_id) {
+        auto it = gpuSlab.slots.find(foam_id);
+        if (it == gpuSlab.slots.end() || it->second.dead) return;
+        const auto permIt = foamMortonPerms.find(foam_id);
+        if (permIt == foamMortonPerms.end()) return;
+
+        const auto& adj     = foamAdjacencyLists.at(foam_id);
+        const auto& ordered = adj.getOrderedNodeIds();
+        const int   N       = static_cast<int>(ordered.size());
+        const auto& perm    = permIt->second;
+
+        // Build the Morton-sorted node ID list:
+        //   morton_sorted_ids[i] = node whose particle data sits at slab position i.
+        std::vector<uint32_t> morton_sorted_ids(N);
+        for (int i = 0; i < N; ++i)
+            morton_sorted_ids[i] = ordered[perm[i]];
+
+        const FoamSlot& slot = it->second;
+        adj.buildGPUAdjacencyList(
+            foamGpuAdj[foam_id],
+            gpuSlab.d_csr_colidx + slot.csr_edge_offset,
+            static_cast<size_t>(slot.csr_edge_capacity),
+            gpuSlab.d_csr_rowptr + slot.csr_node_offset,
+            static_cast<size_t>(slot.csr_node_capacity),
+            morton_sorted_ids);
+        gpuSlab.biasCsrOffsets(foam_id);
     }
 
     // -------------------------------------------------------------------------
     // rebuildAllSlabCsr
     //
-    // Rebuilds the GPU CSR adjacency for every live foam directly into its
-    // current slab slice, then re-biases the node_offsets.
-    //
-    // This must be called after gpuSlab.compact().  compact() D->D moves the
-    // raw CSR node_offsets values but does not update the bias they carry: each
-    // value was written as (0-based_offset + old_csr_edge_offset).  After
-    // compaction csr_edge_offset has changed, so the values are wrong.
-    // Rebuilding from the always-valid CPU adjacency lists corrects this in one
-    // pass without any extra kernel.
+    // Rebuilds the GPU CSR adjacency for every live foam in Morton-sorted order.
+    // Must be called after gpuSlab.compact() so that the biased CSR
+    // node_offsets (which carry the old csr_edge_offset) are corrected for the
+    // new slab layout produced by compaction.
     // -------------------------------------------------------------------------
     void Simulation::rebuildAllSlabCsr() {
-        for (auto& [foam_id, adj] : foamAdjacencyLists) {
-            auto it = gpuSlab.slots.find(foam_id);
-            if (it == gpuSlab.slots.end() || it->second.dead) continue;
-            const FoamSlot& slot = it->second;
-            adj.buildGPUAdjacencyListIntoSlice(
-                foamGpuAdj[foam_id],
-                gpuSlab.d_csr_colidx + slot.csr_edge_offset,
-                static_cast<size_t>(slot.csr_edge_capacity),
-                gpuSlab.d_csr_rowptr + slot.csr_node_offset,
-                static_cast<size_t>(slot.csr_node_capacity));
-            gpuSlab.biasCsrOffsets(foam_id);
+        for (const auto& [foam_id, adj] : foamAdjacencyLists)
+            rebuildSlabCsrMortonOrder(foam_id);
+    }
+
+    // -------------------------------------------------------------------------
+    // uploadParticleData
+    //
+    // Collects the local indices (0-based position within getOrderedNodeIds())
+    // of all Surface particles and their immediate graph neighbours for a foam,
+    // uploads them to the GPU slab's active-IDs buffer, then Morton-sorts the
+    // slice using the foam's particle positions already present on the device.
+    // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // uploadParticleData
+    //
+    // Single entry point for all per-particle GPU data for one foam.
+    // Builds CPU arrays for local-space AABBs, RGBA colors, world positions,
+    // surface mask, and active mask (surface + 1-hop neighbours), uploads all
+    // four static buffers to the GPU slab in getOrderedNodeIds() order, then
+    // calls gpuSlab.bulkMortonSort which:
+    //   - reorders every slab buffer (AABBs, colors, positions, surface mask)
+    //     together by local-space Morton code in a single pass,
+    //   - compacts active particle positions into d_active_ids,
+    //   - writes the permutation to foamMortonPerms[foam_id] so render() can
+    //     upload per-frame positions in the same Morton-sorted order.
+    // -------------------------------------------------------------------------
+    void Simulation::uploadParticleData(entt::entity foamEntity) {
+        const int foam_id = static_cast<int>(foamEntity);
+        const auto it = gpuSlab.slots.find(foam_id);
+        if (it == gpuSlab.slots.end() || it->second.dead) return;
+
+        const auto& adj     = foamAdjacencyLists.at(foam_id);
+        const auto& ordered = adj.getOrderedNodeIds();
+        const int   N       = static_cast<int>(ordered.size());
+        if (N == 0) return;
+
+        // Build local-index map: entity_id → position in ordered[].
+        std::unordered_map<uint32_t, uint32_t> localIndexMap;
+        localIndexMap.reserve(N);
+        for (int li = 0; li < N; ++li)
+            localIndexMap[ordered[li]] = static_cast<uint32_t>(li);
+
+        // Build all per-particle arrays in the same getOrderedNodeIds() order.
+        std::vector<AABB>      h_aabbs(N);
+        std::vector<glm::vec4> h_colors(N);
+        std::vector<glm::vec3> h_positions(N);
+        std::vector<uint8_t>   h_surface(N, 0);
+        std::vector<uint8_t>   h_active(N, 0);
+
+        for (int li = 0; li < N; ++li) {
+            const entt::entity e = static_cast<entt::entity>(ordered[li]);
+
+            const auto& verts = particleRegistry.get<ParticleVertices>(e).vertices;
+            auto [mn, mx] = calculateAABB(verts);
+            h_aabbs[li] = AABB(mn, mx);
+
+            const auto* c = particleRegistry.try_get<ParticleColor>(e);
+            const auto* o = particleRegistry.try_get<ParticleOpacity>(e);
+            if (c && o) h_colors[li] = glm::vec4(c->rgb, o->value);
+
+            h_positions[li] = particleRegistry.get<ParticleWorldPosition>(e).value;
+
+            if (particleRegistry.all_of<Surface>(e)) h_surface[li] = 1;
         }
+
+        // Active mask: surface particles + their immediate graph neighbours.
+        for (int li = 0; li < N; ++li) {
+            if (!h_surface[li]) continue;
+            h_active[li] = 1;
+            adj.forEachNeighbor(ordered[li], [&](uint32_t nbr_id) {
+                auto nit = localIndexMap.find(nbr_id);
+                if (nit != localIndexMap.end())
+                    h_active[nit->second] = 1;
+            });
+        }
+
+        // Bulk upload to slab in getOrderedNodeIds() order.
+        gpuSlab.uploadParticleAABBs(foam_id, h_aabbs.data(), N);
+        gpuSlab.uploadParticleColors(foam_id, h_colors.data(), N);
+        gpuSlab.uploadParticlePositions(foam_id, h_positions.data(), N);
+        gpuSlab.uploadSurfaceMask(foam_id, h_surface.data(), N);
+
+        // Bulk Morton sort: reorders all slab buffers together, compacts active
+        // IDs, and returns the permutation for per-frame position uploads.
+        foamMortonPerms[foam_id].resize(N);
+        gpuSlab.bulkMortonSort(foam_id, N, h_active.data(), foamMortonPerms[foam_id]);
     }
 
     void Simulation::buildBVH(entt::entity foamEntity) {
-        const int foam_id   = static_cast<int>(foamEntity);
-        auto& adj           = foamAdjacencyLists.at(foam_id);
-        const auto& ordered = adj.getOrderedNodeIds();
-        const int N = static_cast<int>(ordered.size());
+        const int foam_id = static_cast<int>(foamEntity);
+        auto& adj = foamAdjacencyLists.at(foam_id);
+        const int N = static_cast<int>(adj.getOrderedNodeIds().size());
         const int E = static_cast<int>(adj.getCOOSrc().size());
 
-        std::vector<AABB> ordered_aabbs;
-        ordered_aabbs.reserve(N);
-        for (auto e : ordered) {
-            const auto& verts = particleRegistry.get<ParticleVertices>(static_cast<entt::entity>(e)).vertices;
-            auto [mn, mx] = calculateAABB(verts);
-            ordered_aabbs.push_back(AABB(mn, mx));
-        }
-
         auto it = gpuSlab.slots.find(foam_id);
-        if (it != gpuSlab.slots.end() && !it->second.dead) {
-            const int num_bvh_nodes = (N > 1) ? 2 * N - 1 : 1;
+        if (it == gpuSlab.slots.end() || it->second.dead) return;
 
-            // If particle count has grown beyond the 2x overcommit, tombstone the
-            // old slot and allocate a larger one.  The CSR must also be rebuilt
-            // into the new slice since the edge-block start offset has changed.
-            if (gpuSlab.needsResize(foam_id, num_bvh_nodes, N + 1, E, N)) {
-                gpuSlab.resize(foam_id, num_bvh_nodes, N + 1, E, N);
-                const FoamSlot& newSlot = gpuSlab.slots.at(foam_id);
-                adj.buildGPUAdjacencyListIntoSlice(
-                    foamGpuAdj[foam_id],
-                    gpuSlab.d_csr_colidx + newSlot.csr_edge_offset,
-                    static_cast<size_t>(newSlot.csr_edge_capacity),
-                    gpuSlab.d_csr_rowptr + newSlot.csr_node_offset,
-                    static_cast<size_t>(newSlot.csr_node_capacity));
-                gpuSlab.biasCsrOffsets(foam_id);
-            }
+        const int num_bvh_nodes = (N > 1) ? 2 * N - 1 : 1;
 
-            const FoamSlot& slot = gpuSlab.slots.at(foam_id);
-            foamBVHs[foam_id].build(ordered_aabbs.data(), N,
-                                    gpuSlab.d_bvh_nodes + slot.bvh_offset,
-                                    slot.bvh_capacity);
-
-        } else {
-            // Slab not yet initialised (first construction pass) — normal alloc.
-            BVH bvh;
-            bvh.build(ordered_aabbs.data(), ordered_aabbs.size());
-            foamBVHs[foam_id] = std::move(bvh);
+        // If particle count has grown beyond the 2x overcommit, tombstone the
+        // old slot and allocate a larger one.  The CSR must also be rebuilt
+        // into the new slice since the edge-block start offset has changed.
+        if (gpuSlab.needsResize(foam_id, num_bvh_nodes, N + 1, E, N)) {
+            gpuSlab.resize(foam_id, num_bvh_nodes, N + 1, E, N);
+            const FoamSlot& newSlot = gpuSlab.slots.at(foam_id);
+            adj.buildGPUAdjacencyList(
+                foamGpuAdj[foam_id],
+                gpuSlab.d_csr_colidx + newSlot.csr_edge_offset,
+                static_cast<size_t>(newSlot.csr_edge_capacity),
+                gpuSlab.d_csr_rowptr + newSlot.csr_node_offset,
+                static_cast<size_t>(newSlot.csr_node_capacity));
+            gpuSlab.biasCsrOffsets(foam_id);
         }
+
+        // Bulk-upload all particle data (AABBs, colors, positions, surface mask)
+        // and Morton-sort every buffer together in a single pass.
+        uploadParticleData(foamEntity);
+
+        // Build BVH using the now Morton-sorted particle AABBs.
+        const FoamSlot& slot = gpuSlab.slots.at(foam_id);
+        foamBVHs[foam_id].build(
+            gpuSlab.d_particle_aabbs + slot.particle_offset, N,
+            gpuSlab.d_bvh_nodes + slot.bvh_offset,
+            slot.bvh_capacity);
+
+        // Rebuild the CSR in Morton order so that CSR row / column indices
+        // are Morton positions, consistent with prim_idx and all other slab buffers.
+        rebuildSlabCsrMortonOrder(foam_id);
     }
 
     void Simulation::applyForwardKinematics(
@@ -357,16 +424,54 @@ namespace DynamicFoam::Sim2D {
         foamRegistry.view<Controller, Position>().each([&](auto entity, auto& pos) {
             pos.value = glm::vec3(world_x, world_y, 0.0f);
             applyForwardKinematics(entity);
-            buildAABB(entity);  // keep broadphase AABB in sync with particle world positions
+            // World AABB is computed on-demand from slab + transforms in step().
         });
     }
 
+    // -------------------------------------------------------------------------
+    // buildWorldAABBs
+    //
+    // Downloads per-foam local-space AABBs from the GPU slab (d_foam_aabbs,
+    // written by computeFoamAABB inside bulkMortonSort) and applies each foam's
+    // world transform to produce world-space AABBs for collision/topology.
+    // -------------------------------------------------------------------------
+    std::unordered_map<int, AABB> Simulation::buildWorldAABBs() const {
+        std::unordered_map<int, AABB> result;
+        const int num_foams = gpuSlab.num_foams;
+        if (num_foams <= 0 || !gpuSlab.d_foam_aabbs) return result;
+
+        std::vector<AABB> h_local(num_foams);
+        CUDA_CHECK(cudaMemcpy(h_local.data(), gpuSlab.d_foam_aabbs,
+                              num_foams * sizeof(AABB), cudaMemcpyDeviceToHost));
+
+        for (const auto& [foam_id, slot] : gpuSlab.slots) {
+            if (slot.dead || foam_id >= num_foams) continue;
+            const auto foamEntity = static_cast<entt::entity>(foam_id);
+            const auto& pos    = foamRegistry.get<Position>(foamEntity);
+            const auto& orient = foamRegistry.get<Orientation>(foamEntity);
+            const glm::mat4 tx =
+                glm::translate(glm::mat4(1.f), pos.value) * glm::mat4_cast(orient.value);
+            const AABB&     local = h_local[foam_id];
+            const glm::vec3 mn    = local.min_pt, mx = local.max_pt;
+            glm::vec3 c0   = glm::vec3(tx * glm::vec4(mn, 1.f));
+            glm::vec3 wmin = c0, wmax = c0;
+            for (int i = 1; i < 8; ++i) {
+                glm::vec3 c(i & 1 ? mx.x : mn.x, i & 2 ? mx.y : mn.y, i & 4 ? mx.z : mn.z);
+                c    = glm::vec3(tx * glm::vec4(c, 1.f));
+                wmin = glm::min(wmin, c);
+                wmax = glm::max(wmax, c);
+            }
+            result[foam_id] = AABB(wmin, wmax);
+        }
+        return result;
+    }
+
     void Simulation::updateTopology(
-        const std::unordered_map<int, AABB>&                         foamAABBs,
-        const std::unordered_map<int, BVH>&                          foamBVHs,
-        std::unordered_map<int, AdjacencyList>&                      foamAdjacencyLists
+        const std::unordered_map<int, BVH>&          foamBVHs,
+        std::unordered_map<int, AdjacencyList>&      foamAdjacencyLists
     ) {
-        const auto results = topologySubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, foamRegistry, particleRegistry);
+        const auto worldAABBs = buildWorldAABBs();
+        const auto results = topologySubsystem.update(worldAABBs, foamBVHs, foamAdjacencyLists, foamRegistry, particleRegistry);
         for (const auto& result : results) {
             // Refresh world positions for the affected particles.
             const std::unordered_set<entt::entity> particleSubset(
@@ -374,8 +479,10 @@ namespace DynamicFoam::Sim2D {
             applyForwardKinematics(result.foamId, particleSubset);
 
             // Rebuild BVH from current ParticleVertices in the registry.
+            // buildBVH also calls uploadParticleData which reorders all slab
+            // buffers by Morton, refreshes active IDs, and writes the foam's
+            // local AABB into slab.d_foam_aabbs (via computeFoamAABB).
             buildBVH(result.foamId);
-            buildAABB(result.foamId);
 
             // A parent foam snapshot indicates a new foam was spawned from a topology change.
             if (result.parentFoamSnapshot.has_value()) {
@@ -424,27 +531,28 @@ namespace DynamicFoam::Sim2D {
     }
 
     void Simulation::updatePhysics(
-        const std::unordered_map<int, AABB>&  foamAABBs,
         const std::unordered_map<int, BVH>&   foamBVHs,
         float deltaTime) {
-        const auto updatedFoams = physicsSubsystem.update(foamAABBs, foamBVHs, foamAdjacencyLists, foamRegistry, particleRegistry, deltaTime);
-        for (const auto foamEntity : updatedFoams)
-            buildAABB(foamEntity);
+        const auto worldAABBs = buildWorldAABBs();
+        const auto updatedFoams = physicsSubsystem.update(worldAABBs, foamBVHs, foamAdjacencyLists, foamRegistry, particleRegistry, deltaTime);
+        // Local-space AABBs are unaffected by rigid-body motion; no slab update needed.
+        (void)updatedFoams;
     }
 
     void Simulation::render() {
-        // Upload per-frame particle world positions to the slab.
-        // Physics runs on the CPU, so positions change every frame for dynamic
-        // foams.  Static foams' entries in the slab are overwritten with the
-        // same data each frame, which is cheap (~few KB memcpy).
+        // Upload per-frame particle world positions to the slab in Morton-sorted
+        // order so the layout matches the sorted AABBs/colors/mask already on device.
+        // foamMortonPerms[foam_id][i] is the original getOrderedNodeIds() index of
+        // the particle at Morton-sorted slab position i.
         for (const auto& [foam_id, adj] : foamAdjacencyLists) {
             const auto& ordered = adj.getOrderedNodeIds();
-            std::vector<glm::vec3> h_positions;
-            h_positions.reserve(ordered.size());
-            for (auto e : ordered)
-                h_positions.push_back(particleRegistry.get<ParticleWorldPosition>(static_cast<entt::entity>(e)).value);
-            gpuSlab.uploadParticlePositions(
-                foam_id, h_positions.data(), static_cast<int>(h_positions.size()));
+            const int   N       = static_cast<int>(ordered.size());
+            const auto& perm    = foamMortonPerms.at(foam_id);
+            std::vector<glm::vec3> h_positions(N);
+            for (int i = 0; i < N; ++i)
+                h_positions[i] = particleRegistry.get<ParticleWorldPosition>(
+                    static_cast<entt::entity>(ordered[perm[i]])).value;
+            gpuSlab.uploadParticlePositions(foam_id, h_positions.data(), N);
         }
 
         // Build per-foam world transforms from position and orientation.
@@ -458,13 +566,13 @@ namespace DynamicFoam::Sim2D {
 
         // Recompute viewport height from current aspect ratio before rendering.
         camera_.height = camera_.width * (float(windowSize_.y) / float(windowSize_.x));
-        renderSubsystem.update(foamAABBs, gpuSlab, foamTransforms,
+        renderSubsystem.update(gpuSlab, foamTransforms,
                                camera_, windowSize_, overlayParams);
     }
 
     void Simulation::step(const UserInput& input, float deltaTime) {
         handleUserInput(input, deltaTime);
-        updateTopology(foamAABBs, foamBVHs, foamAdjacencyLists);
+        updateTopology(foamBVHs, foamAdjacencyLists);
 
         // Compact dead slab regions accumulated from prior resizes.
         // compact() D->D packs BVH/CSR/particle data and resets watermarks,
@@ -477,7 +585,7 @@ namespace DynamicFoam::Sim2D {
             rebuildAllSlabCsr();
         }
 
-        updatePhysics(foamAABBs, foamBVHs, deltaTime);
+        updatePhysics(foamBVHs, deltaTime);
         // Re-sample the cursor position after the expensive subsystems so that
         // Controller foam is placed at its true on-screen location when the GPU
         // kernel fires, minimising input-to-display latency.
