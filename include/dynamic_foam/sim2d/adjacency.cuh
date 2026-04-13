@@ -107,10 +107,7 @@ public:
         adj[a].insert(b);
         adj[b].insert(a);
 
-        coo_src.push_back(a);
-        coo_dst.push_back(b);
-        coo_src.push_back(b);
-        coo_dst.push_back(a);
+        coo_dirty = true;
     }
 
     void addNodeEdges(uint32_t nodeId, const std::vector<uint32_t>& connections) {
@@ -128,7 +125,7 @@ public:
             edgeIndex.erase(edgeKey(nodeId, nbr));
         }
         adj.erase(it);
-        rebuildCOO();
+        coo_dirty = true;
     }
 
     // Merge another adjacency list into this one
@@ -158,10 +155,10 @@ public:
         return adj;
     }
 
-    // Returns the flat directed COO edge arrays. Always current — no lazy
-    // rebuild needed since mutations update the COO eagerly.
-    const std::vector<uint32_t>& getCOOSrc() const { return coo_src; }
-    const std::vector<uint32_t>& getCOODst() const { return coo_dst; }
+    // Returns the flat directed COO edge arrays. Rebuilt lazily on first
+    // access after any mutation that sets coo_dirty.
+    const std::vector<uint32_t>& getCOOSrc() const { if (coo_dirty) rebuildCOO(); return coo_src; }
+    const std::vector<uint32_t>& getCOODst() const { if (coo_dirty) rebuildCOO(); return coo_dst; }
 
     // Returns node IDs in insertion order. Used by the render layer to build
     // the per-foam slice of the flat position/color/surface-mask buffers in
@@ -200,40 +197,20 @@ public:
     // -------------------------------------------------------------------------
     // buildGPUAdjacencyList — compiled by NVCC only
     //
-    // Constructs a CSR adjacency list entirely on the GPU from the current
-    // COO edge list.
+    // Builds a CSR adjacency list directly into a pre-allocated slab slice.
+    // d_nbrs_slice and d_node_offsets_slice are device memory owned by an
+    // external allocator (GpuSlabAllocator); they will NOT be freed by this
+    // call or by out.free().
     //
-    // sorted_ids           CPU-side node IDs in desired sort order (e.g. from
-    //                      a Morton sort pass). Pass an empty vector to use
-    //                      insertion order. When non-empty, only intra-subset
-    //                      edges are uploaded; filtering is done on the CPU
-    //                      via getSubsetCOO before any GPU work begins.
-    //
-    // out                  Reused across frames. Device buffers are grown with
-    //                      the doubling realloc helper and never shrunk.
-    //
-    // stream               All GPU work is issued onto this stream.
-    // -------------------------------------------------------------------------
-    void buildGPUAdjacencyList(
-        AdjacencyListGPU&            out,
-        const std::vector<uint32_t>& sorted_ids = {},
-        cudaStream_t                 stream = 0) const;
-
-    // -------------------------------------------------------------------------
-    // buildGPUAdjacencyListIntoSlice
-    //
-    // Slab variant: d_nbrs_slice and d_node_offsets_slice are pre-allocated
-    // device memory owned by an external allocator (GpuSlabAllocator).  The
-    // adjacency list writes directly into these slices and will NOT free them.
-    //
-    // nbrs_cap        must be >= E (num directed edges in this foam).
+    // nbrs_cap         must be >= E (num directed edges in this foam).
     // node_offsets_cap must be >= N + 1 (num nodes + sentinel).
     //
-    // After this call, out.nbrs and out.node_offsets point at the slices with
-    // nbrs_owned = false / node_offsets_owned = false so that out.free() is
-    // safe to call without leaking.
+    // sorted_ids        CPU-side node IDs in desired sort order. Pass an empty
+    //                   vector to use insertion order.
+    //
+    // stream            All GPU work is issued onto this stream.
     // -------------------------------------------------------------------------
-    void buildGPUAdjacencyListIntoSlice(
+    void buildGPUAdjacencyList(
         AdjacencyListGPU&            out,
         uint32_t*                    d_nbrs_slice,
         size_t                       nbrs_cap,
@@ -250,13 +227,20 @@ private:
     // O(1) existence check (canonical undirected key)
     std::unordered_set<uint64_t> edgeIndex;
 
-    // COO cache — kept current eagerly by all mutation methods
-    std::vector<uint32_t> coo_src;
-    std::vector<uint32_t> coo_dst;
+    // COO cache — rebuilt lazily when coo_dirty is set by a mutation.
+    mutable std::vector<uint32_t> coo_src;
+    mutable std::vector<uint32_t> coo_dst;
+    mutable bool coo_dirty = false;
 
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
+
+    // Core GPU CSR builder — operates on buffers already wired into out.
+    void buildGPUAdjacencyListImpl(
+        AdjacencyListGPU&            out,
+        const std::vector<uint32_t>& sorted_ids,
+        cudaStream_t                 stream) const;
 
     // Canonical edge key: always pack smaller ID into high bits
     static uint64_t edgeKey(uint32_t a, uint32_t b) {
@@ -271,10 +255,10 @@ private:
         edgeIndex.erase(key);
         adj[a].erase(b);
         adj[b].erase(a);
-        rebuildCOO();
+        coo_dirty = true;
     }
 
-    void rebuildCOO() {
+    void rebuildCOO() const {
         coo_src.clear();
         coo_dst.clear();
         for (const auto& [node, neighbors] : adj)
@@ -282,6 +266,7 @@ private:
                 coo_src.push_back(node);
                 coo_dst.push_back(nbr);
             }
+        coo_dirty = false;
     }
 };
 
