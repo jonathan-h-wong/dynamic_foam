@@ -67,6 +67,13 @@ struct FoamSlot {
     int active_capacity = 0;
     int active_count    = 0;
 
+    // COO edge list: (coo_count) pairs of (src, dst) uint32 entries each.
+    // Populated by stageCOOData; consumed by GPU adjacency-list construction
+    // kernels so that no full H2D COO transfer is needed at build time.
+    int coo_offset   = 0;
+    int coo_capacity = 0; ///< Per-buffer element capacity (same for src and dst).
+    int coo_count    = 0; ///< Actual directed-edge count staged into the buffer.
+
     bool dead = false; // Tombstoned by resize(); ignored by kernels and compact().
 };
 
@@ -136,13 +143,27 @@ public:
     //   total_csr_edges  — sum of directed edge counts across all initial foams.
     //   total_particles  — sum of particle counts across all initial foams.
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // init — allocate the underlying flat GPU buffers once at startup.
+    // Arguments are lower-bound estimates; each buffer grows with a 2× strategy
+    // if a subsequent allocate() call would overflow it.
+    //
+    //   total_bvh_nodes  — sum of (2*n_i − 1) across all initial foams.
+    //   total_csr_nodes  — sum of (n_i + 1) across all initial foams.
+    //   total_csr_edges  — sum of directed edge counts across all initial foams.
+    //   total_particles  — sum of particle counts across all initial foams.
+    //   total_coo_edges  — sum of directed COO edge counts across all initial foams
+    //                      (can be the same estimate as total_csr_edges).
+    // -------------------------------------------------------------------------
     void init(int total_bvh_nodes, int total_csr_nodes,
-              int total_csr_edges, int total_particles) {
+              int total_csr_edges, int total_particles,
+              int total_coo_edges = -1) {
         grow_bvh(total_bvh_nodes);
         grow_csr_nodes(total_csr_nodes);
         grow_csr_edges(total_csr_edges);
         grow_particles(total_particles);
         grow_active(total_particles);  // worst case: all particles active
+        grow_coo(total_coo_edges >= 0 ? total_coo_edges : total_csr_edges);
         grow_foam_aabbs(8);            // grows with num_foams
 
         // Initial per-foam slab start tables (grown on demand).
@@ -151,31 +172,41 @@ public:
         CUDA_CHECK(cudaMalloc(&d_foam_particle_start, 8 * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_foam_colidx_start,   8 * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_foam_active_start,   8 * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_foam_coo_start,      8 * sizeof(int)));
         offset_table_cap = 8;
         h_foam_bvh_start.assign(8, 0);
         h_foam_rowptr_start.assign(8, 0);
         h_foam_particle_start.assign(8, 0);
         h_foam_colidx_start.assign(8, 0);
         h_foam_active_start.assign(8, 0);
+        h_foam_coo_start.assign(8, 0);
     }
 
     // -------------------------------------------------------------------------
     // allocate — reserve a 2× overcommitted slice for foam_id.
     // Returns a stable reference to the new FoamSlot.
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // allocate — reserve a 2× overcommitted slice for foam_id.
+    // n_coo_edges is the directed COO edge count; pass -1 to match n_csr_edges.
+    // Returns a stable reference to the new FoamSlot.
+    // -------------------------------------------------------------------------
     FoamSlot& allocate(int foam_id,
                        int n_bvh_nodes, int n_csr_nodes,
-                       int n_csr_edges, int n_particles) {
+                       int n_csr_edges, int n_particles,
+                       int n_coo_edges = -1) {
         const int bvh_need  = n_bvh_nodes  * 2;
         const int cn_need   = n_csr_nodes  * 2;
         const int ce_need   = n_csr_edges  * 2;
         const int part_need = n_particles  * 2;
+        const int coo_need  = (n_coo_edges >= 0 ? n_coo_edges : n_csr_edges) * 2;
 
         if (bvh_watermark       + bvh_need  > (int)bvh_cap)      grow_bvh(bvh_watermark       + bvh_need);
         if (csr_node_watermark  + cn_need   > (int)csr_node_cap)  grow_csr_nodes(csr_node_watermark  + cn_need);
         if (csr_edge_watermark  + ce_need   > (int)csr_edge_cap)  grow_csr_edges(csr_edge_watermark  + ce_need);
         if (particle_watermark  + part_need > (int)particle_cap)  grow_particles(particle_watermark  + part_need);
         if (active_watermark    + part_need > (int)active_cap)    grow_active(active_watermark    + part_need);
+        if (coo_watermark       + coo_need  > (int)coo_cap)       grow_coo(coo_watermark       + coo_need);
 
         FoamSlot s;
         s.bvh_offset        = bvh_watermark;        s.bvh_capacity      = bvh_need;
@@ -183,6 +214,8 @@ public:
         s.csr_edge_offset   = csr_edge_watermark;   s.csr_edge_capacity = ce_need;
         s.particle_offset   = particle_watermark;   s.particle_capacity = part_need;
         s.active_offset     = active_watermark;     s.active_capacity   = part_need;
+        s.coo_offset        = coo_watermark;        s.coo_capacity      = coo_need;
+        s.coo_count         = 0;
         s.dead              = false;
 
         bvh_watermark       += bvh_need;
@@ -190,6 +223,7 @@ public:
         csr_edge_watermark  += ce_need;
         particle_watermark  += part_need;
         active_watermark    += part_need;
+        coo_watermark       += coo_need;
 
         slots[foam_id] = s;
         num_foams = std::max(num_foams, foam_id + 1);
@@ -205,9 +239,10 @@ public:
     // -------------------------------------------------------------------------
     void resize(int foam_id,
                 int new_bvh_nodes, int new_csr_nodes,
-                int new_csr_edges, int new_particles) {
+                int new_csr_edges, int new_particles,
+                int new_coo_edges = -1) {
         slots.at(foam_id).dead = true;
-        allocate(foam_id, new_bvh_nodes, new_csr_nodes, new_csr_edges, new_particles);
+        allocate(foam_id, new_bvh_nodes, new_csr_nodes, new_csr_edges, new_particles, new_coo_edges);
     }
 
     // -------------------------------------------------------------------------
@@ -217,14 +252,16 @@ public:
     // capacities.  Returns false when no slot exists yet (first-build path).
     // -------------------------------------------------------------------------
     bool needsResize(int foam_id, int n_bvh, int n_csr_nodes,
-                      int n_csr_edges, int n_particles) const {
+                      int n_csr_edges, int n_particles,
+                      int n_coo_edges = -1) const {
         auto it = slots.find(foam_id);
         if (it == slots.end() || it->second.dead) return false;
         const FoamSlot& s = it->second;
         return n_bvh       > s.bvh_capacity      ||
                n_csr_nodes > s.csr_node_capacity  ||
                n_csr_edges > s.csr_edge_capacity  ||
-               n_particles > s.particle_capacity;
+               n_particles > s.particle_capacity  ||
+               (n_coo_edges >= 0 && n_coo_edges > s.coo_capacity);
     }
 
     // -------------------------------------------------------------------------
@@ -262,7 +299,7 @@ public:
             if (!s.dead) ordered.push_back({s.bvh_offset, id});
         std::sort(ordered.begin(), ordered.end());
 
-        int bw = 0, cnw = 0, cew = 0, pw = 0, aw = 0;
+        int bw = 0, cnw = 0, cew = 0, pw = 0, aw = 0, coow = 0;
         for (auto& [_, id] : ordered) {
             FoamSlot& s = slots[id];
             if (s.bvh_offset != bw)
@@ -304,10 +341,20 @@ public:
                     d_active_ids + s.active_offset,
                     s.active_capacity * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
             s.active_offset = aw;  aw += s.active_capacity;
+
+            if (s.coo_offset != coow) {
+                CUDA_CHECK(cudaMemcpy(d_coo_src + coow,
+                    d_coo_src + s.coo_offset,
+                    s.coo_capacity * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_coo_dst + coow,
+                    d_coo_dst + s.coo_offset,
+                    s.coo_capacity * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            }
+            s.coo_offset = coow;  coow += s.coo_capacity;
         }
         bvh_watermark      = bw;   csr_node_watermark = cnw;
         csr_edge_watermark = cew;  particle_watermark  = pw;
-        active_watermark   = aw;
+        active_watermark   = aw;   coo_watermark       = coow;
 
         rebuild_and_upload_offset_tables();
     }
@@ -350,6 +397,24 @@ public:
     }
 
     // -------------------------------------------------------------------------
+    // stageCOOData — upload directed COO edge pairs for one foam in a single H2D
+    // transfer.
+    //   h_src      — host array of source node IDs for each directed edge.
+    //   h_dst      — host array of destination node IDs for each directed edge.
+    //   n_edges    — number of directed edges (must be <= slot.coo_capacity).
+    // -------------------------------------------------------------------------
+    void stageCOOData(int foam_id,
+                      const uint32_t* h_src,
+                      const uint32_t* h_dst,
+                      int n_edges) {
+        FoamSlot& s = slots.at(foam_id);
+        assert(n_edges <= s.coo_capacity && "stageCOOData: n_edges exceeds slab COO capacity");
+        CUDA_CHECK(cudaMemcpy(d_coo_src + s.coo_offset, h_src, n_edges * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_coo_dst + s.coo_offset, h_dst, n_edges * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        s.coo_count = n_edges;
+    }
+
+    // -------------------------------------------------------------------------
     // updateFoamData — applies a FoamUpdate to the particle slab buffers for
     // foam_id.  Deletions are resolved by searching d_active_ids for matching
     // entity IDs and compacting all five particle arrays.  Insertions are
@@ -376,13 +441,9 @@ public:
     //   2. Gathers all per-particle slab buffers (AABBs, colors, positions,
     //      surface mask, active IDs) into Morton order via a single permutation.
     //   3. Sets slot.active_count = n_particles.
-    //   4. Writes the permutation to h_perm_out so callers (e.g. render()) can
-    //      rebuild the host-side sorted order for per-frame position uploads.
     //
-    // h_perm_out: host vector resized to n_particles on return.
     // Implemented in gpu_slab.cu (requires nvcc).
-    void bulkMortonSort(int foam_id, int n_particles,
-                        std::vector<uint32_t>& h_perm_out);
+    void bulkMortonSort(int foam_id, int n_particles);
 
     // Reduce all n per-particle local-space AABBs for foam_id into a single
     // foam AABB, write it into d_foam_aabbs[foam_id] (device), and also copy
@@ -400,19 +461,23 @@ public:
     glm::vec4* d_particle_colors    = nullptr; ///< Flat particle RGBA colors.
     uint8_t*   d_particle_surface_mask = nullptr; ///< 1 = surface particle, 0 = interior.
     AABB*      d_particle_aabbs     = nullptr; ///< Local-space per-particle AABB (BVH primitives). Indexed by particle_offset.
-    uint32_t*  d_active_ids         = nullptr; ///< Active particle positions (indices into the Morton-sorted particle arrays).
+    uint32_t*  d_active_ids         = nullptr; ///< Morton-sorted entity IDs. d_active_ids[slot.active_offset + i] = entity at Morton position i.
     AABB*      d_foam_aabbs         = nullptr; ///< Local-space AABB for each foam, indexed directly by foam_id (size = num_foams).
+    uint32_t*  d_coo_src            = nullptr; ///< Flat COO source node IDs — all foams packed end-to-end.
+    uint32_t*  d_coo_dst            = nullptr; ///< Flat COO destination node IDs — all foams packed end-to-end.
 
     // Per-foam slab start tables — one int per foam, indexed by foam_id.
     // d_foam_bvh_start[fid]      = slot.bvh_offset       (start in d_bvh_nodes)
     // d_foam_rowptr_start[fid]   = slot.csr_node_offset  (start in d_csr_rowptr)
     // d_foam_colidx_start[fid]   = slot.csr_edge_offset  (start in d_csr_colidx — not currently used by kernels but available)
     // d_foam_particle_start[fid] = slot.particle_offset  (start in d_particle_positions etc.)
+    // d_foam_coo_start[fid]      = slot.coo_offset        (start in d_coo_src / d_coo_dst)
     int* d_foam_bvh_start      = nullptr;
     int* d_foam_rowptr_start   = nullptr;
     int* d_foam_colidx_start   = nullptr;
     int* d_foam_particle_start = nullptr;
     int* d_foam_active_start   = nullptr; ///< Active-IDs slice start per foam (indexed by foam_id).
+    int* d_foam_coo_start      = nullptr; ///< COO slice start per foam (indexed by foam_id).
 
     int num_foams = 0; ///< Max foam_id + 1 (offset table stride).
 
@@ -426,6 +491,7 @@ private:
     int csr_edge_watermark = 0;
     int particle_watermark = 0;
     int active_watermark   = 0;
+    int coo_watermark      = 0;
 
     // Slab capacities (element counts).
     size_t bvh_cap        = 0;
@@ -433,6 +499,7 @@ private:
     size_t csr_edge_cap   = 0;
     size_t particle_cap   = 0;
     size_t active_cap     = 0;
+    size_t coo_cap        = 0;
     size_t foam_aabb_cap_ = 0;
 
     // Host mirrors of the per-foam slab start tables.
@@ -441,6 +508,7 @@ private:
     std::vector<int> h_foam_colidx_start;
     std::vector<int> h_foam_particle_start;
     std::vector<int> h_foam_active_start;
+    std::vector<int> h_foam_coo_start;
     size_t offset_table_cap = 0;
 
     // -------------------------------------------------------------------------
@@ -522,6 +590,25 @@ private:
         active_cap = nc;
     }
 
+    void grow_coo(int required) {
+        const size_t nc = std::max<size_t>(required * 2, 64);
+        uint32_t* ds = nullptr;
+        uint32_t* dd = nullptr;
+        CUDA_CHECK(cudaMalloc(&ds, nc * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&dd, nc * sizeof(uint32_t)));
+        if (d_coo_src && coo_watermark > 0) {
+            CUDA_CHECK(cudaMemcpy(ds, d_coo_src,
+                coo_watermark * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(dd, d_coo_dst,
+                coo_watermark * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+        }
+        if (d_coo_src) CUDA_CHECK(cudaFree(d_coo_src));
+        if (d_coo_dst) CUDA_CHECK(cudaFree(d_coo_dst));
+        d_coo_src = ds;
+        d_coo_dst = dd;
+        coo_cap = nc;
+    }
+
     void grow_foam_aabbs(int required) {
         if ((size_t)required <= foam_aabb_cap_) return;
         const size_t nc = std::max<size_t>(required * 2, 8);
@@ -551,11 +638,13 @@ private:
         realloc_ints(d_foam_colidx_start);
         realloc_ints(d_foam_particle_start);
         realloc_ints(d_foam_active_start);
+        realloc_ints(d_foam_coo_start);
         h_foam_bvh_start.resize(nc, 0);
         h_foam_rowptr_start.resize(nc, 0);
         h_foam_colidx_start.resize(nc, 0);
         h_foam_particle_start.resize(nc, 0);
         h_foam_active_start.resize(nc, 0);
+        h_foam_coo_start.resize(nc, 0);
         offset_table_cap = nc;
     }
 
@@ -568,6 +657,7 @@ private:
             h_foam_colidx_start[id]   = s.csr_edge_offset;
             h_foam_particle_start[id] = s.particle_offset;
             h_foam_active_start[id]   = s.active_offset;
+            h_foam_coo_start[id]      = s.coo_offset;
         }
         CUDA_CHECK(cudaMemcpy(d_foam_bvh_start, h_foam_bvh_start.data(),
             num_foams * sizeof(int), cudaMemcpyHostToDevice));
@@ -578,6 +668,8 @@ private:
         CUDA_CHECK(cudaMemcpy(d_foam_particle_start, h_foam_particle_start.data(),
             num_foams * sizeof(int), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_foam_active_start, h_foam_active_start.data(),
+            num_foams * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_foam_coo_start, h_foam_coo_start.data(),
             num_foams * sizeof(int), cudaMemcpyHostToDevice));
     }
 
@@ -592,12 +684,15 @@ private:
         f(d_particle_aabbs);      d_particle_aabbs      = nullptr;
         f(d_active_ids);          d_active_ids          = nullptr;
         f(d_foam_aabbs);          d_foam_aabbs          = nullptr;
+        f(d_coo_src);             d_coo_src             = nullptr;
+        f(d_coo_dst);             d_coo_dst             = nullptr;
         f(d_foam_bvh_start);      d_foam_bvh_start      = nullptr;
         f(d_foam_rowptr_start);   d_foam_rowptr_start   = nullptr;
         f(d_foam_colidx_start);   d_foam_colidx_start   = nullptr;
         f(d_foam_particle_start); d_foam_particle_start = nullptr;
         f(d_foam_active_start);   d_foam_active_start   = nullptr;
-        bvh_cap = csr_node_cap = csr_edge_cap = particle_cap = active_cap = foam_aabb_cap_ = offset_table_cap = 0;
+        f(d_foam_coo_start);      d_foam_coo_start      = nullptr;
+        bvh_cap = csr_node_cap = csr_edge_cap = particle_cap = active_cap = coo_cap = foam_aabb_cap_ = offset_table_cap = 0;
     }
 };
 

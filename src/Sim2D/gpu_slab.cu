@@ -93,8 +93,7 @@ static __global__ void k_gather(
     if (i < n) dst[i] = src[indices[i]];
 }
 
-void GpuSlabAllocator::bulkMortonSort(int foam_id, int n_particles,
-                                       std::vector<uint32_t>& h_perm_out)
+void GpuSlabAllocator::bulkMortonSort(int foam_id, int n_particles)
 {
     if (n_particles <= 0) return;
     const FoamSlot& s = slots.at(foam_id);
@@ -133,13 +132,7 @@ void GpuSlabAllocator::bulkMortonSort(int foam_id, int n_particles,
         d_perm_in,   d_perm_out,
         n_particles);
 
-    // Step 4: copy permutation to host — render() needs it to upload positions
-    //         in the same Morton order every frame.
-    h_perm_out.resize(n_particles);
-    CUDA_CHECK(cudaMemcpy(h_perm_out.data(), d_perm_out,
-        n_particles * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-    // Step 5: gather every per-particle slab buffer into Morton order.
+    // Step 4: gather every per-particle slab buffer into Morton order.
     AABB*      d_aabb_tmp = nullptr;
     glm::vec4* d_col_tmp  = nullptr;
     glm::vec3* d_pos_tmp  = nullptr;

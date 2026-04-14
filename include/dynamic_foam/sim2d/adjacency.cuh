@@ -270,4 +270,33 @@ private:
     }
 };
 
+// =============================================================================
+// buildGPUAdjacencyListFromSlab
+//
+// Fully GPU-resident CSR adjacency builder.  All inputs are device pointers.
+// The only CPU↔GPU traffic is one scalar D2H read (run-length encode count).
+//
+//   d_sorted_ids          — N Morton-sorted entity IDs
+//                           (d_active_ids + slot.active_offset).
+//   N                     — particle / node count.
+//   d_coo_src / d_coo_dst — E directed edge pairs in raw entity-ID space
+//                           (d_coo_src/dst + slot.coo_offset).
+//   E                     — directed edge count.
+//   d_nbrs_slice          — slab colidx slice (size >= E); NOT freed by out.free().
+//   d_node_offsets_slice  — slab rowptr slice (size >= N+1); NOT freed by out.free().
+//   stream                — CUDA stream for all kernel/cub work.
+// =============================================================================
+void buildGPUAdjacencyListFromSlab(
+    AdjacencyListGPU& out,
+    const uint32_t*   d_sorted_ids,
+    uint32_t          N,
+    const uint32_t*   d_coo_src,
+    const uint32_t*   d_coo_dst,
+    uint32_t          E,
+    uint32_t*         d_nbrs_slice,
+    size_t            nbrs_cap,
+    uint32_t*         d_node_offsets_slice,
+    size_t            node_offsets_cap,
+    cudaStream_t      stream = 0);
+
 } // namespace DynamicFoam::Sim2D

@@ -115,87 +115,57 @@ namespace DynamicFoam::Sim2D {
 
             // Allocate a 2×-overcommitted slab slot.
             gpuSlab.allocate(foam_id, num_bvh_nodes, N + 1, E, N);
-            const FoamSlot& slot = gpuSlab.slots.at(foam_id);
 
-            // Build GPU CSR into slab slice and bias offsets.
-            adj.buildGPUAdjacencyList(
-                foamGpuAdj[foam_id],
-                gpuSlab.d_csr_colidx + slot.csr_edge_offset,
-                static_cast<size_t>(slot.csr_edge_capacity),
-                gpuSlab.d_csr_rowptr + slot.csr_node_offset,
-                static_cast<size_t>(slot.csr_node_capacity));
-            gpuSlab.biasCsrOffsets(foam_id);
+            // Stage COO edge data into the slab so GPU adjacency kernels can
+            // consume it directly without a per-build H2D transfer.
+            gpuSlab.stageCOOData(foam_id,
+                adj.getCOOSrc().data(), adj.getCOODst().data(), E);
 
-            // Bulk-upload all particle data (AABBs, colors, positions, surface mask)
-            // and Morton-sort every buffer together in a single pass.
+            // Bulk-upload particle data and Morton-sort every buffer together.
+            // After this call d_active_ids is Morton-sorted and slot.active_count is set.
             stageParticleData(static_cast<entt::entity>(foam_id));
 
             // Build BVH using the now Morton-sorted particle AABBs.
+            const FoamSlot& slot = gpuSlab.slots.at(foam_id);
             foamBVHs[foam_id].build(
                 gpuSlab.d_particle_aabbs + slot.particle_offset, N,
                 gpuSlab.d_bvh_nodes + slot.bvh_offset,
                 slot.bvh_capacity);
 
-            // Rebuild the CSR in Morton order so that CSR row i and neighbor
-            // column indices are both Morton positions, matching prim_idx from
-            // the BVH leaves and the layout of all other slab particle arrays.
-            rebuildSlabCsrMortonOrder(foam_id);
+            // Build the GPU CSR from the Morton-sorted d_active_ids and the
+            // pre-staged d_coo_src/dst — no H2D uploads needed.
+            rebuildSlabAdj(foam_id);
         }
     }
 
     // -------------------------------------------------------------------------
-    // rebuildSlabCsrMortonOrder
+    // rebuildSlabAdj
     //
-    // Rebuilds the GPU CSR for one foam using the Morton permutation stored in
-    // foamMortonPerms[foam_id].  After bulkMortonSort all particle slab buffers
-    // (AABBs, positions, colors, surface mask) are reordered so that GPU buffer
-    // index i corresponds to Morton position i.  The BVH is then built on top
-    // of that Morton-sorted AABB array, so every leaf's prim_idx is also a
-    // Morton position.  The CSR must use the same indexing convention:
-    //   - CSR row i  → node at Morton position i
-    //   - CSR column indices → Morton positions of neighbors
-    // buildGPUAdjacencyList accepts a sorted_ids parameter that re-orders the
-    // build entirely, so we pass the Morton-permuted node-ID list directly.
+    // Rebuilds the GPU CSR for one foam directly from the slab's device-resident
+    // data: d_active_ids (Morton-sorted, written by bulkMortonSort) and
+    // d_coo_src/dst (staged by stageCOOData).  No H2D transfers.
+    // Replaces the old rebuildSlabCsrMortonOrder + foamMortonPerms machinery.
     // -------------------------------------------------------------------------
-    void Simulation::rebuildSlabCsrMortonOrder(int foam_id) {
+    void Simulation::rebuildSlabAdj(int foam_id) {
         auto it = gpuSlab.slots.find(foam_id);
         if (it == gpuSlab.slots.end() || it->second.dead) return;
-        const auto permIt = foamMortonPerms.find(foam_id);
-        if (permIt == foamMortonPerms.end()) return;
-
-        const auto& adj     = foamAdjacencyLists.at(foam_id);
-        const auto& ordered = adj.getOrderedNodeIds();
-        const int   N       = static_cast<int>(ordered.size());
-        const auto& perm    = permIt->second;
-
-        // Build the Morton-sorted node ID list:
-        //   morton_sorted_ids[i] = node whose particle data sits at slab position i.
-        std::vector<uint32_t> morton_sorted_ids(N);
-        for (int i = 0; i < N; ++i)
-            morton_sorted_ids[i] = ordered[perm[i]];
-
         const FoamSlot& slot = it->second;
-        adj.buildGPUAdjacencyList(
+        const uint32_t N = static_cast<uint32_t>(slot.active_count);
+        const uint32_t E = static_cast<uint32_t>(slot.coo_count);
+        if (N == 0 || E == 0) return;
+
+        buildGPUAdjacencyListFromSlab(
             foamGpuAdj[foam_id],
+            gpuSlab.d_active_ids + slot.active_offset,
+            N,
+            gpuSlab.d_coo_src + slot.coo_offset,
+            gpuSlab.d_coo_dst + slot.coo_offset,
+            E,
             gpuSlab.d_csr_colidx + slot.csr_edge_offset,
             static_cast<size_t>(slot.csr_edge_capacity),
             gpuSlab.d_csr_rowptr + slot.csr_node_offset,
-            static_cast<size_t>(slot.csr_node_capacity),
-            morton_sorted_ids);
+            static_cast<size_t>(slot.csr_node_capacity));
         gpuSlab.biasCsrOffsets(foam_id);
-    }
-
-    // -------------------------------------------------------------------------
-    // rebuildAllSlabCsr
-    //
-    // Rebuilds the GPU CSR adjacency for every live foam in Morton-sorted order.
-    // Must be called after gpuSlab.compact() so that the biased CSR
-    // node_offsets (which carry the old csr_edge_offset) are corrected for the
-    // new slab layout produced by compaction.
-    // -------------------------------------------------------------------------
-    void Simulation::rebuildAllSlabCsr() {
-        for (const auto& [foam_id, adj] : foamAdjacencyLists)
-            rebuildSlabCsrMortonOrder(foam_id);
     }
 
     // -------------------------------------------------------------------------
@@ -203,7 +173,7 @@ namespace DynamicFoam::Sim2D {
     //
     // Delegates the FoamUpdate (deletions then insertions) to the GPU slab.
     // The caller is responsible for rebuilding the BVH (buildBVH) and CSR
-    // (rebuildSlabCsrMortonOrder) for the affected foam after this call.
+    // (rebuildSlabAdj) for the affected foam after this call.
     // -------------------------------------------------------------------------
     void Simulation::updateParticleData(int foam_id, const FoamUpdate& update) {
         gpuSlab.updateFoamData(foam_id, update);
@@ -216,11 +186,9 @@ namespace DynamicFoam::Sim2D {
     // Builds CPU arrays for local-space AABBs, RGBA colors, world positions,
     // surface mask, and active IDs, uploads all five buffers to the GPU slab
     // via gpuSlab.stageParticleData in getOrderedNodeIds() order, then calls
-    // gpuSlab.bulkMortonSort which:
-    //   - reorders every slab buffer (AABBs, colors, positions, surface mask,
-    //     active IDs) together by local-space Morton code in a single pass,
-    //   - writes the permutation to foamMortonPerms[foam_id] so render() can
-    //     rebuild all five arrays in Morton-sorted order each frame.
+    // gpuSlab.bulkMortonSort which reorders every slab buffer by local-space
+    // Morton code.  After this call d_active_ids is Morton-sorted and
+    // slot.active_count reflects the live particle count.
     // -------------------------------------------------------------------------
     void Simulation::stageParticleData(entt::entity foamEntity) {
         const int foam_id = static_cast<int>(foamEntity);
@@ -262,16 +230,15 @@ namespace DynamicFoam::Sim2D {
                                   h_aabbs.data(), h_colors.data(), h_positions.data(),
                                   h_surface.data(), h_active_ids.data(), N);
 
-        // Bulk Morton sort: reorders all slab buffers together (including
-        // d_active_ids) and returns the permutation for per-frame position uploads.
-        foamMortonPerms[foam_id].resize(N);
-        gpuSlab.bulkMortonSort(foam_id, N, foamMortonPerms[foam_id]);
+        // Bulk Morton sort: reorders all slab buffers together (including d_active_ids)
+        // so that d_active_ids[slot.active_offset + i] = entity at Morton position i.
+        gpuSlab.bulkMortonSort(foam_id, N);
     }
 
     void Simulation::buildBVH(entt::entity foamEntity) {
         const int foam_id = static_cast<int>(foamEntity);
         auto& adj = foamAdjacencyLists.at(foam_id);
-        const int N = static_cast<int>(adj.getOrderedNodeIds().size());
+        const int N = static_cast<int>(adj.nodeCount());
         const int E = static_cast<int>(adj.getCOOSrc().size());
 
         auto it = gpuSlab.slots.find(foam_id);
@@ -280,22 +247,18 @@ namespace DynamicFoam::Sim2D {
         const int num_bvh_nodes = (N > 1) ? 2 * N - 1 : 1;
 
         // If particle count has grown beyond the 2x overcommit, tombstone the
-        // old slot and allocate a larger one.  The CSR must also be rebuilt
-        // into the new slice since the edge-block start offset has changed.
+        // old slot and allocate a larger one.
         if (gpuSlab.needsResize(foam_id, num_bvh_nodes, N + 1, E, N)) {
             gpuSlab.resize(foam_id, num_bvh_nodes, N + 1, E, N);
-            const FoamSlot& newSlot = gpuSlab.slots.at(foam_id);
-            adj.buildGPUAdjacencyList(
-                foamGpuAdj[foam_id],
-                gpuSlab.d_csr_colidx + newSlot.csr_edge_offset,
-                static_cast<size_t>(newSlot.csr_edge_capacity),
-                gpuSlab.d_csr_rowptr + newSlot.csr_node_offset,
-                static_cast<size_t>(newSlot.csr_node_capacity));
-            gpuSlab.biasCsrOffsets(foam_id);
         }
+
+        // Always re-stage COO: topology changes may have modified the edge set.
+        gpuSlab.stageCOOData(foam_id,
+            adj.getCOOSrc().data(), adj.getCOODst().data(), E);
 
         // Bulk-upload all particle data (AABBs, colors, positions, surface mask)
         // and Morton-sort every buffer together in a single pass.
+        // After this call d_active_ids is Morton-sorted and slot.active_count is set.
         stageParticleData(foamEntity);
 
         // Build BVH using the now Morton-sorted particle AABBs.
@@ -305,9 +268,9 @@ namespace DynamicFoam::Sim2D {
             gpuSlab.d_bvh_nodes + slot.bvh_offset,
             slot.bvh_capacity);
 
-        // Rebuild the CSR in Morton order so that CSR row / column indices
-        // are Morton positions, consistent with prim_idx and all other slab buffers.
-        rebuildSlabCsrMortonOrder(foam_id);
+        // Build the GPU CSR from the Morton-sorted d_active_ids and the
+        // pre-staged d_coo_src/dst — no H2D uploads needed.
+        rebuildSlabAdj(foam_id);
     }
 
     void Simulation::applyForwardKinematics(
@@ -499,14 +462,13 @@ namespace DynamicFoam::Sim2D {
         updateTopology();
 
         // Compact dead slab regions accumulated from prior resizes.
-        // compact() D->D packs BVH/CSR/particle data and resets watermarks,
-        // but invalidates the biased CSR node_offsets (they were biased by the
-        // old csr_edge_offsets); rebuildAllSlabCsr() rewrites them correctly.
-        // BVH nodes contain only foam-local indices so their D->D move is valid
-        // as-is; no BVH rebuild is needed after compaction.
+        // compact() D->D packs BVH/CSR/COO/particle data and resets watermarks,
+        // but invalidates the biased CSR node_offsets; rebuildSlabAdj() rewrites
+        // them correctly using the already-moved d_active_ids and d_coo_src/dst.
         if (gpuSlab.needsCompaction()) {
             gpuSlab.compact();
-            rebuildAllSlabCsr();
+            for (const auto& [foam_id, _] : foamAdjacencyLists)
+                rebuildSlabAdj(foam_id);
         }
 
         updatePhysics(deltaTime);
