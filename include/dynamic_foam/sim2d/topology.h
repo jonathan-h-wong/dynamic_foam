@@ -28,7 +28,7 @@ namespace DynamicFoam::Sim2D {
     };
 
     // Describes a single foam that was structurally modified by Topology::update.
-    struct TopologyUpdateResult {
+    struct FoamTopologyUpdate {
         // The foam whose topology changed.
         entt::entity foamId;
         // Snapshot of the parent foam taken before mutations were applied.
@@ -45,10 +45,10 @@ namespace DynamicFoam::Sim2D {
         ~Topology() = default;
 
         // Returns one result per foam that was structurally modified this tick.
-        std::vector<TopologyUpdateResult> update(
+        std::vector<FoamTopologyUpdate> update(
             const GpuSlabAllocator&                              gpuSlab,
             std::unordered_map<int, AdjacencyList>&              foamAdjacencyLists,
-            entt::registry&                                      foamRegistry,
+            const std::unordered_map<int, glm::mat4>&            foamTransforms,
             entt::registry&                                      particleRegistry
         );
     };

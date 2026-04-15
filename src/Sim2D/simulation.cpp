@@ -336,7 +336,14 @@ namespace DynamicFoam::Sim2D {
     }
 
     void Simulation::updateTopology() {
-        const auto results = topologySubsystem.update(gpuSlab, foamAdjacencyLists, foamRegistry, particleRegistry);
+        std::unordered_map<int, glm::mat4> foamTransforms;
+        foamRegistry.view<const Position, const Orientation>().each(
+            [&](entt::entity e, const Position& pos, const Orientation& orient) {
+                foamTransforms[static_cast<int>(e)] =
+                    glm::translate(glm::mat4(1.f), pos.value) * glm::mat4_cast(orient.value);
+            });
+
+        const auto results = topologySubsystem.update(gpuSlab, foamAdjacencyLists, foamTransforms, particleRegistry);
         for (const auto& result : results) {
             // Rebuild BVH from current ParticleVertices in the registry.
             // stageParticleData (called inside buildBVH) reads ParticleLocalPosition
@@ -400,7 +407,24 @@ namespace DynamicFoam::Sim2D {
     }
 
     void Simulation::updatePhysics(float deltaTime) {
-        const auto updatedFoams = physicsSubsystem.update(gpuSlab, foamAdjacencyLists, foamRegistry, particleRegistry, deltaTime);
+        // Build the same read-only transform map used by render() and updateTopology().
+        std::unordered_map<int, glm::mat4> foamTransforms;
+        foamRegistry.view<const Position, const Orientation>().each(
+            [&](entt::entity e, const Position& pos, const Orientation& orient) {
+                foamTransforms[static_cast<int>(e)] =
+                    glm::translate(glm::mat4(1.f), pos.value) * glm::mat4_cast(orient.value);
+            });
+
+        const auto results = physicsSubsystem.update(gpuSlab, foamAdjacencyLists, foamTransforms, particleRegistry, deltaTime);
+
+        // Publish the integrated state back into the registry.
+        // Simulation holds exclusive write privileges over foamRegistry.
+        for (const auto& r : results) {
+            foamRegistry.emplace_or_replace<Position>(r.foamId,        r.position);
+            foamRegistry.emplace_or_replace<Velocity>(r.foamId,        r.velocity);
+            foamRegistry.emplace_or_replace<Orientation>(r.foamId,     r.orientation);
+            foamRegistry.emplace_or_replace<AngularVelocity>(r.foamId, r.angularVelocity);
+        }
     }
 
     void Simulation::render() {
