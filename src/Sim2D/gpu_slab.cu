@@ -201,14 +201,36 @@ static __global__ void k_build_del_flags(
     d_flags[i] = keep;
 }
 
+// For each directed edge at position i, set d_flags[i] = 1 (keep) unless either
+// its source or destination particle ID appears in the del_ids array (dropped).
+static __global__ void k_build_edge_del_flags(
+    const uint32_t* __restrict__ coo_src,
+    const uint32_t* __restrict__ coo_dst,
+    const uint32_t* __restrict__ del_ids,
+    uint8_t*        __restrict__ d_flags,
+    int             n_edges,
+    int             n_dels)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_edges) return;
+    const uint32_t src = coo_src[i];
+    const uint32_t dst = coo_dst[i];
+    uint8_t keep = 1;
+    for (int j = 0; j < n_dels; ++j) {
+        if (del_ids[j] == src || del_ids[j] == dst) { keep = 0; break; }
+    }
+    d_flags[i] = keep;
+}
+
 void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
 {
     auto it = slots.find(foam_id);
     if (it == slots.end() || it->second.dead) return;
 
-    const int n_dels = static_cast<int>(update.particle_id_dels.size());
-    const int n_ins  = static_cast<int>(update.particle_position_ins.size());
-    if (n_dels == 0 && n_ins == 0) return;
+    const int n_dels    = static_cast<int>(update.particle_id_dels.size());
+    const int n_ins     = static_cast<int>(update.particle_position_ins.size());
+    const int n_coo_ins = static_cast<int>(update.coo_src_ins.size());
+    if (n_dels == 0 && n_ins == 0 && n_coo_ins == 0) return;
 
     int cur_count = it->second.active_count;
 
@@ -278,6 +300,47 @@ void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
 
         s.active_count = cur_count;
 
+        // -----------------------------------------------------------------
+        // COO edge deletion — compact both COO arrays, dropping any edge
+        // whose src or dst ID appears in the deletion set.
+        // -----------------------------------------------------------------
+        const int cur_coo_count = s.coo_count;
+        if (cur_coo_count > 0) {
+            uint8_t* d_edge_flags = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_edge_flags, cur_coo_count * sizeof(uint8_t)));
+            k_build_edge_del_flags<<<grid_size(cur_coo_count), 256>>>(
+                d_coo_src + s.coo_offset,
+                d_coo_dst + s.coo_offset,
+                d_del_ids, d_edge_flags, cur_coo_count, n_dels);
+            CUDA_CHECK(cudaGetLastError());
+
+            uint32_t* d_coo_src_tmp = nullptr;
+            uint32_t* d_coo_dst_tmp = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_coo_src_tmp, cur_coo_count * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_coo_dst_tmp, cur_coo_count * sizeof(uint32_t)));
+            int* d_coo_selected = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_coo_selected, sizeof(int)));
+
+            CUB_CALL(cub::DeviceSelect::Flagged,
+                d_coo_src + s.coo_offset, d_edge_flags, d_coo_src_tmp, d_coo_selected, cur_coo_count);
+            CUB_CALL(cub::DeviceSelect::Flagged,
+                d_coo_dst + s.coo_offset, d_edge_flags, d_coo_dst_tmp, d_coo_selected, cur_coo_count);
+
+            int new_coo_count = 0;
+            CUDA_CHECK(cudaMemcpy(&new_coo_count, d_coo_selected, sizeof(int), cudaMemcpyDeviceToHost));
+
+            CUDA_CHECK(cudaMemcpy(d_coo_src + s.coo_offset, d_coo_src_tmp,
+                new_coo_count * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_coo_dst + s.coo_offset, d_coo_dst_tmp,
+                new_coo_count * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            s.coo_count = new_coo_count;
+
+            CUDA_CHECK(cudaFree(d_edge_flags));
+            CUDA_CHECK(cudaFree(d_coo_src_tmp));
+            CUDA_CHECK(cudaFree(d_coo_dst_tmp));
+            CUDA_CHECK(cudaFree(d_coo_selected));
+        }
+
         CUDA_CHECK(cudaFree(d_del_ids));
         CUDA_CHECK(cudaFree(d_flags));
         CUDA_CHECK(cudaFree(d_num_selected));
@@ -298,15 +361,20 @@ void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
             // watermark, preserving the surviving particle data via D→D copy.
             const int old_particle_offset = s.particle_offset;
             const int old_active_offset   = s.active_offset;
+            const int old_coo_offset      = s.coo_offset;
+            const int old_coo_count       = s.coo_count;
 
             // Halve the stored (doubled) capacities back to the original counts
             // so that allocate() doubles them again correctly.
             const int bvh_nodes = s.bvh_capacity      / 2;
             const int csr_nodes = s.csr_node_capacity / 2;
             const int csr_edges = s.csr_edge_capacity / 2;
+            // Ensure the new COO slice can hold existing + incoming edges so
+            // Phase 3 (COO insertion) won't need a second resize.
+            const int coo_need  = old_coo_count + n_coo_ins;
 
             s.dead = true;
-            allocate(foam_id, bvh_nodes, csr_nodes, csr_edges, new_count);
+            allocate(foam_id, bvh_nodes, csr_nodes, csr_edges, new_count, coo_need);
             FoamSlot& ns = slots.at(foam_id); // re-fetch: allocate() overwrites the map entry
 
             // Copy post-deletion particles from old slot to new slot.
@@ -322,6 +390,14 @@ void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
                 CUDA_CHECK(cudaMemcpy(d_active_ids            + ns.active_offset,
                     d_active_ids            + old_active_offset,   cur_count * sizeof(uint32_t),  cudaMemcpyDeviceToDevice));
             }
+            // Copy surviving COO edges from old slot to new slot.
+            if (old_coo_count > 0) {
+                CUDA_CHECK(cudaMemcpy(d_coo_src + ns.coo_offset,
+                    d_coo_src + old_coo_offset, old_coo_count * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_coo_dst + ns.coo_offset,
+                    d_coo_dst + old_coo_offset, old_coo_count * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            }
+            ns.coo_count = old_coo_count;
         }
 
         // Append new particles immediately after the surviving ones.
@@ -341,6 +417,66 @@ void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
             update.particle_active_ids_ins.data(),      n_ins * sizeof(uint32_t),  cudaMemcpyHostToDevice));
 
         sn.active_count = new_count;
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 3: COO edge insertions
+    // -------------------------------------------------------------------------
+    if (n_coo_ins > 0) {
+        FoamSlot& s = slots.at(foam_id);
+        const int new_coo_count = s.coo_count + n_coo_ins;
+
+        if (new_coo_count > s.coo_capacity) {
+            // COO slice is too small.  Tombstone and re-allocate a larger one,
+            // preserving both the surviving particle data and COO edge data.
+            const int old_particle_offset = s.particle_offset;
+            const int old_active_offset   = s.active_offset;
+            const int old_coo_offset      = s.coo_offset;
+            const int old_coo_count       = s.coo_count;
+            const int cur_particle_count  = s.active_count;
+
+            const int bvh_nodes  = s.bvh_capacity      / 2;
+            const int csr_nodes  = s.csr_node_capacity / 2;
+            const int csr_edges  = s.csr_edge_capacity / 2;
+            const int part_nodes = s.particle_capacity / 2;
+
+            s.dead = true;
+            allocate(foam_id, bvh_nodes, csr_nodes, csr_edges, part_nodes, new_coo_count);
+            FoamSlot& ns = slots.at(foam_id);
+
+            // Copy surviving particle data from old slot to new slot.
+            if (cur_particle_count > 0) {
+                CUDA_CHECK(cudaMemcpy(d_particle_aabbs        + ns.particle_offset,
+                    d_particle_aabbs        + old_particle_offset, cur_particle_count * sizeof(AABB),      cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_particle_colors       + ns.particle_offset,
+                    d_particle_colors       + old_particle_offset, cur_particle_count * sizeof(glm::vec4), cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_particle_positions    + ns.particle_offset,
+                    d_particle_positions    + old_particle_offset, cur_particle_count * sizeof(glm::vec3), cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_particle_surface_mask + ns.particle_offset,
+                    d_particle_surface_mask + old_particle_offset, cur_particle_count * sizeof(uint8_t),   cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_active_ids            + ns.active_offset,
+                    d_active_ids            + old_active_offset,   cur_particle_count * sizeof(uint32_t),  cudaMemcpyDeviceToDevice));
+            }
+            ns.active_count = cur_particle_count;
+
+            // Copy surviving COO edges from old slot to new slot.
+            if (old_coo_count > 0) {
+                CUDA_CHECK(cudaMemcpy(d_coo_src + ns.coo_offset,
+                    d_coo_src + old_coo_offset, old_coo_count * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(d_coo_dst + ns.coo_offset,
+                    d_coo_dst + old_coo_offset, old_coo_count * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            }
+            ns.coo_count = old_coo_count;
+        }
+
+        // Append new COO edges immediately after the surviving ones.
+        FoamSlot& sn = slots.at(foam_id);
+        const int insert_coo_pos = sn.coo_offset + sn.coo_count;
+        CUDA_CHECK(cudaMemcpy(d_coo_src + insert_coo_pos,
+            update.coo_src_ins.data(), n_coo_ins * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_coo_dst + insert_coo_pos,
+            update.coo_dst_ins.data(), n_coo_ins * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        sn.coo_count = new_coo_count;
     }
 }
 } // namespace DynamicFoam::Sim2D

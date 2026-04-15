@@ -92,6 +92,12 @@ struct FoamUpdate {
     // Deletion buffer — entity IDs of particles to remove:
     std::vector<uint32_t> particle_id_dels;
 
+    // Edge insertion buffers — directed COO edges to append after deletions.
+    // An edge (coo_src_ins[i], coo_dst_ins[i]) is appended to the slab COO
+    // buffers.  Both vectors must be the same length.
+    std::vector<uint32_t> coo_src_ins;
+    std::vector<uint32_t> coo_dst_ins;
+
     FoamUpdate() = default;
 
     FoamUpdate(
