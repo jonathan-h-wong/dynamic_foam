@@ -434,6 +434,34 @@ public:
     // -------------------------------------------------------------------------
     void updateFoamData(int foam_id, const FoamUpdate& update);
 
+    // -------------------------------------------------------------------------
+    // copyFoamData — D→D copy of a foam slot's data to a freshly allocated
+    // destination slot (dst_foam_id must not yet exist in the registry).
+    //
+    // Full copy  (h_particle_ids == nullptr  ||  n_ids == 0):
+    //   Allocates a dst slot sized to the src's live particle / edge counts and
+    //   copies all five particle arrays, both COO arrays, the BVH node array,
+    //   and the CSR rowptr + colidx arrays verbatim.
+    //
+    // Conditional copy  (h_particle_ids != nullptr  &&  n_ids > 0):
+    //   Allocates a dst slot sized to the number of matching particles and
+    //   surviving edges found on the GPU.
+    //   • Particle arrays: stream-compacted to only those entries whose entity
+    //     ID (from d_active_ids) appears in h_particle_ids.  Because the src
+    //     slot is Morton-sorted, the compacted subset retains Morton order.
+    //   • COO arrays: stream-compacted to edges where either src or dst ID is
+    //     in the set.
+    //   • BVH and CSR are NOT copied — the caller must rebuild them after this
+    //     call (e.g. via buildBVH / buildGPUAdjacencyList + biasCsrOffsets).
+    //     The dst slot is still allocated with appropriately-sized BVH/CSR
+    //     regions so those rebuild calls need not trigger a resize.
+    //
+    // Implemented in gpu_slab.cu (requires nvcc).
+    // -------------------------------------------------------------------------
+    void copyFoamData(int src_foam_id, int dst_foam_id,
+                      const uint32_t* h_particle_ids = nullptr,
+                      int n_ids = 0);
+
     // Bulk Morton sort — the single entry point for all foam data ordering.
     //
     // Requires that d_particle_aabbs, d_particle_colors, d_particle_positions,

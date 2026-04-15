@@ -182,44 +182,50 @@ void GpuSlabAllocator::bulkMortonSort(int foam_id, int n_particles)
 // updateFoamData — apply FoamUpdate (deletions then insertions)
 // =============================================================================
 
-// For each particle at position i, set d_flags[i] = 1 (keep) unless its entity
-// ID (from d_active_ids) appears in the del_ids array, in which case = 0 (drop).
-static __global__ void k_build_del_flags(
+// Generic per-particle flag kernel.
+// d_flags[i] = match_value   if active_ids[i] is found in id_set,
+// d_flags[i] = 1-match_value otherwise.
+// Set match_value=0 to flag matched particles for deletion (keep=1 by default).
+// Set match_value=1 to flag matched particles for retention (keep=0 by default).
+static __global__ void k_build_id_match_flags(
     const uint32_t* __restrict__ active_ids,
-    const uint32_t* __restrict__ del_ids,
+    const uint32_t* __restrict__ id_set,
     uint8_t*        __restrict__ d_flags,
     int             n_particles,
-    int             n_dels)
+    int             n_ids,
+    uint8_t         match_value)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_particles) return;
     const uint32_t id = active_ids[i];
-    uint8_t keep = 1;
-    for (int j = 0; j < n_dels; ++j) {
-        if (del_ids[j] == id) { keep = 0; break; }
+    uint8_t flag = 1 - match_value;
+    for (int j = 0; j < n_ids; ++j) {
+        if (id_set[j] == id) { flag = match_value; break; }
     }
-    d_flags[i] = keep;
+    d_flags[i] = flag;
 }
 
-// For each directed edge at position i, set d_flags[i] = 1 (keep) unless either
-// its source or destination particle ID appears in the del_ids array (dropped).
-static __global__ void k_build_edge_del_flags(
+// Generic per-edge flag kernel.
+// d_flags[i] = match_value   if coo_src[i] or coo_dst[i] is found in id_set,
+// d_flags[i] = 1-match_value otherwise.
+static __global__ void k_build_edge_id_match_flags(
     const uint32_t* __restrict__ coo_src,
     const uint32_t* __restrict__ coo_dst,
-    const uint32_t* __restrict__ del_ids,
+    const uint32_t* __restrict__ id_set,
     uint8_t*        __restrict__ d_flags,
     int             n_edges,
-    int             n_dels)
+    int             n_ids,
+    uint8_t         match_value)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_edges) return;
     const uint32_t src = coo_src[i];
     const uint32_t dst = coo_dst[i];
-    uint8_t keep = 1;
-    for (int j = 0; j < n_dels; ++j) {
-        if (del_ids[j] == src || del_ids[j] == dst) { keep = 0; break; }
+    uint8_t flag = 1 - match_value;
+    for (int j = 0; j < n_ids; ++j) {
+        if (id_set[j] == src || id_set[j] == dst) { flag = match_value; break; }
     }
-    d_flags[i] = keep;
+    d_flags[i] = flag;
 }
 
 void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
@@ -249,9 +255,9 @@ void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
         // Build per-particle keep-flag array (1 = keep, 0 = discard).
         uint8_t* d_flags = nullptr;
         CUDA_CHECK(cudaMalloc(&d_flags, cur_count * sizeof(uint8_t)));
-        k_build_del_flags<<<grid_size(cur_count), 256>>>(
+        k_build_id_match_flags<<<grid_size(cur_count), 256>>>(
             d_active_ids + s.active_offset,
-            d_del_ids, d_flags, cur_count, n_dels);
+            d_del_ids, d_flags, cur_count, n_dels, /*match_value=*/0);
         CUDA_CHECK(cudaGetLastError());
 
         // Temporary compacted output buffers.
@@ -308,10 +314,10 @@ void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
         if (cur_coo_count > 0) {
             uint8_t* d_edge_flags = nullptr;
             CUDA_CHECK(cudaMalloc(&d_edge_flags, cur_coo_count * sizeof(uint8_t)));
-            k_build_edge_del_flags<<<grid_size(cur_coo_count), 256>>>(
+            k_build_edge_id_match_flags<<<grid_size(cur_coo_count), 256>>>(
                 d_coo_src + s.coo_offset,
                 d_coo_dst + s.coo_offset,
-                d_del_ids, d_edge_flags, cur_coo_count, n_dels);
+                d_del_ids, d_edge_flags, cur_coo_count, n_dels, /*match_value=*/0);
             CUDA_CHECK(cudaGetLastError());
 
             uint32_t* d_coo_src_tmp = nullptr;
@@ -479,4 +485,237 @@ void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
         sn.coo_count = new_coo_count;
     }
 }
+
+// =============================================================================
+// copyFoamData — D→D clone of one foam slot into a new slot.
+// =============================================================================
+
+void GpuSlabAllocator::copyFoamData(int src_foam_id, int dst_foam_id,
+                                     const uint32_t* h_particle_ids,
+                                     int n_ids)
+{
+    // Snapshot all src values before any allocate() call, since allocate()
+    // can rehash the unordered_map and invalidate any reference into it.
+    const FoamSlot src_snap = slots.at(src_foam_id);
+    const int src_n_particles  = src_snap.active_count;
+    const int src_n_coo        = src_snap.coo_count;
+    const int src_bvh_off      = src_snap.bvh_offset;
+    const int src_csr_node_off = src_snap.csr_node_offset;
+    const int src_csr_edge_off = src_snap.csr_edge_offset;
+    const int src_part_off     = src_snap.particle_offset;
+    const int src_active_off   = src_snap.active_offset;
+    const int src_coo_off      = src_snap.coo_offset;
+    const int src_csr_edges    = src_snap.csr_edge_capacity / 2; // actual directed-edge count estimate
+
+    if (h_particle_ids == nullptr || n_ids == 0) {
+        // =====================================================================
+        // Full copy — transfer all particle data, COO edges, BVH, and CSR.
+        // =====================================================================
+        const int bvh_nodes = (src_n_particles > 0) ? (2 * src_n_particles - 1) : 1;
+        const int csr_nodes = src_n_particles + 1;
+        allocate(dst_foam_id, bvh_nodes, csr_nodes, src_csr_edges,
+                 src_n_particles, src_n_coo);
+        const FoamSlot& dst = slots.at(dst_foam_id);
+
+        // Particle arrays.
+        if (src_n_particles > 0) {
+            CUDA_CHECK(cudaMemcpy(d_particle_aabbs        + dst.particle_offset,
+                d_particle_aabbs        + src_part_off,
+                src_n_particles * sizeof(AABB),      cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_particle_colors       + dst.particle_offset,
+                d_particle_colors       + src_part_off,
+                src_n_particles * sizeof(glm::vec4), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_particle_positions    + dst.particle_offset,
+                d_particle_positions    + src_part_off,
+                src_n_particles * sizeof(glm::vec3), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_particle_surface_mask + dst.particle_offset,
+                d_particle_surface_mask + src_part_off,
+                src_n_particles * sizeof(uint8_t),   cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_active_ids            + dst.active_offset,
+                d_active_ids            + src_active_off,
+                src_n_particles * sizeof(uint32_t),  cudaMemcpyDeviceToDevice));
+        }
+
+        // COO edge arrays.
+        if (src_n_coo > 0) {
+            CUDA_CHECK(cudaMemcpy(d_coo_src + dst.coo_offset,
+                d_coo_src + src_coo_off, src_n_coo * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_coo_dst + dst.coo_offset,
+                d_coo_dst + src_coo_off, src_n_coo * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+        }
+
+        // BVH nodes.
+        if (bvh_nodes > 0) {
+            CUDA_CHECK(cudaMemcpy(d_bvh_nodes + dst.bvh_offset,
+                d_bvh_nodes + src_bvh_off,
+                bvh_nodes * sizeof(BVHNode), cudaMemcpyDeviceToDevice));
+        }
+
+        // CSR rowptr (n+1 entries, already biased by src's csr_edge_offset;
+        // re-bias for the new offset so indices remain globally valid).
+        if (csr_nodes > 0) {
+            CUDA_CHECK(cudaMemcpy(d_csr_rowptr + dst.csr_node_offset,
+                d_csr_rowptr + src_csr_node_off,
+                csr_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            // Adjust bias: subtract src edge offset, add dst edge offset.
+            const int bias_delta = dst.csr_edge_offset - src_csr_edge_off;
+            if (bias_delta != 0) {
+                k_bias_u32<<<grid_size(csr_nodes), 256>>>(
+                    d_csr_rowptr + dst.csr_node_offset,
+                    csr_nodes,
+                    static_cast<uint32_t>(bias_delta));
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
+
+        // CSR colidx.
+        if (src_csr_edges > 0) {
+            CUDA_CHECK(cudaMemcpy(d_csr_colidx + dst.csr_edge_offset,
+                d_csr_colidx + src_csr_edge_off,
+                src_csr_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+        }
+
+        FoamSlot& dst_mut = slots.at(dst_foam_id);
+        dst_mut.active_count = src_n_particles;
+        dst_mut.coo_count    = src_n_coo;
+
+    } else {
+        // =====================================================================
+        // Conditional copy — filter by the supplied particle ID set.
+        // =====================================================================
+
+        // Upload ID set to device.
+        uint32_t* d_id_set = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_id_set, n_ids * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemcpy(d_id_set, h_particle_ids,
+            n_ids * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+        // -----------------------------------------------------------------
+        // Step 1: compact particle arrays by ID membership.
+        // -----------------------------------------------------------------
+        uint8_t* d_part_flags = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_part_flags, src_n_particles * sizeof(uint8_t)));
+        if (src_n_particles > 0) {
+            k_build_id_match_flags<<<grid_size(src_n_particles), 256>>>(
+                d_active_ids + src_active_off,
+                d_id_set, d_part_flags, src_n_particles, n_ids, /*match_value=*/1);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        AABB*      d_aabb_tmp = nullptr;
+        glm::vec4* d_col_tmp  = nullptr;
+        glm::vec3* d_pos_tmp  = nullptr;
+        uint8_t*   d_mask_tmp = nullptr;
+        uint32_t*  d_ids_tmp  = nullptr;
+        int*       d_n_sel    = nullptr;
+        if (src_n_particles > 0) {
+            CUDA_CHECK(cudaMalloc(&d_aabb_tmp, src_n_particles * sizeof(AABB)));
+            CUDA_CHECK(cudaMalloc(&d_col_tmp,  src_n_particles * sizeof(glm::vec4)));
+            CUDA_CHECK(cudaMalloc(&d_pos_tmp,  src_n_particles * sizeof(glm::vec3)));
+            CUDA_CHECK(cudaMalloc(&d_mask_tmp, src_n_particles * sizeof(uint8_t)));
+            CUDA_CHECK(cudaMalloc(&d_ids_tmp,  src_n_particles * sizeof(uint32_t)));
+        }
+        CUDA_CHECK(cudaMalloc(&d_n_sel, sizeof(int)));
+
+        int n_surviving = 0;
+        if (src_n_particles > 0) {
+            CUB_CALL(cub::DeviceSelect::Flagged,
+                d_particle_aabbs        + src_part_off,   d_part_flags, d_aabb_tmp, d_n_sel, src_n_particles);
+            CUB_CALL(cub::DeviceSelect::Flagged,
+                d_particle_colors       + src_part_off,   d_part_flags, d_col_tmp,  d_n_sel, src_n_particles);
+            CUB_CALL(cub::DeviceSelect::Flagged,
+                d_particle_positions    + src_part_off,   d_part_flags, d_pos_tmp,  d_n_sel, src_n_particles);
+            CUB_CALL(cub::DeviceSelect::Flagged,
+                d_particle_surface_mask + src_part_off,   d_part_flags, d_mask_tmp, d_n_sel, src_n_particles);
+            CUB_CALL(cub::DeviceSelect::Flagged,
+                d_active_ids            + src_active_off, d_part_flags, d_ids_tmp,  d_n_sel, src_n_particles);
+            CUDA_CHECK(cudaMemcpy(&n_surviving, d_n_sel, sizeof(int), cudaMemcpyDeviceToHost));
+        }
+
+        // -----------------------------------------------------------------
+        // Step 2: compact COO edges — keep if either endpoint is in the set.
+        // -----------------------------------------------------------------
+        uint32_t* d_coo_src_tmp = nullptr;
+        uint32_t* d_coo_dst_tmp = nullptr;
+        int n_surviving_edges = 0;
+        if (src_n_coo > 0) {
+            uint8_t* d_edge_flags = nullptr;
+            int*     d_e_sel      = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_edge_flags, src_n_coo * sizeof(uint8_t)));
+            CUDA_CHECK(cudaMalloc(&d_e_sel, sizeof(int)));
+            CUDA_CHECK(cudaMalloc(&d_coo_src_tmp, src_n_coo * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_coo_dst_tmp, src_n_coo * sizeof(uint32_t)));
+
+            k_build_edge_id_match_flags<<<grid_size(src_n_coo), 256>>>(
+                d_coo_src + src_coo_off,
+                d_coo_dst + src_coo_off,
+                d_id_set, d_edge_flags, src_n_coo, n_ids, /*match_value=*/1);
+            CUDA_CHECK(cudaGetLastError());
+
+            CUB_CALL(cub::DeviceSelect::Flagged,
+                d_coo_src + src_coo_off, d_edge_flags, d_coo_src_tmp, d_e_sel, src_n_coo);
+            CUB_CALL(cub::DeviceSelect::Flagged,
+                d_coo_dst + src_coo_off, d_edge_flags, d_coo_dst_tmp, d_e_sel, src_n_coo);
+            CUDA_CHECK(cudaMemcpy(&n_surviving_edges, d_e_sel, sizeof(int), cudaMemcpyDeviceToHost));
+
+            CUDA_CHECK(cudaFree(d_edge_flags));
+            CUDA_CHECK(cudaFree(d_e_sel));
+        }
+
+        // -----------------------------------------------------------------
+        // Step 3: allocate dst slot sized to surviving counts.
+        //   BVH/CSR regions are reserved (caller must rebuild) but not filled.
+        // -----------------------------------------------------------------
+        const int bvh_nodes = (n_surviving > 0) ? (2 * n_surviving - 1) : 1;
+        const int csr_nodes = n_surviving + 1;
+        // Re-use the src foam's CSR edge density as a rough upper bound for
+        // the new slot's CSR edge capacity.
+        const int csr_edges_est = (src_n_particles > 0)
+            ? static_cast<int>(static_cast<int64_t>(src_csr_edges) * n_surviving
+                               / src_n_particles) + 1
+            : 0;
+        allocate(dst_foam_id, bvh_nodes, csr_nodes, csr_edges_est,
+                 n_surviving, n_surviving_edges);
+        FoamSlot& dst = slots.at(dst_foam_id);
+
+        // Copy compacted particle arrays into the new slot.
+        if (n_surviving > 0) {
+            CUDA_CHECK(cudaMemcpy(d_particle_aabbs        + dst.particle_offset,
+                d_aabb_tmp, n_surviving * sizeof(AABB),      cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_particle_colors       + dst.particle_offset,
+                d_col_tmp,  n_surviving * sizeof(glm::vec4), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_particle_positions    + dst.particle_offset,
+                d_pos_tmp,  n_surviving * sizeof(glm::vec3), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_particle_surface_mask + dst.particle_offset,
+                d_mask_tmp, n_surviving * sizeof(uint8_t),   cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_active_ids            + dst.active_offset,
+                d_ids_tmp,  n_surviving * sizeof(uint32_t),  cudaMemcpyDeviceToDevice));
+        }
+
+        // Copy compacted COO edges into the new slot.
+        if (n_surviving_edges > 0) {
+            CUDA_CHECK(cudaMemcpy(d_coo_src + dst.coo_offset,
+                d_coo_src_tmp, n_surviving_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_coo_dst + dst.coo_offset,
+                d_coo_dst_tmp, n_surviving_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+        }
+
+        FoamSlot& dst_mut = slots.at(dst_foam_id);
+        dst_mut.active_count = n_surviving;
+        dst_mut.coo_count    = n_surviving_edges;
+
+        // Free temporaries.
+        CUDA_CHECK(cudaFree(d_id_set));
+        CUDA_CHECK(cudaFree(d_part_flags));
+        CUDA_CHECK(cudaFree(d_n_sel));
+        if (d_aabb_tmp)     CUDA_CHECK(cudaFree(d_aabb_tmp));
+        if (d_col_tmp)      CUDA_CHECK(cudaFree(d_col_tmp));
+        if (d_pos_tmp)      CUDA_CHECK(cudaFree(d_pos_tmp));
+        if (d_mask_tmp)     CUDA_CHECK(cudaFree(d_mask_tmp));
+        if (d_ids_tmp)      CUDA_CHECK(cudaFree(d_ids_tmp));
+        if (d_coo_src_tmp)  CUDA_CHECK(cudaFree(d_coo_src_tmp));
+        if (d_coo_dst_tmp)  CUDA_CHECK(cudaFree(d_coo_dst_tmp));
+    }
+}
+
 } // namespace DynamicFoam::Sim2D
