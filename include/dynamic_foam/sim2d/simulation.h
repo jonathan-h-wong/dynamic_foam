@@ -43,11 +43,6 @@ class Simulation {
         CameraParams camera_;
 
     private:
-        void applyForwardKinematics(
-            entt::entity foamEntity,
-            const std::optional<std::unordered_set<entt::entity>>& particleSubset = std::nullopt
-        );
-
         // Resolves the latest cursor screen position to world space and snaps
         // all Controller foam bodies to it.  Separated from handleUserInput so
         // it can be called a second time immediately before render() to minimise
@@ -61,11 +56,13 @@ class Simulation {
         void buildBVH(entt::entity foamEntity);
 
         // Bulk upload for a single foam: builds CPU arrays for AABBs, colors,
-        // world positions, surface mask, and active IDs from the particle registry,
+        // local positions, surface mask, and active IDs from the particle registry,
         // uploads all five buffers to the GPU slab via gpuSlab.stageParticleData in
         // getOrderedNodeIds() order, then calls gpuSlab.bulkMortonSort to reorder
         // every buffer together by local-space Morton code so that d_active_ids is
         // Morton-sorted and ready for buildGPUAdjacencyListFromSlab.
+        // d_particle_positions stores local (object) space; the renderer transforms
+        // rays per-foam using foam_inv_transforms in k_exact_collision.
         // Must be called after a foam's particle data is fully populated and
         // after gpuSlab.allocate() has reserved a valid slot for the foam.
         void stageParticleData(entt::entity foamEntity);

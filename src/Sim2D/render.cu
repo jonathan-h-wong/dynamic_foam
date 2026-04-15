@@ -188,6 +188,11 @@ __global__ void k_extract_ray_idx(
 // Neighbor indices in csr_nbrs[] are foam-local sorted positions; adding
 // foam_particle_offsets[fid] converts them to global flat indices.
 //
+// Particle positions are stored in local (object) space. The world-space ray
+// is transformed into each foam's local space per-hit using foam_inv_transforms.
+// The Voronoi bisector math is coordinate-system agnostic, and t values are
+// comparable across foams because rigid transforms preserve ray arc length.
+//
 // Voronoi slab test:
 //   For each candidate surface particle P, intersect all bisector half-planes
 //   defined by P and each neighbor N. The ray hits P's Voronoi cell if the
@@ -212,6 +217,7 @@ __global__ void k_exact_collision(
     // foam_particle_offsets[fid] = start of foam fid's particles in positions/colors
     const int*            csr_offsets,
     const int*            foam_particle_offsets,
+    const glm::mat4*      foam_inv_transforms,
     const glm::vec3*      particle_positions,
     const glm::vec4*      particle_colors,
     glm::vec4*            output_buffer,
@@ -225,17 +231,28 @@ __global__ void k_exact_collision(
     const int hit_count  = ray_hit_counts[i];
     const int hit_offset = ray_hit_offsets[i];
 
-    glm::vec3 origin, dir;
-    generateRay(camera, ray_idx, width, height, origin, dir);
+    // World-space ray — generated once, transformed into each foam's local
+    // space inside the loop since different hits may belong to different foams.
+    glm::vec3 world_origin, world_dir;
+    generateRay(camera, ray_idx, width, height, world_origin, world_dir);
 
-    float    best_t        = 1e30f;
-    int      best_particle = -1;
-    int      best_foam_id  = -1;
-    uint32_t best_enter_k  = ~0u; // CSR index of the neighbor whose bisector produced t_enter
+    float     best_t            = 1e30f;
+    int       best_particle     = -1;
+    int       best_foam_id      = -1;
+    uint32_t  best_enter_k      = ~0u; // CSR index of the neighbor whose bisector produced t_enter
+    glm::vec3 best_local_origin = {};
+    glm::vec3 best_local_dir    = {};
 
     for (int j = 0; j < hit_count; ++j) {
-        const NarrowphaseHit hit   = narrowphase_hits[hit_offset + j];
-        const int            fid   = hit.foam_id;
+        const NarrowphaseHit hit = narrowphase_hits[hit_offset + j];
+        const int            fid = hit.foam_id;
+
+        // Transform ray into this foam's local space.
+        // Particle positions are in local (object) space, so the bisector
+        // test must use a consistently transformed ray.
+        const glm::mat4& inv_xform = foam_inv_transforms[fid];
+        const glm::vec3  origin    = glm::vec3(inv_xform * glm::vec4(world_origin, 1.0f));
+        const glm::vec3  dir       = glm::vec3(inv_xform * glm::vec4(world_dir,    0.0f));
 
         // particle_id is already a global flat index (biased by foam offset
         // when the narrowphase hit was written).
@@ -288,10 +305,12 @@ __global__ void k_exact_collision(
         }
 
         if (valid && t_enter <= t_exit && t_enter < best_t) {
-            best_t        = t_enter;
-            best_particle = pid;
-            best_foam_id  = fid;
-            best_enter_k  = enter_k;
+            best_t            = t_enter;
+            best_particle     = pid;
+            best_foam_id      = fid;
+            best_enter_k      = enter_k;
+            best_local_origin = origin;
+            best_local_dir    = dir;
         }
     }
 
@@ -299,7 +318,9 @@ __global__ void k_exact_collision(
         glm::vec4 out_color = particle_colors[best_particle];
 
         if (overlay.show_edges || overlay.show_centers) {
-            const glm::vec3 p_hit = origin + best_t * dir;
+            // p_hit and p_pos are in the winning foam's local space —
+            // consistent with particle_positions which are also local-space.
+            const glm::vec3 p_hit = best_local_origin + best_t * best_local_dir;
             const glm::vec3 p_pos = particle_positions[best_particle];
 
             // --- Edge overlay ---
@@ -335,7 +356,7 @@ __global__ void k_exact_collision(
                     max_margin = fmaxf(max_margin, margin);
                 }
                 // max_margin > -edge_threshold: p_hit is within edge_threshold
-                // world units of the nearest non-entry Voronoi face.
+                // local units of the nearest non-entry Voronoi face.
                 if (max_margin > -overlay.edge_threshold)
                     out_color = overlay.edge_color;
             }
@@ -547,6 +568,7 @@ void Render::update(
         slab.d_csr_colidx,
         slab.d_foam_rowptr_start,
         slab.d_foam_particle_start,
+        d_foam_inv_transforms_,
         slab.d_particle_positions,
         slab.d_particle_colors,
         d_output_buffer_,

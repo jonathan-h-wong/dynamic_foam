@@ -69,8 +69,5 @@ namespace DynamicFoam::Sim2D {
     struct ParticleLocalPosition {
         glm::vec3 value{0.0f};
     };
-    struct ParticleWorldPosition {
-        glm::vec3 value{0.0f};
-    };
 
 }

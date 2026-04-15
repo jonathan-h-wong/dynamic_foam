@@ -61,9 +61,6 @@ namespace DynamicFoam::Sim2D {
                 const auto& p_verts = foam.particleVertices.at(particleId);
                 particleRegistry.emplace<ParticleVertices>(particle, p_verts);
 
-                glm::vec3 worldPos = glm::vec3(transform * glm::vec4(localPos, 1.0f));
-                particleRegistry.emplace<ParticleWorldPosition>(particle, worldPos);
-
                 if (foam.isStencil.at(particleId)) {
                     particleRegistry.emplace<Stencil>(particle);
                 } else if (foam.isMutable.at(particleId)) {
@@ -183,12 +180,14 @@ namespace DynamicFoam::Sim2D {
     // stageParticleData
     //
     // Single entry point for all per-particle GPU data for one foam.
-    // Builds CPU arrays for local-space AABBs, RGBA colors, world positions,
+    // Builds CPU arrays for local-space AABBs, RGBA colors, local positions,
     // surface mask, and active IDs, uploads all five buffers to the GPU slab
     // via gpuSlab.stageParticleData in getOrderedNodeIds() order, then calls
     // gpuSlab.bulkMortonSort which reorders every slab buffer by local-space
     // Morton code.  After this call d_active_ids is Morton-sorted and
     // slot.active_count reflects the live particle count.
+    // d_particle_positions stores local (object) space coordinates; the renderer
+    // transforms rays into local space per-foam using foam_inv_transforms.
     // -------------------------------------------------------------------------
     void Simulation::stageParticleData(entt::entity foamEntity) {
         const int foam_id = static_cast<int>(foamEntity);
@@ -218,7 +217,7 @@ namespace DynamicFoam::Sim2D {
             const auto* o = particleRegistry.try_get<ParticleOpacity>(e);
             if (c && o) h_colors[li] = glm::vec4(c->rgb, o->value);
 
-            h_positions[li] = particleRegistry.get<ParticleWorldPosition>(e).value;
+            h_positions[li] = particleRegistry.get<ParticleLocalPosition>(e).value;
 
             if (particleRegistry.all_of<Surface>(e)) h_surface[li] = 1;
 
@@ -271,48 +270,6 @@ namespace DynamicFoam::Sim2D {
         // Build the GPU CSR from the Morton-sorted d_active_ids and the
         // pre-staged d_coo_src/dst — no H2D uploads needed.
         rebuildSlabAdj(foam_id);
-    }
-
-    void Simulation::applyForwardKinematics(
-        entt::entity foamEntity,
-        const std::optional<std::unordered_set<entt::entity>>& particleSubset
-    ) {
-        const auto& pos = foamRegistry.get<Position>(foamEntity);
-        const auto& orient = foamRegistry.get<Orientation>(foamEntity);
-
-        glm::mat4 translationMatrix = glm::translate(glm::mat4(1.0f), pos.value);
-        glm::mat4 rotationMatrix = glm::mat4_cast(orient.value);
-        glm::mat4 transform = translationMatrix * rotationMatrix;
-
-        const int foamId = static_cast<int>(foamEntity);
-        if (!foamAdjacencyLists.count(foamId)) return;
-
-        const auto& adjList = foamAdjacencyLists.at(foamId);
-        const auto allParticles = adjList.getOrderedNodeIds();  // std::vector<uint32_t>
-
-        // Build the update buffer: validate and use the subset if provided, otherwise use all particles.
-        std::vector<uint32_t> effectiveBuffer;
-        if (particleSubset.has_value()) {
-            const std::unordered_set<uint32_t> foamParticleSet(allParticles.begin(), allParticles.end());
-            for (const auto& particle : *particleSubset) {
-                uint32_t id = static_cast<uint32_t>(particle);
-                if (!foamParticleSet.count(id)) {
-                    throw std::invalid_argument(
-                        "Particle entity " + std::to_string(id) +
-                        " does not belong to foam " + std::to_string(foamId)
-                    );
-                }
-                effectiveBuffer.push_back(id);
-            }
-        } else {
-            effectiveBuffer = allParticles;
-        }
-
-        for (uint32_t pid : effectiveBuffer) {
-            auto& worldPos = particleRegistry.get<ParticleWorldPosition>(static_cast<entt::entity>(pid));
-            const auto& localPos = particleRegistry.get<ParticleLocalPosition>(static_cast<entt::entity>(pid));
-            worldPos.value = glm::vec3(transform * glm::vec4(localPos.value, 1.0f));
-        }
     }
 
     void Simulation::handleUserInput(const UserInput& input, float deltaTime) {
@@ -372,20 +329,18 @@ namespace DynamicFoam::Sim2D {
 
         foamRegistry.view<Controller, Position>().each([&](auto entity, auto& pos) {
             pos.value = glm::vec3(world_x, world_y, 0.0f);
-            applyForwardKinematics(entity);
-            // World AABB is computed on-demand from slab + transforms in step().
+            // Local-space particle positions are static; only the rigid-body
+            // Position component needs updating. The renderer reads the foam
+            // transform each frame, so no stageParticleData call is required.
         });
     }
 
     void Simulation::updateTopology() {
         const auto results = topologySubsystem.update(gpuSlab, foamAdjacencyLists, foamRegistry, particleRegistry);
         for (const auto& result : results) {
-            // Refresh world positions for the affected particles.
-            const std::unordered_set<entt::entity> particleSubset(
-                result.updatedParticles.begin(), result.updatedParticles.end());
-            applyForwardKinematics(result.foamId, particleSubset);
-
             // Rebuild BVH from current ParticleVertices in the registry.
+            // stageParticleData (called inside buildBVH) reads ParticleLocalPosition
+            // directly — no forward-kinematics pass is needed.
             // buildBVH also calls stageParticleData which reorders all slab
             // buffers by Morton, refreshes active IDs, and writes the foam's
             // local AABB into slab.d_foam_aabbs (via computeFoamAABB).
@@ -397,12 +352,19 @@ namespace DynamicFoam::Sim2D {
 
                 // --- Populate the new foam's rigid body components ---
                 // Gather per-particle data needed for several derived quantities.
+                // World positions are derived on-the-fly from local positions and the
+                // foam's current transform (set by the topology subsystem before this result).
+                const auto& snapPos    = foamRegistry.get<Position>(result.foamId);
+                const auto& snapOrient = foamRegistry.get<Orientation>(result.foamId);
+                const glm::mat4 foamTx = glm::translate(glm::mat4(1.f), snapPos.value)
+                                       * glm::mat4_cast(snapOrient.value);
+
                 std::unordered_map<entt::entity, glm::vec3> localPositions;
                 std::unordered_map<entt::entity, glm::vec3> worldPositions;
                 std::unordered_map<entt::entity, float> masses;
                 for (const auto& particle : result.updatedParticles) {
                     localPositions[particle] = particleRegistry.get<ParticleLocalPosition>(particle).value;
-                    worldPositions[particle] = particleRegistry.get<ParticleWorldPosition>(particle).value;
+                    worldPositions[particle] = glm::vec3(foamTx * glm::vec4(localPositions[particle], 1.f));
                     masses[particle] = particleRegistry.get<ParticleMass>(particle).value;
                 }
 

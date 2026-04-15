@@ -25,7 +25,6 @@
 
 #pragma once
 
-#define GLM_FORCE_CUDA
 #include <cuda_runtime.h>
 #include <glm/glm.hpp>
 
@@ -457,7 +456,7 @@ public:
     BVHNode*   d_bvh_nodes  = nullptr; ///< All foams' BVH nodes packed end-to-end.
     uint32_t*  d_csr_rowptr = nullptr; ///< All foams' CSR row pointers (per-particle neighbor-list start) packed end-to-end.
     uint32_t*  d_csr_colidx = nullptr; ///< All foams' CSR column indices (neighbor particle ids) packed end-to-end.
-    glm::vec3* d_particle_positions = nullptr; ///< Flat particle world-space positions.
+    glm::vec3* d_particle_positions = nullptr; ///< Flat particle local-space positions.
     glm::vec4* d_particle_colors    = nullptr; ///< Flat particle RGBA colors.
     uint8_t*   d_particle_surface_mask = nullptr; ///< 1 = surface particle, 0 = interior.
     AABB*      d_particle_aabbs     = nullptr; ///< Local-space per-particle AABB (BVH primitives). Indexed by particle_offset.

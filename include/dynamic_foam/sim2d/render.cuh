@@ -7,7 +7,6 @@
 
 #pragma once
 
-#define GLM_FORCE_CUDA
 #include <cuda_runtime.h>
 #include <entt/entity/registry.hpp>
 #include <glm/glm.hpp>
