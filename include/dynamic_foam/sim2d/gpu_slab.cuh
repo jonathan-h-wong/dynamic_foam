@@ -472,7 +472,7 @@ public:
     //   1. Computes Morton codes for all n_particles from their local-space AABB
     //      centroids, normalized against the foam's own AABB.
     //   2. Gathers all per-particle slab buffers (AABBs, colors, positions,
-    //      surface mask, active IDs) into Morton order via a single permutation.
+    //      surface mask, active IDs) into Morton order via a singlermutation.
     //   3. Sets slot.active_count = n_particles.
     //
     // Implemented in gpu_slab.cu (requires nvcc).
@@ -483,6 +483,21 @@ public:
     // it to out_bbox (host).  Called automatically by bulkMortonSort.
     // Implemented in gpu_slab.cu (requires nvcc).
     void computeFoamAABB(int foam_id, int n, AABB& out_bbox);
+
+    // -------------------------------------------------------------------------
+    // reparentFoamData — shift all per-particle positions and AABBs so that
+    // new_origin becomes the new local-space origin (0,0,0).
+    //
+    // Subtracts new_origin from d_particle_positions and from both min_pt /
+    // max_pt of d_particle_aabbs for every active particle in the foam's slab
+    // slice.  The operation is fully in-place on the GPU with no temporaries.
+    //
+    // BVH nodes, CSR data, and COO edges are NOT updated here — the caller is
+    // responsible for triggering rebuilds as needed after reparenting.
+    //
+    // Implemented in gpu_slab.cu (requires nvcc).
+    // -------------------------------------------------------------------------
+    void reparentFoamData(int foam_id, glm::vec3 new_origin);
 
     // =========================================================================
     // Flat device buffers — owned by the allocator, lifetime = simulation.

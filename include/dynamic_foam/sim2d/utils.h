@@ -362,4 +362,67 @@ inline int countCycles(
     return E - V + C;
 }
 
+/**
+ * @brief Finds shared air particles — air cells that are adjacent to at least
+ * two distinct connected components.
+ *
+ * A shared air particle is an air particle (opacity == 0) whose non-air
+ * neighbours belong to two or more different connected components.  Because a
+ * single air particle can be shared by several components simultaneously the
+ * output map may contain the same particle ID under multiple component keys.
+ *
+ * @param adjList         The adjacency list representing the graph.
+ * @param surfaceMap      Map from particle ID → true if the particle is a
+ *                        surface cell (i.e. a non-air particle on the boundary
+ *                        of a foam cluster).  Used to restrict the neighbour
+ *                        search to particles that are topologically meaningful.
+ * @param opacityMap      Map from particle ID → opacity (0.0f = air, >0 = foam).
+ * @param componentLabels Output of findConnectedComponents: particle ID →
+ *                        component ID (only non-air particles are present).
+ * @return An unordered_map<component_id, vector<air_particle_ids>> where every
+ *         entry lists the air particles shared with that component.  A particle
+ *         that spans N components appears once in each of those N entries.
+ */
+inline std::unordered_map<int, std::vector<uint32_t>> findSharedAirParticles(
+    const AdjacencyList& adjList,
+    const std::unordered_map<uint32_t, bool>& surfaceMap,
+    const std::unordered_map<uint32_t, float>& opacityMap,
+    const std::unordered_map<uint32_t, int>& componentLabels
+) {
+    std::unordered_map<int, std::vector<uint32_t>> result;
+
+    // Collect candidate air particles: those adjacent to at least one surface
+    // particle.  Using surfaceMap as the seed avoids scanning the entire graph.
+    std::unordered_set<uint32_t> candidates;
+    for (const auto& [id, isSurface] : surfaceMap) {
+        if (!isSurface) continue;
+        // Only seed from particles that actually belong to a component.
+        if (!componentLabels.count(id)) continue;
+        adjList.forEachNeighbor(id, [&](uint32_t neighborId) {
+            auto opIt = opacityMap.find(neighborId);
+            if (opIt != opacityMap.end() && opIt->second == 0.0f)
+                candidates.insert(neighborId);
+        });
+    }
+
+    // For each candidate air particle, collect the set of component IDs that
+    // its non-air neighbours belong to.
+    for (uint32_t airId : candidates) {
+        std::unordered_set<int> touchedComponents;
+        adjList.forEachNeighbor(airId, [&](uint32_t neighborId) {
+            auto compIt = componentLabels.find(neighborId);
+            if (compIt != componentLabels.end())
+                touchedComponents.insert(compIt->second);
+        });
+
+        // Only an air bridge if it spans at least two distinct components.
+        if (touchedComponents.size() < 2) continue;
+
+        for (int compId : touchedComponents)
+            result[compId].push_back(airId);
+    }
+
+    return result;
+}
+
 } // namespace DynamicFoam::Sim2D

@@ -54,6 +54,39 @@ void GpuSlabAllocator::computeFoamAABB(int foam_id, int n, AABB& out_bbox) {
 }
 
 // =============================================================================
+// Reparent — shift particle positions and AABBs to a new local origin
+// =============================================================================
+
+// Subtracts `origin` from both the position and the AABB of each particle.
+// This is an in-place operation; no auxiliary memory is required.
+static __global__ void k_reparent(
+    glm::vec3* __restrict__ positions,
+    AABB*      __restrict__ aabbs,
+    int        n,
+    glm::vec3  origin)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    positions[i]    -= origin;
+    aabbs[i].min_pt -= origin;
+    aabbs[i].max_pt -= origin;
+}
+
+void GpuSlabAllocator::reparentFoamData(int foam_id, glm::vec3 new_origin)
+{
+    auto it = slots.find(foam_id);
+    if (it == slots.end() || it->second.dead) return;
+    const FoamSlot& s = it->second;
+    const int n = s.active_count;
+    if (n <= 0) return;
+    k_reparent<<<grid_size(n), 256>>>(
+        d_particle_positions + s.particle_offset,
+        d_particle_aabbs     + s.particle_offset,
+        n, new_origin);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// =============================================================================
 // Bulk Morton sort — reorders ALL per-particle slab buffers together
 // =============================================================================
 
