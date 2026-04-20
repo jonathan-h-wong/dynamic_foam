@@ -86,7 +86,7 @@ triangulateVoronoiCells(
         const auto& cell = eit->first;
         uint32_t id1 = particleIds[cell->vertex(eit->second)->info()];
         uint32_t id2 = particleIds[cell->vertex(eit->third)->info()];
-        adjList.addEdgeUnique(id1, id2);
+        adjList.addEdge(id1, id2);
     }
 
     // ------------------------------------------------------------------

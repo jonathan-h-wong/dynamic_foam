@@ -86,6 +86,15 @@ namespace DynamicFoam::Sim2D {
     // initSlab
     // -------------------------------------------------------------------------
     void Simulation::initSlab() {
+        // Build COO data once per foam; reuse across the tally and upload loops.
+        struct FoamCOO { std::vector<uint32_t> src, dst; };
+        std::unordered_map<int, FoamCOO> foamCOOs;
+        foamCOOs.reserve(foamAdjacencyLists.size());
+        for (const auto& [foam_id, adj] : foamAdjacencyLists) {
+            auto [src, dst] = adj.buildCOO();
+            foamCOOs[foam_id] = FoamCOO{ std::move(src), std::move(dst) };
+        }
+
         // Tally buffer totals across all foams.
         int total_bvh_nodes = 0;
         int total_csr_nodes = 0; // Σ (N_i + 1)
@@ -94,7 +103,7 @@ namespace DynamicFoam::Sim2D {
 
         for (const auto& [foam_id, adj] : foamAdjacencyLists) {
             const int N = adj.nodeCount();
-            const int E = static_cast<int>(adj.getCOOSrc().size());
+            const int E = static_cast<int>(foamCOOs.at(foam_id).src.size());
             total_bvh_nodes += (N > 1) ? 2 * N - 1 : 1;
             total_csr_nodes += N + 1;
             total_csr_edges += E;
@@ -107,7 +116,8 @@ namespace DynamicFoam::Sim2D {
         // Per-foam slice setup.
         for (auto& [foam_id, adj] : foamAdjacencyLists) {
             const int N             = static_cast<int>(adj.nodeCount());
-            const int E             = static_cast<int>(adj.getCOOSrc().size());
+            const auto& [coo_src, coo_dst] = foamCOOs.at(foam_id);
+            const int E             = static_cast<int>(coo_src.size());
             const int num_bvh_nodes = (N > 1) ? 2 * N - 1 : 1;
 
             // Allocate a 2×-overcommitted slab slot.
@@ -115,8 +125,7 @@ namespace DynamicFoam::Sim2D {
 
             // Stage COO edge data into the slab so GPU adjacency kernels can
             // consume it directly without a per-build H2D transfer.
-            gpuSlab.stageCOOData(foam_id,
-                adj.getCOOSrc().data(), adj.getCOODst().data(), E);
+            gpuSlab.stageCOOData(foam_id, coo_src.data(), coo_dst.data(), E);
 
             // Bulk-upload particle data and Morton-sort every buffer together.
             // After this call d_active_ids is Morton-sorted and slot.active_count is set.

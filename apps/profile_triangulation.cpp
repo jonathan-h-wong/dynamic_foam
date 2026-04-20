@@ -177,11 +177,10 @@ static PhaseTimes runTrial(size_t N, std::mt19937& rng)
     auto t2 = Clock::now();
 
     // ---- Phase 2b: AdjacencyList hash-map insertions -------------------
-    // Use addEdgeUnique: nodes are pre-populated and CGAL edges are unique.
     AdjacencyList adjList(ids);
     adjList.reserveEdges(edges.size());
     for (const auto& e : edges)
-        adjList.addEdgeUnique(e.a, e.b);
+        adjList.addEdge(e.a, e.b);
 
     auto t3 = Clock::now();
 

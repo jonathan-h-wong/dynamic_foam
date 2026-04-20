@@ -63,8 +63,8 @@ struct AdjacencyListGPU {
 //
 //   adj         — node -> unordered_set of neighbor IDs
 //   edgeIndex   — packed 64-bit key set for O(1) existence checks
-//   coo_src/dst — flat directed edge list kept current by all mutations
 // =============================================================================
+// Note: COO edge data is built on-demand via buildCOO() and is not cached.
 class AdjacencyList {
 public:
 
@@ -107,7 +107,6 @@ public:
         adj[a].insert(b);
         adj[b].insert(a);
 
-        coo_dirty = true;
     }
 
     void addNodeEdges(uint32_t nodeId, const std::vector<uint32_t>& connections) {
@@ -115,19 +114,7 @@ public:
             addEdge(nodeId, conn);
     }
 
-    // Fast-path edge insert for callers that guarantee:
-    //   (a) both endpoints are already registered as nodes, and
-    //   (b) each undirected edge is submitted exactly once (no duplicates).
-    // Skips the existence check and the redundant addNode try_emplace calls.
-    // ~2x faster than addEdge per call. Use for CGAL finite_edges output.
-    void addEdgeUnique(uint32_t a, uint32_t b) {
-        adj[a].insert(b);
-        adj[b].insert(a);
-        edgeIndex.insert(edgeKey(a, b));
-        coo_dirty = true;
-    }
-
-    // Pre-size the edge dedup index. Call before a bulk addEdgeUnique sequence
+    // Pre-size the edge dedup index. Call before a bulk addEdge sequence
     // when the expected edge count is known (e.g. dt.number_of_finite_edges()).
     void reserveEdges(size_t numEdges) {
         edgeIndex.reserve(numEdges);
@@ -143,23 +130,36 @@ public:
             edgeIndex.erase(edgeKey(nodeId, nbr));
         }
         adj.erase(it);
-        coo_dirty = true;
     }
 
-    // Merge another adjacency list into this one
+    // Merge another adjacency list into this one (copying).
     void graphEdit(const AdjacencyList& other) {
         for (const auto& [node, neighbors] : other.adj)
             for (uint32_t nbr : neighbors)
                 addEdge(node, nbr);
     }
 
+    // Move-merge: transfer all nodes/edges from other into this using C++17
+    // node-handle splicing. Non-overlapping nodes and edges are moved with zero
+    // heap allocation; overlapping nodes have their neighbor sets spliced in the
+    // same way. 'other' is left in a valid but empty-ish state after the call.
+    // O(n + e) with a much lower constant than the copying overload.
+    void graphEdit(AdjacencyList&& other) {
+        // Move non-duplicate edge keys with no allocation.
+        edgeIndex.merge(other.edgeIndex);
+
+        // Splice non-conflicting nodes (O(1) per node, no copy).
+        adj.merge(other.adj);
+
+        // For nodes that existed in both maps, other.adj still holds them;
+        // splice their neighbor sets element-by-element (still no allocation).
+        for (auto& [node, neighbors] : other.adj)
+            adj[node].merge(neighbors);
+    }
+
     // -------------------------------------------------------------------------
     // Accessors
     // -------------------------------------------------------------------------
-
-    bool hasEdge(uint32_t a, uint32_t b) const {
-        return edgeIndex.count(edgeKey(a, b)) > 0;
-    }
 
     template <typename Func>
     void forEachNeighbor(uint32_t nodeId, Func fn) const {
@@ -173,10 +173,17 @@ public:
         return adj;
     }
 
-    // Returns the flat directed COO edge arrays. Rebuilt lazily on first
-    // access after any mutation that sets coo_dirty.
-    const std::vector<uint32_t>& getCOOSrc() const { if (coo_dirty) rebuildCOO(); return coo_src; }
-    const std::vector<uint32_t>& getCOODst() const { if (coo_dirty) rebuildCOO(); return coo_dst; }
+    // Build and return all directed COO edges as a src/dst pair.
+    // Called once during initialisation; result is not cached.
+    std::pair<std::vector<uint32_t>, std::vector<uint32_t>> buildCOO() const {
+        std::vector<uint32_t> src, dst;
+        for (const auto& [node, neighbors] : adj)
+            for (uint32_t nbr : neighbors) {
+                src.push_back(node);
+                dst.push_back(nbr);
+            }
+        return {src, dst};
+    }
 
     // Returns node IDs in insertion order. Used by the render layer to build
     // the per-foam slice of the flat position/color/surface-mask buffers in
@@ -194,24 +201,6 @@ public:
 
     uint32_t nodeCount() const { return static_cast<uint32_t>(adj.size()); }
 
-    // Returns the subset of the COO where both endpoints are in subset_ids.
-    // Call this on the CPU before buildGPUAdjacencyList to avoid uploading and
-    // filtering the full edge list on the GPU.
-    std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
-    getSubsetCOO(const std::vector<uint32_t>& subset_ids) const {
-        std::unordered_set<uint32_t> subset_set(subset_ids.begin(), subset_ids.end());
-        std::vector<uint32_t> src, dst;
-        for (uint32_t node : subset_ids) {
-            forEachNeighbor(node, [&](uint32_t nbr) {
-                if (subset_set.count(nbr)) {
-                    src.push_back(node);
-                    dst.push_back(nbr);
-                }
-            });
-        }
-        return {src, dst};
-    }
-
 private:
 
     // node -> set of neighbor IDs
@@ -219,11 +208,6 @@ private:
 
     // O(1) existence check (canonical undirected key)
     std::unordered_set<uint64_t> edgeIndex;
-
-    // COO cache — rebuilt lazily when coo_dirty is set by a mutation.
-    mutable std::vector<uint32_t> coo_src;
-    mutable std::vector<uint32_t> coo_dst;
-    mutable bool coo_dirty = false;
 
     // -------------------------------------------------------------------------
     // Internal helpers
@@ -242,18 +226,6 @@ private:
         edgeIndex.erase(key);
         adj[a].erase(b);
         adj[b].erase(a);
-        coo_dirty = true;
-    }
-
-    void rebuildCOO() const {
-        coo_src.clear();
-        coo_dst.clear();
-        for (const auto& [node, neighbors] : adj)
-            for (uint32_t nbr : neighbors) {
-                coo_src.push_back(node);
-                coo_dst.push_back(nbr);
-            }
-        coo_dirty = false;
     }
 };
 

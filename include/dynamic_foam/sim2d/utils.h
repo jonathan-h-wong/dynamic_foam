@@ -80,14 +80,13 @@ triangulateWithMetadata(
     }
 
     // Build adjacency using O(1) vh->info() index lookup.
-    // CGAL's finite_edges iterator emits each undirected edge exactly once,
-    // so addEdgeUnique (no dedup check, nodes pre-populated) is safe and fast.
+    // CGAL's finite_edges iterator emits each undirected edge exactly once.
     AdjacencyList adjList(particleIds);
     adjList.reserveEdges(static_cast<size_t>(dt.number_of_finite_edges()));
     for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
         auto v1 = eit->first->vertex(eit->second);
         auto v2 = eit->first->vertex(eit->third);
-        adjList.addEdgeUnique(particleIds[v1->info()], particleIds[v2->info()]);
+        adjList.addEdge(particleIds[v1->info()], particleIds[v2->info()]);
     }
 
     // Pre-compute every finite cell's circumcenter once.
