@@ -405,8 +405,10 @@ void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
 
             // Halve the stored (doubled) capacities back to the original counts
             // so that allocate() doubles them again correctly.
-            const int bvh_nodes = s.bvh_capacity      / 2;
-            const int csr_nodes = s.csr_node_capacity / 2;
+            // BVH and CSR node counts are derived from new_count (not the old
+            // slot) since new_count may exceed 2 * old slot capacity.
+            const int bvh_nodes = (new_count > 1) ? 2 * new_count - 1 : 1;
+            const int csr_nodes = new_count + 1;
             const int csr_edges = s.csr_edge_capacity / 2;
             // Ensure the new COO slice can hold existing + incoming edges so
             // Phase 3 (COO insertion) won't need a second resize.

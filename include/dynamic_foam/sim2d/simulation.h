@@ -55,34 +55,15 @@ class Simulation {
         // If a slab slot already exists for the foam, builds directly into the slab slice.
         void buildBVH(entt::entity foamEntity);
 
-        // Bulk upload for a single foam: builds CPU arrays for AABBs, colors,
-        // local positions, surface mask, and active IDs from the particle registry,
-        // uploads all five buffers to the GPU slab via gpuSlab.stageParticleData in
-        // getOrderedNodeIds() order, then calls gpuSlab.bulkMortonSort to reorder
-        // every buffer together by local-space Morton code so that d_active_ids is
-        // Morton-sorted and ready for buildGPUAdjacencyListFromSlab.
-        // d_particle_positions stores local (object) space; the renderer transforms
-        // rays per-foam using foam_inv_transforms in k_exact_collision.
-        // Must be called after a foam's particle data is fully populated and
-        // after gpuSlab.allocate() has reserved a valid slot for the foam.
-        void stageParticleData(entt::entity foamEntity);
-
         // Allocates and populates the GpuSlabAllocator from the CPU-side foam
         // structures.  Implemented in simulation_gpu.cu (requires nvcc).
         // Called once at the end of the constructor.
         void initSlab();
 
-        // Rebuilds the GPU CSR for one foam using the device-resident Morton-sorted
+        // Builds the GPU CSR for one foam using the device-resident Morton-sorted
         // d_active_ids and pre-staged d_coo_src/dst buffers.  No H2D transfers.
-        // Call after stageParticleData (which populates d_active_ids) and whenever
-        // the adjacency or slab layout has changed (resize, compact).
-        void rebuildSlabAdj(int foam_id);
-
-        // Applies a FoamUpdate (deletions then insertions) to the GPU particle
-        // slab buffers for the given foam.  Delegates to gpuSlab.updateFoamData.
-        // The caller is responsible for rebuilding the BVH and CSR adjacency
-        // after this call if the particle set has changed.
-        void updateParticleData(int foam_id, const FoamUpdate& update);
+        // Call whenever the adjacency or slab layout has changed (resize, compact).
+        void buildAdj(int foam_id);
         
         entt::registry foamRegistry;
         entt::registry particleRegistry;

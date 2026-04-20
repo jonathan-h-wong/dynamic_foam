@@ -189,10 +189,6 @@ public:
 
     // -------------------------------------------------------------------------
     // allocate — reserve a 2× overcommitted slice for foam_id.
-    // Returns a stable reference to the new FoamSlot.
-    // -------------------------------------------------------------------------
-    // -------------------------------------------------------------------------
-    // allocate — reserve a 2× overcommitted slice for foam_id.
     // n_coo_edges is the directed COO edge count; pass -1 to match n_csr_edges.
     // Returns a stable reference to the new FoamSlot.
     // -------------------------------------------------------------------------
