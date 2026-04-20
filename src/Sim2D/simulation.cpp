@@ -141,7 +141,6 @@ namespace DynamicFoam::Sim2D {
     // Rebuilds the GPU CSR for one foam directly from the slab's device-resident
     // data: d_active_ids (Morton-sorted, written by bulkMortonSort) and
     // d_coo_src/dst (staged by stageCOOData).  No H2D transfers.
-    // Replaces the old rebuildSlabCsrMortonOrder + foamMortonPerms machinery.
     // -------------------------------------------------------------------------
     void Simulation::rebuildSlabAdj(int foam_id) {
         auto it = gpuSlab.slots.find(foam_id);
@@ -151,7 +150,7 @@ namespace DynamicFoam::Sim2D {
         const uint32_t E = static_cast<uint32_t>(slot.coo_count);
         if (N == 0 || E == 0) return;
 
-        buildGPUAdjacencyListFromSlab(
+        buildGPUAdjacencyList(
             foamGpuAdj[foam_id],
             gpuSlab.d_active_ids + slot.active_offset,
             N,
@@ -344,6 +343,14 @@ namespace DynamicFoam::Sim2D {
             });
 
         const auto results = topologySubsystem.update(gpuSlab, foamAdjacencyLists, foamTransforms, particleRegistry);
+        
+        
+        
+        
+        
+        
+        
+        
         for (const auto& result : results) {
             // Rebuild BVH from current ParticleVertices in the registry.
             // stageParticleData (called inside buildBVH) reads ParticleLocalPosition

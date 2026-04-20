@@ -212,31 +212,6 @@ public:
         return {src, dst};
     }
 
-    // -------------------------------------------------------------------------
-    // buildGPUAdjacencyList — compiled by NVCC only
-    //
-    // Builds a CSR adjacency list directly into a pre-allocated slab slice.
-    // d_nbrs_slice and d_node_offsets_slice are device memory owned by an
-    // external allocator (GpuSlabAllocator); they will NOT be freed by this
-    // call or by out.free().
-    //
-    // nbrs_cap         must be >= E (num directed edges in this foam).
-    // node_offsets_cap must be >= N + 1 (num nodes + sentinel).
-    //
-    // sorted_ids        CPU-side node IDs in desired sort order. Pass an empty
-    //                   vector to use insertion order.
-    //
-    // stream            All GPU work is issued onto this stream.
-    // -------------------------------------------------------------------------
-    void buildGPUAdjacencyList(
-        AdjacencyListGPU&            out,
-        uint32_t*                    d_nbrs_slice,
-        size_t                       nbrs_cap,
-        uint32_t*                    d_node_offsets_slice,
-        size_t                       node_offsets_cap,
-        const std::vector<uint32_t>& sorted_ids = {},
-        cudaStream_t                 stream = 0) const;
-
 private:
 
     // node -> set of neighbor IDs
@@ -253,12 +228,6 @@ private:
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
-
-    // Core GPU CSR builder — operates on buffers already wired into out.
-    void buildGPUAdjacencyListImpl(
-        AdjacencyListGPU&            out,
-        const std::vector<uint32_t>& sorted_ids,
-        cudaStream_t                 stream) const;
 
     // Canonical edge key: always pack smaller ID into high bits
     static uint64_t edgeKey(uint32_t a, uint32_t b) {
@@ -289,10 +258,10 @@ private:
 };
 
 // =============================================================================
-// buildGPUAdjacencyListFromSlab
+// buildGPUAdjacencyList — fully GPU-resident CSR adjacency builder.
 //
-// Fully GPU-resident CSR adjacency builder.  All inputs are device pointers.
-// The only CPU↔GPU traffic is one scalar D2H read (run-length encode count).
+// All inputs are device pointers. The only CPU↔GPU traffic is one scalar
+// D2H read (run-length encode count).
 //
 //   d_sorted_ids          — N Morton-sorted entity IDs
 //                           (d_active_ids + slot.active_offset).
@@ -304,7 +273,7 @@ private:
 //   d_node_offsets_slice  — slab rowptr slice (size >= N+1); NOT freed by out.free().
 //   stream                — CUDA stream for all kernel/cub work.
 // =============================================================================
-void buildGPUAdjacencyListFromSlab(
+void buildGPUAdjacencyList(
     AdjacencyListGPU& out,
     const uint32_t*   d_sorted_ids,
     uint32_t          N,
