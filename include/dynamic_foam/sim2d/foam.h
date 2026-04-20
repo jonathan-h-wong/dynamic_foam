@@ -46,18 +46,31 @@ namespace DynamicFoam::Sim2D {
             particleColor(color),
             particleOpacity(opacity),
             density(density) {
-            // Triangulate in original space (translation-invariant topology/volumes)
-            auto [adjList, volumeMap, voronoiVertices] = triangulateVoronoiCells(positions, particleIds);
+            // Triangulate in original space (translation-invariant topology)
+            auto [adjList, voronoiVertices] = triangulateVoronoiCells(positions, particleIds);
             adjacencyList = adjList;
             particleVertices = voronoiVertices;
 
-            // Build position and mass maps
+            // Build position and mass maps.
+            // Mass is approximated from the AABB of the Voronoi cell vertices
+            // (volume = AABB width * height * depth * density).  Boundary
+            // particles (empty vertex list) get zero mass.
             for (size_t i = 0; i < particleIds.size(); ++i) {
                 uint32_t id = particleIds[i];
                 particlePosition[id] = positions[i];
-                particleMass[id] = (volumeMap.count(id) && volumeMap.at(id) > 0.0f)
-                    ? volumeMap.at(id) * density
-                    : 0.0f;
+
+                const auto& verts = voronoiVertices[id];
+                if (!verts.empty()) {
+                    glm::vec3 lo = verts[0], hi = verts[0];
+                    for (const auto& v : verts) {
+                        lo = glm::min(lo, v);
+                        hi = glm::max(hi, v);
+                    }
+                    glm::vec3 ext = hi - lo;
+                    particleMass[id] = ext.x * ext.y * ext.z * density;
+                } else {
+                    particleMass[id] = 0.0f;
+                }
             }
 
             validate();

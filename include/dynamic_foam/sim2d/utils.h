@@ -17,17 +17,24 @@
 #ifndef __CUDACC__
 // CGAL header-only setup with faster kernel
 #include <CGAL/Delaunay_triangulation_3.h>
+#include <CGAL/Delaunay_triangulation_cell_base_3.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#include <CGAL/Triangulation_data_structure_3.h>
+#include <CGAL/Triangulation_vertex_base_with_info_3.h>
 #endif // !__CUDACC__
 
 namespace DynamicFoam::Sim2D {
 
 #ifndef __CUDACC__
-// CGAL typedefs for use in function signatures
-// Using Exact_predicates_inexact_constructions_kernel for faster compilation
-using K = CGAL::Exact_predicates_inexact_constructions_kernel;
-using Delaunay_3 = CGAL::Delaunay_triangulation_3<K>;
-using Point_3 = K::Point_3;
+// CGAL typedefs for use in function signatures.
+// Vertex base stores the original particle index (size_t) as user info,
+// eliminating the O(N^2) coordinate-scan vertex→index lookup.
+using K    = CGAL::Exact_predicates_inexact_constructions_kernel;
+using Vb   = CGAL::Triangulation_vertex_base_with_info_3<size_t, K>;
+using Cb   = CGAL::Delaunay_triangulation_cell_base_3<K>;
+using Tds  = CGAL::Triangulation_data_structure_3<Vb, Cb>;
+using Delaunay_3 = CGAL::Delaunay_triangulation_3<K, Tds>;
+using Point_3    = K::Point_3;
 #endif // !__CUDACC__
 
 #ifndef __CUDACC__
@@ -59,35 +66,42 @@ triangulateWithMetadata(
 ) {
     size_t numParticles = particleIds.size();
 
+    // Insert points with their original index stored directly in the vertex.
+    // This eliminates the O(N^2) coordinate-scan that previously populated
+    // vertexToIndex; all lookups become O(1) via vh->info().
     Delaunay_3 dt;
-    std::unordered_map<Delaunay_3::Vertex_handle, size_t> vertexToIndex;
-
-    std::vector<Point_3> points;
-    points.reserve(numParticles);
-    for (size_t i = 0; i < numParticles; ++i)
-        points.emplace_back(positions[i].x, positions[i].y, positions[i].z);
-    dt.insert(points.begin(), points.end());
-
-    for (auto vh = dt.finite_vertices_begin(); vh != dt.finite_vertices_end(); ++vh) {
-        const auto& p = vh->point();
-        for (size_t i = 0; i < numParticles; ++i) {
-            if (p.x() == positions[i].x && p.y() == positions[i].y && p.z() == positions[i].z) {
-                vertexToIndex[vh] = i;
-                break;
-            }
-        }
+    {
+        std::vector<std::pair<Point_3, size_t>> indexed_points;
+        indexed_points.reserve(numParticles);
+        for (size_t i = 0; i < numParticles; ++i)
+            indexed_points.emplace_back(
+                Point_3(positions[i].x, positions[i].y, positions[i].z), i);
+        dt.insert(indexed_points.begin(), indexed_points.end());
     }
 
+    // Build adjacency using O(1) vh->info() index lookup.
+    // CGAL's finite_edges iterator emits each undirected edge exactly once,
+    // so addEdgeUnique (no dedup check, nodes pre-populated) is safe and fast.
     AdjacencyList adjList(particleIds);
+    adjList.reserveEdges(static_cast<size_t>(dt.number_of_finite_edges()));
     for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
-        auto cell = eit->first;
-        auto v1 = cell->vertex(eit->second);
-        auto v2 = cell->vertex(eit->third);
-        if (vertexToIndex.count(v1) && vertexToIndex.count(v2)) {
-            uint32_t id1 = particleIds[vertexToIndex[v1]];
-            uint32_t id2 = particleIds[vertexToIndex[v2]];
-            adjList.addNodeEdges(id1, {id2});
-        }
+        auto v1 = eit->first->vertex(eit->second);
+        auto v2 = eit->first->vertex(eit->third);
+        adjList.addEdgeUnique(particleIds[v1->info()], particleIds[v2->info()]);
+    }
+
+    // Pre-compute every finite cell's circumcenter once.
+    // Storing by Cell_handle (pointer) avoids redundant dt.dual() calls in the
+    // per-vertex Voronoi loop, which previously recomputed the same circumcenters
+    // once per incident edge per vertex.
+    std::unordered_map<Delaunay_3::Cell_handle, glm::vec3> ccCache;
+    ccCache.reserve(static_cast<size_t>(dt.number_of_finite_cells()));
+    for (auto cit = dt.finite_cells_begin(); cit != dt.finite_cells_end(); ++cit) {
+        Point_3 cc = dt.dual(cit);
+        ccCache[cit] = glm::vec3(
+            static_cast<float>(cc.x()),
+            static_cast<float>(cc.y()),
+            static_cast<float>(cc.z()));
     }
 
     std::unordered_map<uint32_t, float> volumeMap;
@@ -96,8 +110,7 @@ triangulateWithMetadata(
     voronoiVertices.reserve(numParticles);
 
     for (auto vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit) {
-        if (!vertexToIndex.count(vit)) continue;
-        size_t   i  = vertexToIndex[vit];
+        size_t   i  = vit->info();
         uint32_t id = particleIds[i];
 
         glm::vec3 genPt(
@@ -111,18 +124,22 @@ triangulateWithMetadata(
             continue;
         }
 
+        // Collect Voronoi vertices (circumcenters of incident finite cells)
+        // from the cache — no new dt.dual() calls needed.
         std::vector<Delaunay_3::Cell_handle> incident_cells;
         dt.incident_cells(vit, std::back_inserter(incident_cells));
         std::vector<glm::vec3> v_vertices;
-        for (const auto& cell_handle : incident_cells) {
-            Point_3 cc = dt.dual(cell_handle);
-            v_vertices.emplace_back(
-                static_cast<float>(cc.x()),
-                static_cast<float>(cc.y()),
-                static_cast<float>(cc.z()));
+        v_vertices.reserve(incident_cells.size());
+        for (const auto& ch : incident_cells) {
+            auto it = ccCache.find(ch);
+            if (it != ccCache.end())
+                v_vertices.push_back(it->second);
         }
         voronoiVertices[id] = v_vertices;
 
+        // Compute Voronoi cell volume: for each incident Delaunay edge the dual
+        // is a Voronoi face polygon; decompose each polygon into a fan of
+        // tetrahedra from genPt. All circumcenters are read from cache.
         float total_volume = 0.0f;
         std::vector<Delaunay_3::Edge> incident_edges;
         dt.incident_edges(vit, std::back_inserter(incident_edges));
@@ -133,23 +150,17 @@ triangulateWithMetadata(
 
             std::vector<glm::vec3> face_points;
             do {
-                if (!dt.is_infinite(cc)) {
-                    Point_3 dual_pt = dt.dual(cc);
-                    face_points.emplace_back(
-                        static_cast<float>(dual_pt.x()),
-                        static_cast<float>(dual_pt.y()),
-                        static_cast<float>(dual_pt.z()));
-                }
-                cc++;
+                auto it = ccCache.find(cc);
+                if (it != ccCache.end())
+                    face_points.push_back(it->second);
+                ++cc;
             } while (cc != done);
 
             if (face_points.size() < 3) continue;
             const glm::vec3& p0 = face_points[0];
-            for (size_t j = 1; j < face_points.size() - 1; ++j) {
-                const glm::vec3& p1 = face_points[j];
-                const glm::vec3& p2 = face_points[j + 1];
+            for (size_t j = 1; j + 1 < face_points.size(); ++j) {
                 total_volume += (1.0f / 6.0f) * glm::determinant(
-                    glm::mat3(p0 - genPt, p1 - genPt, p2 - genPt));
+                    glm::mat3(p0 - genPt, face_points[j] - genPt, face_points[j + 1] - genPt));
             }
         }
         volumeMap[id] = std::abs(total_volume);
