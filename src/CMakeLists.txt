@@ -38,6 +38,36 @@ set (DYNAMIC_FOAM_SOURCES
 )
 add_library(dynamic_foam ${DYNAMIC_FOAM_SOURCES})
 
+# Precompiled headers for CXX translation units.
+# CUDA source files (.cu) and files compiled as LANGUAGE CUDA cannot use MSVC
+# precompiled headers, so they are explicitly opted out. The imgui backends are
+# also opted out since they don't include entt/glm and cross-contaminating them
+# with these heavy headers would add cost rather than save it.
+target_precompile_headers(dynamic_foam PRIVATE
+    <vector>
+    <unordered_map>
+    <optional>
+    <glm/glm.hpp>
+    <glm/gtc/quaternion.hpp>
+    <entt/entity/registry.hpp>
+)
+set_source_files_properties(
+    # CUDA device-code files
+    ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/adjacency.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/bvh.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/render.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/collision.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/gpu_slab.cu
+    # .cpp files routed through NVCC (LANGUAGE CUDA)
+    ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/physics.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/topology.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/user_input.cpp
+    # Third-party imgui backends (don't use entt/glm)
+    ${imgui_backends_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_backends_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+    PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+)
+
 # Link Header files and dependencies
 target_include_directories(dynamic_foam 
     PUBLIC 
