@@ -132,29 +132,23 @@ public:
         adj.erase(it);
     }
 
-    // Merge another adjacency list into this one (copying).
-    void graphEdit(const AdjacencyList& other) {
-        for (const auto& [node, neighbors] : other.adj)
+    // Strict induced-subgraph copy: copy only nodes that pass `nodeFilter`,
+    // and only edges where BOTH endpoints pass. No stray neighbours are
+    // introduced, so the caller controls the exact node set explicitly.
+    // Use a prior BFS expansion to grow the seed set before calling if you
+    // want to include a surrounding shell.
+    //
+    // Example:
+    //   child.copyNodesFrom(parent, [&](uint32_t id){ return keep.count(id); });
+    template <typename Pred>
+    void copyNodesFrom(const AdjacencyList& other, Pred nodeFilter) {
+        for (const auto& [node, neighbors] : other.adj) {
+            if (!nodeFilter(node)) continue;
+            addNode(node);
             for (uint32_t nbr : neighbors)
-                addEdge(node, nbr);
-    }
-
-    // Move-merge: transfer all nodes/edges from other into this using C++17
-    // node-handle splicing. Non-overlapping nodes and edges are moved with zero
-    // heap allocation; overlapping nodes have their neighbor sets spliced in the
-    // same way. 'other' is left in a valid but empty-ish state after the call.
-    // O(n + e) with a much lower constant than the copying overload.
-    void graphEdit(AdjacencyList&& other) {
-        // Move non-duplicate edge keys with no allocation.
-        edgeIndex.merge(other.edgeIndex);
-
-        // Splice non-conflicting nodes (O(1) per node, no copy).
-        adj.merge(other.adj);
-
-        // For nodes that existed in both maps, other.adj still holds them;
-        // splice their neighbor sets element-by-element (still no allocation).
-        for (auto& [node, neighbors] : other.adj)
-            adj[node].merge(neighbors);
+                if (nodeFilter(nbr))
+                    addEdge(node, nbr);
+        }
     }
 
     // -------------------------------------------------------------------------

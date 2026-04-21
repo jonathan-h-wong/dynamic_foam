@@ -325,8 +325,163 @@ namespace DynamicFoam::Sim2D {
                 buildBVH(result.foamId);
                 buildAdj(foam_id);
             } else {
-                //TODO
+                // Split — the foam has fragmented into num_components pieces.
+                // Build surfaceMap required by findSharedAirParticles.
+                std::unordered_map<uint32_t, bool> surfaceMap;
+                for (const auto& [node, _] : adj.getAdjList())
+                    surfaceMap[node] = false;
+                for (uint32_t sid : surfaceIds)
+                    surfaceMap[sid] = true;
+
+                // Shared air particles: air cells adjacent to 2+ components.
+                // Maps component_id -> [shared air particle ids].
+                const auto sharedAirByComponent = findSharedAirParticles(
+                    adj, surfaceMap, opacityMap, componentLabels);
+
+                // Collect the full set of shared air particles for later cleanup.
+                std::unordered_set<uint32_t> allSharedAir;
+                for (const auto& [comp_id, air_ids] : sharedAirByComponent)
+                    for (uint32_t aid : air_ids)
+                        allSharedAir.insert(aid);
+
+                // Group component-member particle IDs (non-air).
+                std::unordered_map<int, std::vector<uint32_t>> byComponent;
+                for (const auto& [node, comp_id] : componentLabels)
+                    byComponent[comp_id].push_back(node);
+
+                // Snapshot parent kinematic state before mutating the registry.
+                const glm::vec3 parentPos     = foamRegistry.get<Position>(result.foamId).value;
+                const glm::vec3 parentVel     = foamRegistry.get<Velocity>(result.foamId).value;
+                const glm::quat parentOrient  = foamRegistry.get<Orientation>(result.foamId).value;
+                const glm::vec3 parentOmega   = foamRegistry.get<AngularVelocity>(result.foamId).value;
+                const float     parentDensity = foamRegistry.get<Density>(result.foamId).value;
+                const bool      parentDynamic = foamRegistry.all_of<Dynamic>(result.foamId);
+
+                for (auto& [comp_id, particle_ids] : byComponent) {
+                    // (1) Create a new foam entity and adjacency list.
+                    const entt::entity child_entity = foamRegistry.create();
+                    const int          child_id     = static_cast<int>(child_entity);
+                    AdjacencyList&     child_adj    = foamAdjacencyLists[child_id];
+
+                    // (2) Collect this component's shared air neighbours via one BFS step 
+                    std::unordered_set<uint32_t> member_set(particle_ids.begin(), particle_ids.end());
+
+                    const auto sharedIt = sharedAirByComponent.find(comp_id);
+                    std::vector<uint32_t> original_air_ids;
+                    if (sharedIt != sharedAirByComponent.end())
+                        original_air_ids = sharedIt->second;
+
+                    // One BFS step outward: expand member_set by all direct neighbours.
+                    std::unordered_set<uint32_t> copy_set = member_set;
+                    for (uint32_t pid : particle_ids)
+                        adj.forEachNeighbor(pid, [&](uint32_t nbr) { copy_set.insert(nbr); });
+
+                    child_adj.copyNodesFrom(adj, [&](uint32_t id) {
+                        return copy_set.count(id) > 0;
+                    });
+
+                    // (3) Remove the original shared-air nodes from the child — they will be
+                    //     replaced by per-component clones in step (4).
+                    for (uint32_t aid : original_air_ids)
+                        child_adj.deleteNode(aid);
+
+                    // (4) Create duplicate air particles with the same properties
+                    //     and add them to the child adjacency list and particle registry.
+                    for (uint32_t orig_aid : original_air_ids) {
+                        const entt::entity orig_e   = static_cast<entt::entity>(orig_aid);
+                        const entt::entity clone_e  = particleRegistry.create();
+                        const uint32_t     clone_id = static_cast<uint32_t>(clone_e);
+
+                        // Copy all particle components from the original air particle.
+                        if (auto* c = particleRegistry.try_get<ParticleLocalPosition>(orig_e))
+                            particleRegistry.emplace<ParticleLocalPosition>(clone_e, *c);
+                        if (auto* c = particleRegistry.try_get<ParticleColor>(orig_e))
+                            particleRegistry.emplace<ParticleColor>(clone_e, *c);
+                        if (auto* c = particleRegistry.try_get<ParticleOpacity>(orig_e))
+                            particleRegistry.emplace<ParticleOpacity>(clone_e, *c);
+                        if (auto* c = particleRegistry.try_get<ParticleMass>(orig_e))
+                            particleRegistry.emplace<ParticleMass>(clone_e, *c);
+                        if (auto* c = particleRegistry.try_get<ParticleVertices>(orig_e))
+                            particleRegistry.emplace<ParticleVertices>(clone_e, *c);
+                        if (particleRegistry.all_of<Surface>(orig_e))
+                            particleRegistry.emplace<Surface>(clone_e);
+                        if (particleRegistry.all_of<Mutable>(orig_e))
+                            particleRegistry.emplace<Mutable>(clone_e);
+                        else if (particleRegistry.all_of<Immutable>(orig_e))
+                            particleRegistry.emplace<Immutable>(clone_e);
+                        else if (particleRegistry.all_of<Stencil>(orig_e))
+                            particleRegistry.emplace<Stencil>(clone_e);
+
+                        // Wire the clone into the child adjacency list.
+                        child_adj.addNode(clone_id);
+                        adj.forEachNeighbor(orig_aid, [&](uint32_t nbr) {
+                            if (member_set.count(nbr))
+                                child_adj.addEdge(clone_id, nbr);
+                        });
+                    }
+
+                    // (5) Register foam physics for this child, deriving kinematic
+                    //     state from the parent foam's snapshot.
+                    // Since the parent's origin coincides with its CoM, particle local
+                    // positions are already expressed relative to the parent CoM.  We
+                    // only need local-space data — no per-particle world transform needed.
+                    const auto& child_adj_nodes = child_adj.getOrderedNodeIds();
+                    std::unordered_map<entt::entity, glm::vec3> localPositions;
+                    std::unordered_map<entt::entity, float>     masses;
+                    for (uint32_t pid : child_adj_nodes) {
+                        const entt::entity e = static_cast<entt::entity>(pid);
+                        localPositions[e] = particleRegistry.get<ParticleLocalPosition>(e).value;
+                        masses[e]         = particleRegistry.get<ParticleMass>(e).value;
+                    }
+                    // Child CoM in local (parent) space; rotate into world space to get
+                    // the world-space offset from the parent CoM.
+                    const glm::vec3 childCoM_local = calculateCenterOfMass(localPositions, masses);
+                    const glm::vec3 childCoM_world = parentPos + glm::mat3_cast(parentOrient) * childCoM_local;
+
+                    foamRegistry.emplace_or_replace<InertiaTensor>(child_entity,
+                        calculateInertiaTensor(localPositions, masses));
+                    foamRegistry.emplace_or_replace<Density>(child_entity, parentDensity);
+                    if (parentDynamic)
+                        foamRegistry.emplace_or_replace<Dynamic>(child_entity);
+                    foamRegistry.emplace_or_replace<Position>(child_entity, childCoM_world);
+                    // Chasles decomposition: v(child) = v_parent_cm + ω × (R · child_cm_local)
+                    foamRegistry.emplace_or_replace<Velocity>(child_entity,
+                        parentVel + glm::cross(parentOmega, childCoM_world - parentPos));
+                    foamRegistry.emplace_or_replace<Orientation>(child_entity, parentOrient);
+                    foamRegistry.emplace_or_replace<AngularVelocity>(child_entity, parentOmega);
+                }
+
+                // Post-loop cleanup: erase parent from all registries.
+                foamAdjacencyLists.erase(foam_id);
+                foamGpuAdj.erase(foam_id);
+                foamRegistry.destroy(result.foamId);
+
+                // Destroy all shared air particles (replaced by per-child clones).
+                for (uint32_t aid : allSharedAir)
+                    particleRegistry.destroy(static_cast<entt::entity>(aid));
             }
+        }
+    }
+
+    void Simulation::updatePhysics(float deltaTime) {
+        // Build the same read-only transform map used by render() and updateTopology().
+        std::unordered_map<int, glm::mat4> foamTransforms;
+        foamRegistry.view<const Position, const Orientation>().each(
+            [&](entt::entity e, const Position& pos, const Orientation& orient) {
+                foamTransforms[static_cast<int>(e)] =
+                    glm::translate(glm::mat4(1.f), pos.value) * glm::mat4_cast(orient.value);
+            });
+
+        const auto results = physicsSubsystem.update(gpuSlab, foamAdjacencyLists, foamTransforms, particleRegistry, deltaTime);
+
+        // Publish the integrated state back into the registry.
+        // Simulation holds exclusive write privileges over foamRegistry.
+        for (const auto& r : results) {
+            foamRegistry.emplace_or_replace<Position>(r.foamId,        r.position);
+            foamRegistry.emplace_or_replace<Velocity>(r.foamId,        r.velocity);
+            foamRegistry.emplace_or_replace<Orientation>(r.foamId,     r.orientation);
+            foamRegistry.emplace_or_replace<AngularVelocity>(r.foamId, r.angularVelocity);
+        }
     }
 
     void Simulation::render() {
