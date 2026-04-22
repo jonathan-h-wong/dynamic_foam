@@ -315,16 +315,15 @@ namespace DynamicFoam::Sim2D {
             int num_components = 0;
             for (const auto& [node, comp_id] : componentLabels)
                 num_components = std::max(num_components, comp_id);
+            
+            // Update regardless of split or no-split
+            gpuSlab.updateFoamData(foam_id, result.foamUpdate);
+            const int N = gpuSlab.slots.at(foam_id).active_count;
+            gpuSlab.bulkMortonSort(foam_id, N);
+            buildBVH(result.foamId);
+            buildAdj(foam_id);
 
-            if (num_components <= 1) {
-                // No split: stream only the difference into the slab, then
-                // Morton-sort and rebuild BVH + CSR adjacency.
-                gpuSlab.updateFoamData(foam_id, result.foamUpdate);
-                const int N = gpuSlab.slots.at(foam_id).active_count;
-                gpuSlab.bulkMortonSort(foam_id, N);
-                buildBVH(result.foamId);
-                buildAdj(foam_id);
-            } else {
+            if (num_components > 1) {
                 // Split — the foam has fragmented into num_components pieces.
                 // Build surfaceMap required by findSharedAirParticles.
                 std::unordered_map<uint32_t, bool> surfaceMap;
@@ -380,10 +379,25 @@ namespace DynamicFoam::Sim2D {
                         return copy_set.count(id) > 0;
                     });
 
+                    // FoamUpdate accumulators — built during steps (3)/(4) where all
+                    // clone entity IDs and properties are defined.  Positions are stored in
+                    // parent-local space here and shifted to child-local space after the CoM
+                    // is known in step (5), immediately before the GPU update in step (6).
+                    std::vector<uint32_t>  clone_del_ids;
+                    std::vector<glm::vec3> clone_positions;
+                    std::vector<glm::vec4> clone_colors;
+                    std::vector<uint8_t>   clone_surface_masks;
+                    std::vector<AABB>      clone_aabbs;
+                    std::vector<uint32_t>  clone_active_ids;
+                    std::vector<uint32_t>  clone_coo_src;
+                    std::vector<uint32_t>  clone_coo_dst;
+
                     // (3) Remove the original shared-air nodes from the child — they will be
                     //     replaced by per-component clones in step (4).
-                    for (uint32_t aid : original_air_ids)
+                    for (uint32_t aid : original_air_ids) {
                         child_adj.deleteNode(aid);
+                        clone_del_ids.push_back(aid); // stage for GPU deletion
+                    }
 
                     // (4) Create duplicate air particles with the same properties
                     //     and add them to the child adjacency list and particle registry.
@@ -418,6 +432,36 @@ namespace DynamicFoam::Sim2D {
                             if (member_set.count(nbr))
                                 child_adj.addEdge(clone_id, nbr);
                         });
+
+                        // Populate GPU FoamUpdate insertion buffers for this clone.
+                        // Positions are in parent-local space for now; subtraction of
+                        // childCoM_local happens after step (5) below.
+                        // All four components are guaranteed present: every particle
+                        // entering the registry (constructor or topology) receives them
+                        // unconditionally, and the clone was just copied from such a particle.
+                        {
+                            const glm::vec3 pos  = particleRegistry.get<ParticleLocalPosition>(clone_e).value;
+                            const auto&     col_c = particleRegistry.get<ParticleColor>(clone_e);
+                            const float     alpha = particleRegistry.get<ParticleOpacity>(clone_e).value;
+                            const glm::vec4 col  = glm::vec4(col_c.rgb, alpha);
+                            const uint8_t   surf = particleRegistry.all_of<Surface>(clone_e) ? 1u : 0u;
+                            const auto& pv_verts = particleRegistry.get<ParticleVertices>(clone_e).vertices;
+                            auto [mn, mx] = calculateAABB(pv_verts);
+                            const AABB aabb(mn, mx);
+                            clone_positions.push_back(pos);
+                            clone_colors.push_back(col);
+                            clone_surface_masks.push_back(surf);
+                            clone_aabbs.push_back(aabb);
+                            clone_active_ids.push_back(clone_id);
+
+                            // Directed COO edges: clone -> each member-set neighbour (both directions).
+                            adj.forEachNeighbor(orig_aid, [&](uint32_t nbr) {
+                                if (member_set.count(nbr)) {
+                                    clone_coo_src.push_back(clone_id); clone_coo_dst.push_back(nbr);
+                                    clone_coo_src.push_back(nbr);      clone_coo_dst.push_back(clone_id);
+                                }
+                            });
+                        }
                     }
 
                     // (5) Register foam physics for this child, deriving kinematic
@@ -449,6 +493,47 @@ namespace DynamicFoam::Sim2D {
                         parentVel + glm::cross(parentOmega, childCoM_world - parentPos));
                     foamRegistry.emplace_or_replace<Orientation>(child_entity, parentOrient);
                     foamRegistry.emplace_or_replace<AngularVelocity>(child_entity, parentOmega);
+
+                    // (6) GPU mirror — replicate the CPU topology split in the slab.
+                    {
+                        // (6a) Conditional copy: snapshot all copy_set particles from the
+                        // parent slab into a freshly allocated child slot.  Particle data
+                        // (positions, colors, AABBs) arrives in parent-local space.
+                        std::vector<uint32_t> copy_set_ids(copy_set.begin(), copy_set.end());
+                        gpuSlab.copyFoamData(foam_id, child_id,
+                            copy_set_ids.data(), static_cast<int>(copy_set_ids.size()));
+
+                        // (6b) Reparent: shift every copied particle's position and AABB
+                        // so that childCoM_local becomes the new local origin (0,0,0).
+                        gpuSlab.reparentFoamData(child_id, childCoM_local);
+
+                        // (6c) Adjust clone insertion positions/AABBs to child-local space
+                        // now that childCoM_local is known.
+                        for (auto& p : clone_positions)  p -= childCoM_local;
+                        for (auto& a : clone_aabbs) {
+                            a.min_pt -= childCoM_local;
+                            a.max_pt -= childCoM_local;
+                        }
+
+                        // (6d) Submit the FoamUpdate: delete the copied original-air entries
+                        // and insert the per-component clone particles with their COO edges.
+                        FoamUpdate childUpdate;
+                        childUpdate.particle_id_dels         = std::move(clone_del_ids);
+                        childUpdate.particle_position_ins    = std::move(clone_positions);
+                        childUpdate.particle_color_ins       = std::move(clone_colors);
+                        childUpdate.particle_surface_mask_ins= std::move(clone_surface_masks);
+                        childUpdate.particle_aabb_ins        = std::move(clone_aabbs);
+                        childUpdate.particle_active_ids_ins  = std::move(clone_active_ids);
+                        childUpdate.coo_src_ins              = std::move(clone_coo_src);
+                        childUpdate.coo_dst_ins              = std::move(clone_coo_dst);
+                        gpuSlab.updateFoamData(child_id, childUpdate);
+
+                        // (6e) Re-sort, refit BVH, and rebuild CSR for the new child slot.
+                        const int child_N = gpuSlab.slots.at(child_id).active_count;
+                        gpuSlab.bulkMortonSort(child_id, child_N);
+                        buildBVH(child_entity);
+                        buildAdj(child_id);
+                    }
                 }
 
                 // Post-loop cleanup: erase parent from all registries.
@@ -459,6 +544,18 @@ namespace DynamicFoam::Sim2D {
                 // Destroy all shared air particles (replaced by per-child clones).
                 for (uint32_t aid : allSharedAir)
                     particleRegistry.destroy(static_cast<entt::entity>(aid));
+
+                // Tombstone the parent GPU slot — its data has been distributed into
+                // the child slots and is no longer needed.
+                if (gpuSlab.slots.count(foam_id))
+                    gpuSlab.slots.at(foam_id).dead = true;
+
+                // Eagerly compact if the dead parent slot pushes waste past threshold.
+                if (gpuSlab.needsCompaction()) {
+                    gpuSlab.compact();
+                    for (const auto& [fid, _] : foamAdjacencyLists)
+                        buildAdj(fid);
+                }
             }
         }
     }
