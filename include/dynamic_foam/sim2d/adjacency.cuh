@@ -9,54 +9,6 @@
 namespace DynamicFoam::Sim2D {
 
 // =============================================================================
-// AdjacencyListGPU
-//
-// Three-buffer CSR layout. All pointers are device-side and owned by this
-// struct. Call free() when done.
-//
-//   nodes[i]
-//       Original node ID at sorted position i.
-//
-//   nbrs[node_offsets[i] .. node_offsets[i+1] - 1]
-//       Sorted-position indices of node i's neighbors.
-//
-//   node_offsets[i]
-//       Start of node i's neighbor run in nbrs.
-//   node_offsets[num_nodes]
-//       Sentinel equal to num_edges.
-// =============================================================================
-struct AdjacencyListGPU {
-    uint32_t* nodes        = nullptr;
-    uint32_t* nbrs         = nullptr;
-    uint32_t* node_offsets = nullptr;
-
-    uint32_t num_nodes = 0;
-    uint32_t num_edges = 0;
-
-    size_t nodes_capacity        = 0;
-    size_t nbrs_capacity         = 0;
-    size_t node_offsets_capacity = 0;
-
-    // Ownership flags.  When false the pointer is a slice owned by an external
-    // allocator (e.g. GpuSlabAllocator); free() must not cudaFree it.
-    bool nodes_owned        = true;
-    bool nbrs_owned         = true;
-    bool node_offsets_owned = true;
-
-    void free() {
-        if (nodes        && nodes_owned)        { cudaFree(nodes);        }
-        if (nbrs         && nbrs_owned)         { cudaFree(nbrs);         }
-        if (node_offsets && node_offsets_owned) { cudaFree(node_offsets); }
-        nodes        = nullptr;  nodes_owned        = true;  nodes_capacity        = 0;
-        nbrs         = nullptr;  nbrs_owned         = true;  nbrs_capacity         = 0;
-        node_offsets = nullptr;  node_offsets_owned = true;  node_offsets_capacity = 0;
-        num_nodes = num_edges = 0;
-    }
-};
-
-
-
-// =============================================================================
 // AdjacencyList
 //
 // Stores an undirected graph as an adjacency set map plus a flat COO cache.
@@ -240,7 +192,6 @@ private:
 //   stream                — CUDA stream for all kernel/cub work.
 // =============================================================================
 void buildGPUAdjacencyList(
-    AdjacencyListGPU& out,
     const uint32_t*   d_sorted_ids,
     uint32_t          N,
     const uint32_t*   d_coo_src,

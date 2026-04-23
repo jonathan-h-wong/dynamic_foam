@@ -76,8 +76,7 @@ class Simulation {
         // render data for all foams.  Built once in the constructor; updated
         // incrementally when topology changes.
         GpuSlabAllocator gpuSlab;
-        // Per-foam GPU adjacency list handles (nbrs/node_offsets are slab slices).
-        std::unordered_map<int, AdjacencyListGPU> foamGpuAdj;
+
         
         glm::ivec2 windowSize_;
 

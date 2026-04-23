@@ -67,7 +67,6 @@ __global__ void k_iota(uint32_t* arr, int n) {
 // COO remapping uses O(N) binary search instead of an O(max_entity_id) inverse map.
 // =============================================================================
 void buildGPUAdjacencyList(
-    AdjacencyListGPU& out,
     const uint32_t*   d_sorted_ids,
     uint32_t          N,
     const uint32_t*   d_coo_src,
@@ -81,26 +80,9 @@ void buildGPUAdjacencyList(
 {
     if (N == 0 || E == 0) return;
 
-    // Wire slab slices into out (non-owned).
-    if (out.nbrs         && out.nbrs_owned)         { cudaFree(out.nbrs);         }
-    if (out.node_offsets && out.node_offsets_owned) { cudaFree(out.node_offsets); }
-
-    out.nbrs                  = d_nbrs_slice;
-    out.nbrs_capacity         = nbrs_cap;
-    out.nbrs_owned            = false;
-    out.node_offsets          = d_node_offsets_slice;
-    out.node_offsets_capacity = node_offsets_cap;
-    out.node_offsets_owned    = false;
-    out.num_nodes             = N;
-    out.num_edges             = E;
-
-    // D2D copy sorted IDs into out.nodes (owned buffer for caller queries).
-    cuda_realloc_if_needed(&out.nodes, &out.nodes_capacity, N);
-    CUDA_CHECK(cudaMemcpyAsync(out.nodes, d_sorted_ids,
-        N * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
 
     // ------------------------------------------------------------------
-    // Step 2 — build entity-ID → Morton-position lookup as local scratch.
+    // Step 1 — build entity-ID → Morton-position lookup as local scratch.
     //
     // d_sorted_ids is Morton-sorted (entity IDs in spatial order). Sort a
     // copy by entity-ID value paired with an iota of Morton positions so
@@ -150,7 +132,7 @@ void buildGPUAdjacencyList(
         d_remapped_dst, d_coo_dst_sorted,
         static_cast<int>(E), 0, sizeof(uint32_t) * 8, stream);
 
-    CUDA_CHECK(cudaMemcpyAsync(out.nbrs, d_coo_dst_sorted,
+    CUDA_CHECK(cudaMemcpyAsync(d_nbrs_slice, d_coo_dst_sorted,
         E * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
 
     // ------------------------------------------------------------------
@@ -190,9 +172,9 @@ void buildGPUAdjacencyList(
     // Step 6 — exclusive scan over degrees -> node_offsets + sentinel
     // ------------------------------------------------------------------
     CUB_CALL(cub::DeviceScan::ExclusiveSum,
-        d_degrees, out.node_offsets, static_cast<int>(N), stream);
+        d_degrees, d_node_offsets_slice, static_cast<int>(N), stream);
 
-    CUDA_CHECK(cudaMemcpyAsync(out.node_offsets + N, &E,
+    CUDA_CHECK(cudaMemcpyAsync(d_node_offsets_slice + N, &E,
         sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
 
     // ------------------------------------------------------------------

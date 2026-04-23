@@ -143,14 +143,19 @@ namespace DynamicFoam::Sim2D {
                     const entt::entity e = static_cast<entt::entity>(ordered[li]);
 
                     const auto& verts = particleRegistry.get<ParticleVertices>(e).vertices;
-                    auto [mn, mx] = calculateAABB(verts);
-                    h_aabbs[li] = AABB(mn, mx);
+                    h_positions[li] = particleRegistry.get<ParticleLocalPosition>(e).value;
+                    if (verts.empty()) {
+                        // Boundary air particle: no Voronoi cell, assign a point-AABB at
+                        // its local position instead of a degenerate zero-volume box at origin.
+                        h_aabbs[li] = AABB(h_positions[li], h_positions[li]);
+                    } else {
+                        auto [mn, mx] = calculateAABB(verts);
+                        h_aabbs[li] = AABB(mn, mx);
+                    }
 
                     const auto* c = particleRegistry.try_get<ParticleColor>(e);
                     const auto* o = particleRegistry.try_get<ParticleOpacity>(e);
                     if (c && o) h_colors[li] = glm::vec4(c->rgb, o->value);
-
-                    h_positions[li] = particleRegistry.get<ParticleLocalPosition>(e).value;
 
                     if (particleRegistry.all_of<Surface>(e)) h_surface[li] = 1;
 
@@ -193,7 +198,6 @@ namespace DynamicFoam::Sim2D {
         if (N == 0 || E == 0) return;
 
         buildGPUAdjacencyList(
-            foamGpuAdj[foam_id],
             gpuSlab.d_active_ids + slot.active_offset,
             N,
             gpuSlab.d_coo_src + slot.coo_offset,
@@ -446,8 +450,11 @@ namespace DynamicFoam::Sim2D {
                             const glm::vec4 col  = glm::vec4(col_c.rgb, alpha);
                             const uint8_t   surf = particleRegistry.all_of<Surface>(clone_e) ? 1u : 0u;
                             const auto& pv_verts = particleRegistry.get<ParticleVertices>(clone_e).vertices;
-                            auto [mn, mx] = calculateAABB(pv_verts);
-                            const AABB aabb(mn, mx);
+                            // Boundary air particles have an empty vertex list; use a point-AABB
+                            // at their local position rather than a degenerate box at the origin.
+                            const AABB aabb = pv_verts.empty()
+                                ? AABB(pos, pos)
+                                : [&]{ auto [mn, mx] = calculateAABB(pv_verts); return AABB(mn, mx); }();
                             clone_positions.push_back(pos);
                             clone_colors.push_back(col);
                             clone_surface_masks.push_back(surf);
@@ -538,7 +545,6 @@ namespace DynamicFoam::Sim2D {
 
                 // Post-loop cleanup: erase parent from all registries.
                 foamAdjacencyLists.erase(foam_id);
-                foamGpuAdj.erase(foam_id);
                 foamRegistry.destroy(result.foamId);
 
                 // Destroy all shared air particles (replaced by per-child clones).
