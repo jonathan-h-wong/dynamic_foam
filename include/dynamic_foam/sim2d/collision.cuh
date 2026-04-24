@@ -13,7 +13,7 @@
 //                         One thread per (i < j) foam pair: emits a FoamPair
 //                         for every pair whose world AABBs overlap.
 //
-//   3. Narrowphase      — k_col_narrowphase_dual_bvh  (GPU)
+//   3. Narrowphase      — k_col_narrowphase_particle_bvh  (GPU)
 //                         One thread per broadphase-surviving pair: dual BVH
 //                         traversal with B's nodes transformed into A-local
 //                         space.  Emits CollisionCandidates for leaf-leaf hits.
@@ -57,6 +57,10 @@ namespace DynamicFoam::Sim2D {
 // -----------
 //  foamIdA / foamIdB       : integer foam IDs matching the keys passed to
 //                            detectCollisions / detectCandidates.
+//                            When detectCollisions is called with a non-empty
+//                            primaryFoamIds, foamIdA is always a primary foam.
+//                            When primaryFoamIds is empty (all-pairs mode) the
+//                            ordering follows the foamIds index (i < j).
 //  particleA / particleB   : EnTT entities in the shared particleRegistry.
 //  contactPoint            : world-space midpoint of the two deepest support
 //                            points along the penetration normal.
@@ -84,7 +88,7 @@ struct FoamPair {
 
 // -----------------------------------------------------------------------------
 // CollisionCandidate — narrowphase + entity-resolve output.
-// Written by k_col_narrowphase_dual_bvh (prim_idx fields), then updated
+// Written by k_col_narrowphase_particle_bvh (prim_idx fields), then updated
 // in-place by k_col_resolve_entity_ids (entity_id fields) before D2H transfer,
 // so the single download carries everything phase 4 needs.
 //
@@ -127,32 +131,48 @@ __global__ void k_col_broadphase_foam_pairs(
     int         num_foams
 );
 
-// Phase 3a — narrowphase: one thread per broadphase-surviving foam pair.
-// Each thread walks both BVH trees simultaneously using a local stack, emitting
-// CollisionCandidates for each overlapping leaf-leaf pair.
+// Phase 3a — narrowphase: one thread per (broadphase pair × particle in foam A).
+// 2-D launch: blockIdx.x = pair index, blockIdx.y*blockDim.x+threadIdx.x = particle
+// index within foam A's Morton-sorted active set.
 //
-// bvh_nodes     Flat slab BVH node array: slab->d_bvh_nodes.
-// bvh_offsets   Per-foam start in bvh_nodes: slab->d_foam_bvh_start (device).
-// inv_transforms Per-foam inverse world transforms, indexed by foam_id.
-//               Used to form bToA = inv_transforms[fid_a] * transforms[fid_b].
-// transforms    Per-foam world transforms, indexed by foam_id.
-__global__ void k_col_narrowphase_dual_bvh(
+// Each thread transforms its particle A's local-space AABB into foam B-local
+// space and traverses foam B's BVH, emitting a CollisionCandidate for every
+// leaf AABB that overlaps.  Compared to the dual-BVH single-thread-per-pair
+// formulation, this maximises GPU occupancy and lets all threads on the same
+// foam-pair block share foam B's upper BVH levels from L1 cache.
+//
+// particle_aabbs           slab->d_particle_aabbs  (local-space, Morton order)
+// foam_particle_start      slab->d_foam_particle_start (particle_offset per foam)
+// foam_particle_counts     active_count per foam, indexed by foam_id
+// primary_particle_ids     optional sorted array of EnTT entity IDs to filter on;
+//                          nullptr / num_primary=0 disables the filter (all particles).
+//                          Resolved via d_active_ids at thread startup; linear scan
+//                          over at most num_primary entries before any BVH work.
+// d_active_ids             slab->d_active_ids (Morton-sorted entity IDs per foam)
+// d_foam_active_start      slab->d_foam_active_start
+__global__ void k_col_narrowphase_particle_bvh(
     const FoamPair*         broadphase_pairs,      ///< surviving broadphase pairs
     int                     num_broadphase_pairs,
     const BVHNode*          bvh_nodes,             ///< slab->d_bvh_nodes
-    const int*              bvh_offsets,            ///< slab->d_foam_bvh_start
-    const int*              foam_particle_counts,  ///< active_count per foam, indexed by foam_id
-    const glm::mat4*        transforms,            ///< world transforms, indexed by foam_id
-    const glm::mat4*        inv_transforms,        ///< inverse world transforms, indexed by foam_id
-    CollisionCandidate*     candidates_out,        ///< output candidates
-    int*                    candidate_counter,     ///< atomic counter
-    int                     max_candidates         ///< capacity of candidates_out
+    const int*              bvh_offsets,           ///< slab->d_foam_bvh_start
+    const AABB*             particle_aabbs,        ///< slab->d_particle_aabbs
+    const int*              foam_particle_start,   ///< slab->d_foam_particle_start
+    const int*              foam_particle_counts,  ///< active_count per foam
+    const glm::mat4*        transforms,
+    const glm::mat4*        inv_transforms,
+    const uint32_t*         primary_particle_ids,  ///< entity IDs to filter; nullptr = all
+    int                     num_primary_particles, ///< 0 = disable filter
+    const uint32_t*         d_active_ids,          ///< slab->d_active_ids
+    const int*              d_foam_active_start,   ///< slab->d_foam_active_start
+    CollisionCandidate*     candidates_out,
+    int*                    candidate_counter,
+    int                     max_candidates
 );
 
 // Phase 3b — entity resolve: one thread per narrowphase candidate.
 // Reads d_active_ids[d_foam_active_start[fid] + prim_idx] for both sides of
 // each candidate and writes the results into candidate.entity_id_a/b in place.
-// Must run after k_col_narrowphase_dual_bvh, before the D2H candidates copy.
+// Must run after k_col_narrowphase_particle_bvh, before the D2H candidates copy.
 __global__ void k_col_resolve_entity_ids(
     CollisionCandidate* candidates,         ///< in/out: entity fields written
     int                 num_candidates,
@@ -161,28 +181,41 @@ __global__ void k_col_resolve_entity_ids(
 );
 
 // =============================================================================
-// Host-side entry point
+// Host-side entry points
 // =============================================================================
 
 /**
  * @brief GPU phases 1–3 only: broadphase + narrowphase.
  *
- * Uploads transforms, runs the three GPU kernels, and downloads the
- * CollisionCandidates.  The caller is responsible for running GJK+EPA on
- * each returned candidate.
+ * Phase 1 runs on the GPU (AABB transform).  The resulting world-space AABBs
+ * are downloaded to the CPU, which generates the candidate pair list filtered
+ * to pairs where at least one side appears in @p primaryFoamIds, then tests
+ * AABB overlap.  The surviving pairs are uploaded and the narrowphase runs on
+ * the GPU.  The caller is responsible for running GJK+EPA (phase 4) on each
+ * returned candidate.
  *
  * @param gpuSlab         Slab allocator that owns all GPU BVH / particle data.
  * @param foamTransforms  Host-side world transforms keyed by foam_id.
- * @param foamIds         Active foam IDs to test (all pairs i < j).
+ * @param foamIds         Full set of active foam IDs.
+ * @param primaryFoamIds  Restrict to pairs where at least one side is in this
+ *                        set.  Pass an empty vector (the default) to test all
+ *                        i < j pairs — identical to the original behaviour.
+ * @param primaryParticleIds  Restrict the A-side of each candidate to this set
+ *                            of EnTT entity IDs.  Pass an empty vector (the
+ *                            default) to test all particles in foam A.
+ *                            Intended for small sets (≤50 IDs); the kernel
+ *                            performs a linear scan at thread startup.
  * @param maxCandidates   Device buffer capacity for narrowphase output.
  *                        Defaults to 64 K; increase for dense contact scenes.
- * @return CollisionCandidates that survived broadphase and narrowphase.
+ * @return CollisionCandidates that survived the AABB broadphase and narrowphase.
  */
 std::vector<CollisionCandidate> detectCandidates(
     const GpuSlabAllocator&                   gpuSlab,
     const std::unordered_map<int, glm::mat4>& foamTransforms,
     const std::vector<int>&                   foamIds,
-    int                                       maxCandidates = 65536
+    const std::vector<int>&                   primaryFoamIds     = {},
+    const std::vector<uint32_t>&              primaryParticleIds = {},
+    int                                       maxCandidates      = 65536
 );
 
 /**
@@ -190,21 +223,32 @@ std::vector<CollisionCandidate> detectCandidates(
  *
  * prim_idx values from the narrowphase are resolved to EnTT entity handles by
  * reading d_active_ids directly from the slab (Morton-sorted, in sync with the
- * BVH via bulkMortonSort).  AdjacencyList is not needed here.
+ * BVH via bulkMortonSort).
  *
  * @param gpuSlab          Slab allocator that owns all GPU BVH / particle data.
  * @param foamTransforms   Host-side world transforms keyed by foam_id.
  * @param particleRegistry Read-only registry used to fetch ParticleVertices.
- * @param foamIds          Active foam IDs to test.
+ * @param foamIds          Full set of active foam IDs.
+ * @param primaryFoamIds   Restrict to pairs where at least one side is in this
+ *                         set.  Pass an empty vector (the default) to test all
+ *                         i < j pairs — identical to the original behaviour.
+ * @param primaryParticleIds  Restrict the A-side of each candidate to this set
+ *                            of EnTT entity IDs.  Pass an empty vector (the
+ *                            default) to test all particles in foam A.
+ *                            Intended for small sets (≤50 IDs); the kernel
+ *                            performs a linear scan at thread startup.
  * @param maxCandidates    Narrowphase GPU buffer capacity (default 64 K).
- * @return All penetrating Voronoi-cell pairs across all foam pairs.
+ * @return All penetrating Voronoi-cell pairs that involve at least one primary
+ *         foam (or all pairs if @p primaryFoamIds is empty).
  */
 std::vector<FoamCollision> detectCollisions(
     const GpuSlabAllocator&                        gpuSlab,
     const std::unordered_map<int, glm::mat4>&      foamTransforms,
     const entt::registry&                          particleRegistry,
     const std::vector<int>&                        foamIds,
-    int                                            maxCandidates = 65536
+    const std::vector<int>&                        primaryFoamIds     = {},
+    const std::vector<uint32_t>&                   primaryParticleIds = {},
+    int                                            maxCandidates      = 65536
 );
 
 } // namespace DynamicFoam::Sim2D

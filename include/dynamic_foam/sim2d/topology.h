@@ -2,6 +2,7 @@
 #include <vector>
 #include <entt/entity/registry.hpp>
 #include "dynamic_foam/Sim2D/adjacency.cuh"
+#include "dynamic_foam/Sim2D/collision.cuh"
 #include "dynamic_foam/Sim2D/gpu_slab.cuh"
 #include "dynamic_foam/Sim2D/components.h"
 
@@ -25,6 +26,7 @@ namespace DynamicFoam::Sim2D {
             const GpuSlabAllocator&                              gpuSlab,
             std::unordered_map<int, AdjacencyList>&              foamAdjacencyLists,
             const std::unordered_map<int, glm::mat4>&            foamTransforms,
+            const entt::registry&                                foamRegistry,
             entt::registry&                                      particleRegistry
         );
     };

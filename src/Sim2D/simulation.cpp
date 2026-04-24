@@ -297,7 +297,7 @@ namespace DynamicFoam::Sim2D {
                     glm::translate(glm::mat4(1.f), pos.value) * glm::mat4_cast(orient.value);
             });
 
-        const auto results = topologySubsystem.update(gpuSlab, foamAdjacencyLists, foamTransforms, particleRegistry);
+        const auto results = topologySubsystem.update(gpuSlab, foamAdjacencyLists, foamTransforms, foamRegistry, particleRegistry);
 
         for (const auto& result : results) {
             const int foam_id = static_cast<int>(result.foamId);

@@ -16,6 +16,7 @@
 #include <optional>
 #include <stack>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace DynamicFoam::Sim2D {
 
@@ -98,129 +99,123 @@ __global__ void k_col_broadphase_foam_pairs(
 }
 
 // =============================================================================
-// Phase 3 — narrowphase: dual BVH traversal in A-local space
+// Phase 3 — narrowphase: particle-parallel BVH traversal
+//
+// One thread per (broadphase pair × particle in foam A).
+// Each thread transforms that particle's local-space AABB into foam B-local
+// space and traverses foam B's BVH, emitting one CollisionCandidate per hitting
+// leaf.  All threads in the same block share the same pair (blockIdx.x), so
+// foam B's upper BVH levels are reused from L1 cache across the warp.
 // =============================================================================
 
-// Stack capacity per thread — leans on register/local memory.
-// A balanced binary BVH of depth d has at most 2*d nodes on the stack.
-// With 2^15 = 32 K particles the depth is at most 15; 128 is very conservative.
-static constexpr int kDualStackDepth = 128;
+// =============================================================================
+// Phase 3a — narrowphase: particle-parallel BVH traversal
+//
+// 2-D launch:  blockIdx.x = foam-pair index
+//              blockIdx.y * blockDim.x + threadIdx.x = particle index in foam A
+//                (Morton-sorted position within the active set)
+//
+// Each thread:
+//   1. Loads its particle A's local-space AABB.
+//   2. Transforms it into foam B-local space (aToB = inv_B * tx_A).
+//   3. Traverses foam B's BVH against that AABB using a local stack.
+//   4. Emits a CollisionCandidate for each leaf hit via atomicAdd.
+//
+// All threads in the same block share the same foam B BVH, so the upper tree
+// levels stay warm in L1 across the warp — good cache reuse.
+// =============================================================================
 
-// Encodes a (nodeA, nodeB) pair onto a single 64-bit word for the GPU stack.
-__device__ __forceinline__ uint64_t encodePair(int na, int nb) {
-    return ((uint64_t)(unsigned)na << 32) | (unsigned)nb;
-}
-__device__ __forceinline__ void decodePair(uint64_t v, int& na, int& nb) {
-    na = (int)(v >> 32);
-    nb = (int)(v & 0xFFFFFFFFu);
-}
+static constexpr int kParticleStackDepth = 64; // log2(32K) ≈ 15; 64 is conservative
 
-// Transform an AABB by matrix m using the 8-corner method.
-__device__ AABB d_transformAABB(const AABB& box, const glm::mat4& m) {
-    const glm::vec3 mn = box.min_pt, mx = box.max_pt;
-    glm::vec3 c0   = glm::vec3(m * glm::vec4(mn, 1.f));
+__global__ void k_col_narrowphase_particle_bvh(
+    const FoamPair*         broadphase_pairs,
+    int                     num_broadphase_pairs,
+    const BVHNode*          bvh_nodes,
+    const int*              bvh_offsets,
+    const AABB*             particle_aabbs,
+    const int*              foam_particle_start,
+    const int*              foam_particle_counts,
+    const glm::mat4*        transforms,
+    const glm::mat4*        inv_transforms,
+    const uint32_t*         primary_particle_ids,
+    int                     num_primary_particles,
+    const uint32_t*         d_active_ids,
+    const int*              d_foam_active_start,
+    CollisionCandidate*     candidates_out,
+    int*                    candidate_counter,
+    int                     max_candidates)
+{
+    const int pair_idx     = static_cast<int>(blockIdx.x);
+    const int particle_a   = static_cast<int>(blockIdx.y) * blockDim.x
+                             + static_cast<int>(threadIdx.x);
+    if (pair_idx >= num_broadphase_pairs) return;
+
+    const FoamPair pair   = broadphase_pairs[pair_idx];
+    const int      fid_a  = pair.foam_id_a;
+    const int      fid_b  = pair.foam_id_b;
+    const int      n_a    = foam_particle_counts[fid_a];
+    const int      n_b    = foam_particle_counts[fid_b];
+    if (particle_a >= n_a || n_b <= 0) return;
+
+    // Primary-particle filter: resolve this thread's entity ID and check
+    // membership.  Linear scan over at most num_primary_particles entries
+    // (caller-enforced ≤50), executed before any BVH work.
+    if (num_primary_particles > 0) {
+        const uint32_t entity_a =
+            d_active_ids[d_foam_active_start[fid_a] + particle_a];
+        bool found = false;
+        for (int k = 0; k < num_primary_particles; ++k) {
+            if (primary_particle_ids[k] == entity_a) { found = true; break; }
+        }
+        if (!found) return;
+    }
+
+    // Load this particle's local-space AABB and transform it into B-local space.
+    const AABB localA = particle_aabbs[foam_particle_start[fid_a] + particle_a];
+
+    // aToB = inv(txB) * txA  — maps a point from A-local → B-local.
+    const glm::mat4 aToB = inv_transforms[fid_b] * transforms[fid_a];
+
+    // Transform AABB using 8-corner method.
+    const glm::vec3 mn = localA.min_pt, mx = localA.max_pt;
+    glm::vec3 c0   = glm::vec3(aToB * glm::vec4(mn, 1.f));
     glm::vec3 wmin = c0, wmax = c0;
     for (int j = 1; j < 8; ++j) {
         glm::vec3 c(j & 1 ? mx.x : mn.x,
                     j & 2 ? mx.y : mn.y,
                     j & 4 ? mx.z : mn.z);
-        c    = glm::vec3(m * glm::vec4(c, 1.f));
+        c    = glm::vec3(aToB * glm::vec4(c, 1.f));
         wmin = glm::min(wmin, c);
         wmax = glm::max(wmax, c);
     }
-    return AABB(wmin, wmax);
-}
+    const AABB queryB(wmin, wmax);  // AABB of particle A, expressed in B-local space
 
-// AABB vs AABB overlap (device).
-__device__ __forceinline__ bool d_aabbOverlap(const AABB& a, const AABB& b) {
-    return (a.max_pt.x >= b.min_pt.x) & (a.min_pt.x <= b.max_pt.x) &
-           (a.max_pt.y >= b.min_pt.y) & (a.min_pt.y <= b.max_pt.y) &
-           (a.max_pt.z >= b.min_pt.z) & (a.min_pt.z <= b.max_pt.z);
-}
-
-__global__ void k_col_narrowphase_dual_bvh(
-    const FoamPair*      broadphase_pairs,
-    int                  num_broadphase_pairs,
-    const BVHNode*       bvh_nodes,
-    const int*           bvh_offsets,
-    const int*           foam_particle_counts,
-    const glm::mat4*     transforms,
-    const glm::mat4*     inv_transforms,
-    CollisionCandidate*  candidates_out,
-    int*                 candidate_counter,
-    int                  max_candidates)
-{
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_broadphase_pairs) return;
-
-    const FoamPair pair   = broadphase_pairs[tid];
-    const int      fid_a  = pair.foam_id_a;
-    const int      fid_b  = pair.foam_id_b;
-
-    const int n_a = foam_particle_counts[fid_a];
-    const int n_b = foam_particle_counts[fid_b];
-    if (n_a <= 0 || n_b <= 0) return;
-
-    // BVH roots are stored starting at bvh_offsets[fid].
-    // Internal nodes: [0, n-2], leaf nodes: [n-1, 2n-2] (flat layout per Karras).
-    const BVHNode* bvhA = bvh_nodes + bvh_offsets[fid_a];
+    // Traverse foam B's BVH.
     const BVHNode* bvhB = bvh_nodes + bvh_offsets[fid_b];
-
-    // bToA: transforms a point from B-local → A-local.
-    //   bToA = inv(txA) * txB
-    const glm::mat4 bToA = inv_transforms[fid_a] * transforms[fid_b];
-
-    // Iterative dual traversal using a local stack of (nodeA, nodeB) pairs.
-    uint64_t stack[kDualStackDepth];
-    int      stack_ptr = 0;
-    stack[stack_ptr++] = encodePair(0, 0);  // both trees start at root (index 0)
+    int stack[kParticleStackDepth];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0; // root
 
     while (stack_ptr > 0) {
-        int na, nb;
-        decodePair(stack[--stack_ptr], na, nb);
+        const BVHNode& node = bvhB[stack[--stack_ptr]];
 
-        const BVHNode& nodeA = bvhA[na];
-        const BVHNode& nodeB = bvhB[nb];
+        // AABB overlap test (both boxes in B-local space).
+        if ((queryB.max_pt.x < node.bbox.min_pt.x) | (queryB.min_pt.x > node.bbox.max_pt.x) |
+            (queryB.max_pt.y < node.bbox.min_pt.y) | (queryB.min_pt.y > node.bbox.max_pt.y) |
+            (queryB.max_pt.z < node.bbox.min_pt.z) | (queryB.min_pt.z > node.bbox.max_pt.z))
+            continue;
 
-        // Transform B's box into A-local space for the overlap test.
-        const AABB bboxBinA = d_transformAABB(nodeB.bbox, bToA);
-        if (!d_aabbOverlap(nodeA.bbox, bboxBinA)) continue;
-
-        const bool leafA = (nodeA.prim_idx >= 0);
-        const bool leafB = (nodeB.prim_idx >= 0);
-
-        if (leafA && leafB) {
-            // Emit a candidate (bounds-check against allocated capacity).
+        if (node.prim_idx >= 0) {
+            // Leaf hit — emit candidate.
             const int out_idx = atomicAdd(candidate_counter, 1);
-            if (out_idx < max_candidates) {
-                candidates_out[out_idx] = {
-                    fid_a, fid_b,
-                    nodeA.prim_idx,
-                    nodeB.prim_idx
-                };
-            }
-        } else if (leafA) {
-            // A is a leaf — descend B.
-            if (nodeB.left  >= 0 && stack_ptr < kDualStackDepth - 1)
-                stack[stack_ptr++] = encodePair(na, nodeB.left);
-            if (nodeB.right >= 0 && stack_ptr < kDualStackDepth - 1)
-                stack[stack_ptr++] = encodePair(na, nodeB.right);
-        } else if (leafB) {
-            // B is a leaf — descend A.
-            if (nodeA.left  >= 0 && stack_ptr < kDualStackDepth - 1)
-                stack[stack_ptr++] = encodePair(nodeA.left,  nb);
-            if (nodeA.right >= 0 && stack_ptr < kDualStackDepth - 1)
-                stack[stack_ptr++] = encodePair(nodeA.right, nb);
+            if (out_idx < max_candidates)
+                candidates_out[out_idx] = { fid_a, fid_b, particle_a, node.prim_idx, 0, 0 };
         } else {
-            // Both internal — push all 4 child combinations.
-            if (nodeA.left  >= 0 && nodeB.left  >= 0 && stack_ptr < kDualStackDepth - 1)
-                stack[stack_ptr++] = encodePair(nodeA.left,  nodeB.left);
-            if (nodeA.left  >= 0 && nodeB.right >= 0 && stack_ptr < kDualStackDepth - 1)
-                stack[stack_ptr++] = encodePair(nodeA.left,  nodeB.right);
-            if (nodeA.right >= 0 && nodeB.left  >= 0 && stack_ptr < kDualStackDepth - 1)
-                stack[stack_ptr++] = encodePair(nodeA.right, nodeB.left);
-            if (nodeA.right >= 0 && nodeB.right >= 0 && stack_ptr < kDualStackDepth - 1)
-                stack[stack_ptr++] = encodePair(nodeA.right, nodeB.right);
+            // Internal node — push children.
+            if (node.left  >= 0 && stack_ptr < kParticleStackDepth - 1)
+                stack[stack_ptr++] = node.left;
+            if (node.right >= 0 && stack_ptr < kParticleStackDepth - 1)
+                stack[stack_ptr++] = node.right;
         }
     }
 }
@@ -254,10 +249,17 @@ std::vector<CollisionCandidate> detectCandidates(
     const GpuSlabAllocator&                   gpuSlab,
     const std::unordered_map<int, glm::mat4>& foamTransforms,
     const std::vector<int>&                   foamIds,
+    const std::vector<int>&                   primaryFoamIds,
+    const std::vector<uint32_t>&              primaryParticleIds,
     int                                       maxCandidates)
 {
     const int N = static_cast<int>(foamIds.size());
     if (N < 2) return {};
+
+    // Build the primary-foam set.  An empty set means "all foams are primary".
+    const std::unordered_set<int> primarySet(primaryFoamIds.begin(),
+                                             primaryFoamIds.end());
+    const bool allPrimary = primarySet.empty();
 
     // -------------------------------------------------------------------------
     // Upload per-foam transforms and inverse transforms to the GPU.
@@ -288,14 +290,10 @@ std::vector<CollisionCandidate> detectCandidates(
     CUDA_CHECK(cudaMemcpy(d_inv_transforms,  h_inv_transforms.data(),  tableSize * sizeof(glm::mat4), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_particle_counts, h_particle_counts.data(), tableSize * sizeof(int),       cudaMemcpyHostToDevice));
 
-    // Upload active foam ID list.
-    int* d_foam_ids = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_foam_ids, N * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_foam_ids, foamIds.data(), N * sizeof(int), cudaMemcpyHostToDevice));
-
     // -------------------------------------------------------------------------
-    // Phase 1 — transform local-space foam AABBs to world space.
-    // d_world_aabbs is indexed by foam_id, same as the slab's d_foam_aabbs.
+    // Phase 1 — transform local-space foam AABBs to world space on the GPU.
+    // Download immediately; num_foams is tiny so the transfer cost is negligible
+    // and it lets the broadphase pair generation run entirely on the CPU.
     // -------------------------------------------------------------------------
     AABB* d_world_aabbs = nullptr;
     CUDA_CHECK(cudaMalloc(&d_world_aabbs, tableSize * sizeof(AABB)));
@@ -304,68 +302,112 @@ std::vector<CollisionCandidate> detectCandidates(
         const int threads = 128;
         const int blocks  = (tableSize + threads - 1) / threads;
         k_col_transform_foam_aabbs<<<blocks, threads>>>(
-            gpuSlab.d_foam_aabbs,   // local-space, indexed by foam_id
+            gpuSlab.d_foam_aabbs,
             d_transforms,
             d_world_aabbs,
             tableSize);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
+    std::vector<AABB> h_world_aabbs(tableSize);
+    CUDA_CHECK(cudaMemcpy(h_world_aabbs.data(), d_world_aabbs,
+                          tableSize * sizeof(AABB), cudaMemcpyDeviceToHost));
+
     // -------------------------------------------------------------------------
-    // Phase 2 — broadphase: one thread per (i < j) foam pair.
+    // Phase 2 (CPU) — generate filtered i < j pairs and test AABB overlap.
+    // A pair is emitted when at least one side is in primarySet (or primarySet
+    // is empty, meaning all pairs are wanted).
     // -------------------------------------------------------------------------
-    const int numPairs = N * (N - 1) / 2;
+    std::vector<FoamPair> h_broadphase_pairs;
+    h_broadphase_pairs.reserve(N * (N - 1) / 2);
+
+    for (int i = 0; i < N; ++i) {
+        for (int j = i + 1; j < N; ++j) {
+            const int fi = foamIds[i];
+            const int fj = foamIds[j];
+
+            if (!allPrimary && !primarySet.count(fi) && !primarySet.count(fj))
+                continue;
+
+            const AABB& a = h_world_aabbs[fi];
+            const AABB& b = h_world_aabbs[fj];
+            if ((a.max_pt.x < b.min_pt.x) | (a.min_pt.x > b.max_pt.x) |
+                (a.max_pt.y < b.min_pt.y) | (a.min_pt.y > b.max_pt.y) |
+                (a.max_pt.z < b.min_pt.z) | (a.min_pt.z > b.max_pt.z))
+                continue;
+
+            // Guarantee: when primaryFoamIds is non-empty, foam_id_a is always a
+            // primary foam so callers can filter FoamCollision.foamIdA directly.
+            // When both or neither are primary the i < j ordering is preserved.
+            const bool fiIsPrimary = allPrimary || primarySet.count(fi);
+            h_broadphase_pairs.push_back(fiIsPrimary ? FoamPair{fi, fj}
+                                                     : FoamPair{fj, fi});
+        }
+    }
+
+    const int h_num_broadphase = static_cast<int>(h_broadphase_pairs.size());
 
     FoamPair* d_broadphase_pairs = nullptr;
-    int*      d_pair_counter     = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_broadphase_pairs, numPairs * sizeof(FoamPair)));
-    CUDA_CHECK(cudaMalloc(&d_pair_counter,     sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_pair_counter, 0, sizeof(int)));
-
-    {
-        const int threads = 128;
-        const int blocks  = (numPairs + threads - 1) / threads;
-        k_col_broadphase_foam_pairs<<<blocks, threads>>>(
-            d_world_aabbs,
-            d_foam_ids,
-            d_broadphase_pairs,
-            d_pair_counter,
-            N);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    int h_num_broadphase = 0;
-    CUDA_CHECK(cudaMemcpy(&h_num_broadphase, d_pair_counter, sizeof(int), cudaMemcpyDeviceToHost));
-
     std::vector<CollisionCandidate> results;
     if (h_num_broadphase == 0) goto cleanup;
 
+    // Upload the CPU-filtered broadphase pairs to the GPU.
+    CUDA_CHECK(cudaMalloc(&d_broadphase_pairs,
+                          h_num_broadphase * sizeof(FoamPair)));
+    CUDA_CHECK(cudaMemcpy(d_broadphase_pairs, h_broadphase_pairs.data(),
+                          h_num_broadphase * sizeof(FoamPair),
+                          cudaMemcpyHostToDevice));
+
     // -------------------------------------------------------------------------
-    // Phase 3 — narrowphase: dual BVH traversal, one thread per surviving pair.
+    // Phase 3 — narrowphase: particle-parallel BVH traversal.
+    // 2-D grid: X = broadphase pair index, Y = particle chunk in foam A.
     // -------------------------------------------------------------------------
     {
+        // Determine the Y-grid extent from the largest active count in the scene.
+        int max_n_a = 0;
+        for (int fid : foamIds)
+            max_n_a = std::max(max_n_a, h_particle_counts[fid]);
+
+        // Upload the primary-particle filter array (may be empty).
+        uint32_t* d_primary_ids     = nullptr;
+        const int num_primary       = static_cast<int>(primaryParticleIds.size());
+        if (num_primary > 0) {
+            CUDA_CHECK(cudaMalloc(&d_primary_ids, num_primary * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemcpy(d_primary_ids, primaryParticleIds.data(),
+                                  num_primary * sizeof(uint32_t),
+                                  cudaMemcpyHostToDevice));
+        }
+
         CollisionCandidate* d_candidates       = nullptr;
         int*                d_candidate_counter= nullptr;
         CUDA_CHECK(cudaMalloc(&d_candidates,        maxCandidates * sizeof(CollisionCandidate)));
         CUDA_CHECK(cudaMalloc(&d_candidate_counter, sizeof(int)));
         CUDA_CHECK(cudaMemset(d_candidate_counter, 0, sizeof(int)));
 
-        const int threads = 128;
-        const int blocks  = (h_num_broadphase + threads - 1) / threads;
-        k_col_narrowphase_dual_bvh<<<blocks, threads>>>(
+        constexpr int kThreads = 128;
+        const dim3 grid(h_num_broadphase,
+                        (max_n_a + kThreads - 1) / kThreads);
+        const dim3 block(kThreads, 1);
+        k_col_narrowphase_particle_bvh<<<grid, block>>>(
             d_broadphase_pairs,
             h_num_broadphase,
             gpuSlab.d_bvh_nodes,
             gpuSlab.d_foam_bvh_start,
+            gpuSlab.d_particle_aabbs,
+            gpuSlab.d_foam_particle_start,
             d_particle_counts,
             d_transforms,
             d_inv_transforms,
+            d_primary_ids,
+            num_primary,
+            gpuSlab.d_active_ids,
+            gpuSlab.d_foam_active_start,
             d_candidates,
             d_candidate_counter,
             maxCandidates);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());  // must complete before reading counter
-
+        // The synchronous D2H cudaMemcpy below implicitly waits for the kernel.
         int h_num_candidates = 0;
         CUDA_CHECK(cudaMemcpy(&h_num_candidates, d_candidate_counter, sizeof(int), cudaMemcpyDeviceToHost));
         if (h_num_candidates > maxCandidates)
@@ -383,8 +425,7 @@ std::vector<CollisionCandidate> detectCandidates(
                 gpuSlab.d_active_ids,
                 gpuSlab.d_foam_active_start);
             CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-
+            // The synchronous D2H cudaMemcpy below implicitly waits for the kernel.
             results.resize(h_num_candidates);
             CUDA_CHECK(cudaMemcpy(results.data(), d_candidates,
                                   h_num_candidates * sizeof(CollisionCandidate),
@@ -393,13 +434,12 @@ std::vector<CollisionCandidate> detectCandidates(
 
         CUDA_CHECK(cudaFree(d_candidates));
         CUDA_CHECK(cudaFree(d_candidate_counter));
+        CUDA_CHECK(cudaFree(d_primary_ids));
     }
 
 cleanup:
     CUDA_CHECK(cudaFree(d_world_aabbs));
     CUDA_CHECK(cudaFree(d_broadphase_pairs));
-    CUDA_CHECK(cudaFree(d_pair_counter));
-    CUDA_CHECK(cudaFree(d_foam_ids));
     CUDA_CHECK(cudaFree(d_transforms));
     CUDA_CHECK(cudaFree(d_inv_transforms));
     CUDA_CHECK(cudaFree(d_particle_counts));
@@ -717,16 +757,16 @@ std::vector<FoamCollision> detectCollisions(
     const std::unordered_map<int, glm::mat4>&      foamTransforms,
     const entt::registry&                          particleRegistry,
     const std::vector<int>&                        foamIds,
+    const std::vector<int>&                        primaryFoamIds,
+    const std::vector<uint32_t>&                   primaryParticleIds,
     int                                            maxCandidates)
 {
     // -------------------------------------------------------------------------
-    // Phases 1–3: GPU broadphase + narrowphase + entity resolve.
-    // Each CollisionCandidate already carries entity_id_a/b, resolved on the
-    // GPU by k_col_resolve_entity_ids before the D2H transfer.  No active_ids
-    // slice download is needed.
+    // Phases 1–3: GPU AABB transform, CPU broadphase (filtered), GPU narrowphase.
     // -------------------------------------------------------------------------
     const std::vector<CollisionCandidate> candidates =
-        detectCandidates(gpuSlab, foamTransforms, foamIds, maxCandidates);
+        detectCandidates(gpuSlab, foamTransforms, foamIds,
+                         primaryFoamIds, primaryParticleIds, maxCandidates);
 
     if (candidates.empty()) return {};
 
