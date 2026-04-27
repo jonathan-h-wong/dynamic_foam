@@ -73,6 +73,11 @@ namespace DynamicFoam::Sim2D {
         std::unordered_map<entt::entity,
             std::unordered_map<int, std::vector<BoundaryHit>>> stencilBoundaryContacts;
 
+        // effectiveStencilAABB: stencil -> foamB -> AABB over ALL foamB-local boundary
+        // samples (regardless of whether they hit a cell). Used in step 3 to test
+        // whether the intersection region spans the full stencil boundary on any axis.
+        std::unordered_map<entt::entity, std::unordered_map<int, AABB>> effectiveStencilAABB;
+
         for (const auto& [stencil, foamBMap] : stencilContacts) {
             int foamA = stencilFoamId.at(stencil);
             const glm::mat4& txA = foamTransforms.at(foamA);
@@ -104,6 +109,11 @@ namespace DynamicFoam::Sim2D {
                     // Convert boundary sample into foamB local space.
                     glm::vec3 sampleLocal = glm::vec3(invTxB * glm::vec4(sampleWorld, 1.0f));
 
+                    // Expand the effective stencil AABB over every sample (hit or not).
+                    AABB& effAABB = effectiveStencilAABB[stencil][foamB];
+                    effAABB.min_pt = glm::min(effAABB.min_pt, sampleLocal);
+                    effAABB.max_pt = glm::max(effAABB.max_pt, sampleLocal);
+
                     for (entt::entity mutParticle : candidates) {
                         if (!particleRegistry.all_of<ParticleLocalPosition>(mutParticle))
                             continue;
@@ -127,7 +137,36 @@ namespace DynamicFoam::Sim2D {
             }
         }
 
+        // 3) Filter stencilBoundaryContacts to entries where the intersection AABB
+        // matches the effectiveStencilAABB on at least one axis, meaning the stencil
+        // boundary fully spans that axis within foamB — indicating a genuine crossing.
+        //
+        // Result: stencil -> foamB -> boundary hits (same structure, subset of above)
+        std::unordered_map<entt::entity,
+            std::unordered_map<int, std::vector<BoundaryHit>>> validStencilWork;
 
+        for (const auto& [stencil, foamBHits] : stencilBoundaryContacts) {
+            for (const auto& [foamB, hits] : foamBHits) {
+                // Build AABB over the hit points only.
+                AABB intersectionAABB{};
+                for (const auto& hit : hits) {
+                    intersectionAABB.min_pt = glm::min(intersectionAABB.min_pt, hit.localPoint);
+                    intersectionAABB.max_pt = glm::max(intersectionAABB.max_pt, hit.localPoint);
+                }
+
+                const AABB& effAABB = effectiveStencilAABB.at(stencil).at(foamB);
+
+                // Keep this (stencil, foamB) entry if the intersection AABB matches
+                // the effective stencil AABB on at least one axis.
+                bool spans =
+                    (intersectionAABB.min_pt.x == effAABB.min_pt.x && intersectionAABB.max_pt.x == effAABB.max_pt.x) ||
+                    (intersectionAABB.min_pt.y == effAABB.min_pt.y && intersectionAABB.max_pt.y == effAABB.max_pt.y) ||
+                    (intersectionAABB.min_pt.z == effAABB.min_pt.z && intersectionAABB.max_pt.z == effAABB.max_pt.z);
+
+                if (spans)
+                    validStencilWork[stencil][foamB] = hits;
+            }
+        }
 
         return results;
     }
