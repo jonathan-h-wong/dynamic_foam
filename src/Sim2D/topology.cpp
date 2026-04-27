@@ -29,13 +29,14 @@ namespace DynamicFoam::Sim2D {
         auto collisions = detectCollisions(gpuSlab, foamTransforms, particleRegistry, foamIds,
                                            primaryFoamIds, primaryParticleIds);
 
+        // 1) Collect stencil cell to cell collisions
         // stencil particleA -> foamIdB -> intersected mutable particle ids
         std::unordered_map<entt::entity, std::unordered_map<int, std::vector<entt::entity>>> stencilContacts;
         // stencil particle -> the foam it belongs to (needed for neighbor lookup below)
         std::unordered_map<entt::entity, int> stencilFoamId;
         for (const auto& col : collisions) {
             if (particleRegistry.all_of<Stencil>(col.particleA) &&
-                particleRegistry.all_of<Mutable>(col.particleB))
+                particleRegistry.all_of<Mutable, Surface>(col.particleB))
             {
                 stencilContacts[col.particleA][col.foamIdB].push_back(col.particleB);
                 stencilFoamId.emplace(col.particleA, col.foamIdA);
@@ -60,15 +61,17 @@ namespace DynamicFoam::Sim2D {
             return !neighborCenters.empty();
         };
 
-        // For each (stencil particle, foamB) pair, compute the midpoints between
-        // the stencil particle and each of its Voronoi neighbors (world space),
-        // convert them into foamB local space, then test each midpoint against
-        // the candidate mutable cells inside foamB.
+        // 2) Collect stencil boundary point to cell collisions
+        // For each (stencil particle, foamB) pair, sample two points per Voronoi axis
+        // at ±kStencilBoundaryOffset from the edge midpoint (world space), convert them
+        // into foamB local space, then test each sample against the candidate mutable
+        // cells inside foamB.
         //
-        // Result: stencil -> foamId -> [(foamB-local midpoint, collided mutable entity)]
-        struct MidpointHit { glm::vec3 localMidpoint; entt::entity mutParticle; };
+        // Result: stencil -> foamId -> [(foamB-local boundary sample, collided mutable entity)]
+        constexpr float kStencilBoundaryOffset = 0.05f; // perturbation around t=0.5
+        struct BoundaryHit { glm::vec3 localPoint; entt::entity mutParticle; };
         std::unordered_map<entt::entity,
-            std::unordered_map<int, std::vector<MidpointHit>>> stencilBoundaryContacts;
+            std::unordered_map<int, std::vector<BoundaryHit>>> stencilBoundaryContacts;
 
         for (const auto& [stencil, foamBMap] : stencilContacts) {
             int foamA = stencilFoamId.at(stencil);
@@ -79,24 +82,27 @@ namespace DynamicFoam::Sim2D {
                 glm::vec3(txA * glm::vec4(
                     particleRegistry.get<ParticleLocalPosition>(stencil).value, 1.0f));
 
-            // Collect world-space midpoints along each stencil axis (one per neighbor).
-            std::vector<glm::vec3> midpointsWorld;
+            // Collect two world-space boundary samples per stencil axis (±offset from midpoint).
+            std::vector<glm::vec3> boundaryPointsWorld;
             const AdjacencyList& adjA = foamAdjacencyLists.at(foamA);
             adjA.forEachNeighbor(static_cast<uint32_t>(stencil), [&](uint32_t nbId) {
                 entt::entity nb = static_cast<entt::entity>(nbId);
                 if (!particleRegistry.all_of<ParticleLocalPosition>(nb)) return;
                 glm::vec3 nbWorld = glm::vec3(txA * glm::vec4(
                     particleRegistry.get<ParticleLocalPosition>(nb).value, 1.0f));
-                midpointsWorld.push_back((stencilWorld + nbWorld) * 0.5f);
+                glm::vec3 axis = nbWorld - stencilWorld;
+                // Sample at t = 0.5 ± kStencilBoundaryOffset along the stencil->neighbor segment.
+                boundaryPointsWorld.push_back(stencilWorld + (0.5f + kStencilBoundaryOffset) * axis);
+                boundaryPointsWorld.push_back(stencilWorld + (0.5f - kStencilBoundaryOffset) * axis);
             });
 
             for (const auto& [foamB, candidates] : foamBMap) {
                 const glm::mat4  invTxB = glm::inverse(foamTransforms.at(foamB));
                 const AdjacencyList& adjB = foamAdjacencyLists.at(foamB);
 
-                for (const glm::vec3& midWorld : midpointsWorld) {
-                    // Convert midpoint into foamB local space.
-                    glm::vec3 midLocal = glm::vec3(invTxB * glm::vec4(midWorld, 1.0f));
+                for (const glm::vec3& sampleWorld : boundaryPointsWorld) {
+                    // Convert boundary sample into foamB local space.
+                    glm::vec3 sampleLocal = glm::vec3(invTxB * glm::vec4(sampleWorld, 1.0f));
 
                     for (entt::entity mutParticle : candidates) {
                         if (!particleRegistry.all_of<ParticleLocalPosition>(mutParticle))
@@ -114,8 +120,8 @@ namespace DynamicFoam::Sim2D {
                                 particleRegistry.get<ParticleLocalPosition>(nb).value);
                         });
 
-                        if (voronoiContains(midLocal, cellCenter, cellNeighborCenters))
-                            stencilBoundaryContacts[stencil][foamB].push_back({midLocal, mutParticle});
+                        if (voronoiContains(sampleLocal, cellCenter, cellNeighborCenters))
+                            stencilBoundaryContacts[stencil][foamB].push_back({sampleLocal, mutParticle});
                     }
                 }
             }
