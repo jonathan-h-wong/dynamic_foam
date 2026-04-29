@@ -1,385 +1,369 @@
 #include "dynamic_foam/Sim2D/topology.h"
-#include <optional>
 #include <queue>
-#include <unordered_set>
 
 namespace DynamicFoam::Sim2D {
-    std::vector<FoamTopologyUpdate> Topology::update(
-        const GpuSlabAllocator&                              gpuSlab,
-        std::unordered_map<int, AdjacencyList>&              foamAdjacencyLists,
-        const std::unordered_map<int, glm::mat4>&            foamTransforms,
-        const entt::registry&                                foamRegistry,
-        entt::registry&                                      particleRegistry
-    ) {
-        std::vector<FoamTopologyUpdate> results;
 
-        // Collect active foam IDs from the adjacency list map.
-        std::vector<int> foamIds;
-        foamIds.reserve(foamAdjacencyLists.size());
-        for (const auto& [id, _] : foamAdjacencyLists)
-            foamIds.push_back(id);
+// =============================================================================
+// Static helpers
+// =============================================================================
 
-        // Primary foam IDs: foams with the Controller component.
-        std::vector<int> primaryFoamIds;
-        for (auto entity : foamRegistry.view<Controller>())
-            primaryFoamIds.push_back(static_cast<int>(entity));
+bool Topology::voronoiContains(
+    const glm::vec3&              P,
+    const glm::vec3&              C,
+    const std::vector<glm::vec3>& neighborCenters)
+{
+    for (const auto& N : neighborCenters) {
+        glm::vec3 edge = N - C;
+        float     len  = glm::length(edge);
+        if (len < 1e-6f) continue;
+        glm::vec3 n       = edge / len;
+        float     normSdf = glm::dot(P - C, n) - 0.5f * len;
+        if (normSdf > 0.0f) return false;
+    }
+    return !neighborCenters.empty();
+}
 
-        // Primary particle IDs: particles with the Stencil component.
-        std::vector<uint32_t> primaryParticleIds;
-        for (auto entity : particleRegistry.view<Stencil>())
-            primaryParticleIds.push_back(static_cast<uint32_t>(entity));
+std::optional<glm::vec3> Topology::faceReflect(
+    const glm::vec3& P,
+    const glm::vec3& C,
+    const glm::vec3& N)
+{
+    glm::vec3 edge = N - C;
+    float     len  = glm::length(edge);
+    if (len < 1e-6f) return std::nullopt;
+    glm::vec3 n   = edge / len;
+    float     sdf = glm::dot(P - C, n) - 0.5f * len;
+    // sdf(C) = -0.5*len; only proceed if P is closer to the face than C.
+    if (sdf <= -0.5f * len) return std::nullopt;
+    return P - 2.0f * sdf * n;
+}
 
-        auto collisions = detectCollisions(gpuSlab, foamTransforms, particleRegistry, foamIds,
-                                           primaryFoamIds, primaryParticleIds);
+entt::entity Topology::addInteriorParticle(
+    entt::entity                                                         stencilId,
+    entt::entity                                                         cellId,
+    glm::vec3                                                            localPos,
+    entt::registry&                                                      registry,
+    std::unordered_map<entt::entity, std::unordered_set<entt::entity>>& stencilDirtyCells,
+    std::unordered_map<entt::entity, std::unordered_set<entt::entity>>& cellSamples)
+{
+    entt::entity p = registry.create();
+    registry.emplace<ParticleColor>(p,         registry.get<ParticleColor>(cellId));
+    registry.emplace<ParticleOpacity>(p,       registry.get<ParticleOpacity>(cellId));
+    registry.emplace<Surface>(p);
+    registry.emplace<Mutable>(p);
+    registry.emplace<ParticleMass>(p);
+    registry.emplace<ParticleVertices>(p);
+    registry.emplace<ParticleLocalPosition>(p, ParticleLocalPosition{ localPos });
+    stencilDirtyCells[stencilId].insert(cellId);
+    cellSamples[cellId].insert(p);
+    return p;
+}
 
-        // 1) Collect stencil cell to cell collisions
-        // stencil particleA -> foamIdB -> intersected mutable particle ids
-        std::unordered_map<entt::entity, std::unordered_map<int, std::vector<entt::entity>>> stencilCellContacts;
-        // stencil particle -> the foam it belongs to (needed for neighbor lookup below)
-        std::unordered_map<entt::entity, int> stencilFoamId;
-        for (const auto& col : collisions) {
-            if (particleRegistry.all_of<Stencil>(col.particleA) &&
-                particleRegistry.all_of<Mutable, Surface>(col.particleB))
-            {
-                stencilCellContacts[col.particleA][col.foamIdB].push_back(col.particleB);
-                stencilFoamId.emplace(col.particleA, col.foamIdA);
-            }
-        }
+entt::entity Topology::addAirParticle(
+    entt::entity                                                         cellId,
+    glm::vec3                                                            localPos,
+    entt::registry&                                                      registry,
+    std::unordered_map<entt::entity, std::unordered_set<entt::entity>>& cellSamples)
+{
+    entt::entity p = registry.create();
+    registry.emplace<ParticleColor>(p);
+    registry.emplace<ParticleOpacity>(p,       ParticleOpacity{ 0.0f });
+    registry.emplace<ParticleMass>(p,          ParticleMass{ 0.0f });
+    registry.emplace<ParticleVertices>(p);
+    registry.emplace<Mutable>(p);
+    registry.emplace<ParticleLocalPosition>(p, ParticleLocalPosition{ localPos });
+    cellSamples[cellId].insert(p);
+    return p;
+}
 
-        // Voronoi half-plane containment test (CPU, local-space).
-        // Returns true if point P is inside the Voronoi cell centered at C.
-        auto voronoiContains = [](
-            const glm::vec3& P,
-            const glm::vec3& C,
-            const std::vector<glm::vec3>& neighborCenters) -> bool
+// =============================================================================
+// Steps 1-3: build valid stencil work
+// =============================================================================
+
+StencilWorkResult Topology::buildStencilWork(
+    const std::vector<FoamCollision>&             collisions,
+    const std::unordered_map<int, AdjacencyList>& foamAdjacencyLists,
+    const std::unordered_map<int, glm::mat4>&     foamTransforms,
+    const entt::registry&                         particleRegistry)
+{
+    StencilWorkResult result;
+
+    // 1) Collect stencil cell-to-cell collisions.
+    // stencil particle -> the foam it belongs to
+    std::unordered_map<entt::entity, int> stencilFoamId;
+    for (const auto& col : collisions) {
+        if (particleRegistry.all_of<Stencil>(col.particleA) &&
+            particleRegistry.all_of<Mutable, Surface>(col.particleB))
         {
-            for (const auto& N : neighborCenters) {
-                glm::vec3 edge = N - C;
-                float     len  = glm::length(edge);
-                if (len < 1e-6f) continue;
-                glm::vec3 n       = edge / len;
-                float     normSdf = glm::dot(P - C, n) - 0.5f * len;
-                if (normSdf > 0.0f) return false;
-            }
-            return !neighborCenters.empty();
-        };
-
-        // 2) Collect stencil boundary point to cell collisions
-        // For each (stencil particle, foamB) pair, sample two points per Voronoi axis
-        // at ±kStencilBoundaryOffset from the edge midpoint (world space), convert them
-        // into foamB local space, then test each sample against the candidate mutable
-        // cells inside foamB.
-        //
-        // Result: stencil -> foamId -> [(foamB-local boundary sample, collided mutable entity)]
-        constexpr float kStencilBoundaryOffset = 0.05f; // perturbation around t=0.5
-        struct BoundaryHit { glm::vec3 localPoint; entt::entity mutParticle; };
-        std::unordered_map<entt::entity,
-            std::unordered_map<int, std::vector<BoundaryHit>>> stencilBoundaryContacts;
-
-        // effectiveStencilAABB: stencil -> foamB -> AABB over ALL foamB-local boundary
-        // samples (regardless of whether they hit a cell). Used in step 3 to test
-        // whether the intersection region spans the full stencil boundary on any axis.
-        std::unordered_map<entt::entity, std::unordered_map<int, AABB>> effectiveStencilAABB;
-
-        for (const auto& [stencil, foamBMap] : stencilCellContacts) {
-            int foamA = stencilFoamId.at(stencil);
-            const glm::mat4& txA = foamTransforms.at(foamA);
-
-            // Stencil center in world space.
-            glm::vec3 stencilWorld =
-                glm::vec3(txA * glm::vec4(
-                    particleRegistry.get<ParticleLocalPosition>(stencil).value, 1.0f));
-
-            // Collect two world-space boundary samples per stencil axis (±offset from midpoint).
-            std::vector<glm::vec3> boundaryPointsWorld;
-            const AdjacencyList& adjA = foamAdjacencyLists.at(foamA);
-            adjA.forEachNeighbor(static_cast<uint32_t>(stencil), [&](uint32_t nbId) {
-                entt::entity nb = static_cast<entt::entity>(nbId);
-                if (!particleRegistry.all_of<ParticleLocalPosition>(nb)) return;
-                glm::vec3 nbWorld = glm::vec3(txA * glm::vec4(
-                    particleRegistry.get<ParticleLocalPosition>(nb).value, 1.0f));
-                glm::vec3 axis = nbWorld - stencilWorld;
-                // Sample at t = 0.5 ± kStencilBoundaryOffset along the stencil->neighbor segment.
-                boundaryPointsWorld.push_back(stencilWorld + (0.5f + kStencilBoundaryOffset) * axis);
-                boundaryPointsWorld.push_back(stencilWorld + (0.5f - kStencilBoundaryOffset) * axis);
-            });
-
-            for (const auto& [foamB, candidates] : foamBMap) {
-                const glm::mat4  invTxB = glm::inverse(foamTransforms.at(foamB));
-                const AdjacencyList& adjB = foamAdjacencyLists.at(foamB);
-
-                for (const glm::vec3& sampleWorld : boundaryPointsWorld) {
-                    // Convert boundary sample into foamB local space.
-                    glm::vec3 sampleLocal = glm::vec3(invTxB * glm::vec4(sampleWorld, 1.0f));
-
-                    // Expand the effective stencil AABB over every sample (hit or not).
-                    AABB& effAABB = effectiveStencilAABB[stencil][foamB];
-                    effAABB.min_pt = glm::min(effAABB.min_pt, sampleLocal);
-                    effAABB.max_pt = glm::max(effAABB.max_pt, sampleLocal);
-
-                    for (entt::entity mutParticle : candidates) {
-                        if (!particleRegistry.all_of<ParticleLocalPosition>(mutParticle))
-                            continue;
-
-                        // Cell center and neighbor centers are already in foamB local space.
-                        glm::vec3 cellCenter =
-                            particleRegistry.get<ParticleLocalPosition>(mutParticle).value;
-
-                        std::vector<glm::vec3> cellNeighborCenters;
-                        adjB.forEachNeighbor(static_cast<uint32_t>(mutParticle), [&](uint32_t nbId) {
-                            entt::entity nb = static_cast<entt::entity>(nbId);
-                            if (!particleRegistry.all_of<ParticleLocalPosition>(nb)) return;
-                            cellNeighborCenters.push_back(
-                                particleRegistry.get<ParticleLocalPosition>(nb).value);
-                        });
-
-                        if (voronoiContains(sampleLocal, cellCenter, cellNeighborCenters))
-                            stencilBoundaryContacts[stencil][foamB].push_back({sampleLocal, mutParticle});
-                    }
-                }
-            }
+            result.cellContacts[col.particleA][col.foamIdB].push_back(col.particleB);
+            stencilFoamId.emplace(col.particleA, col.foamIdA);
         }
+    }
 
-        // 3) Filter stencilBoundaryContacts to entries where the intersection AABB
-        // matches the effectiveStencilAABB on at least one axis, meaning the stencil
-        // boundary fully spans that axis within foamB — indicating a genuine crossing.
-        //
-        // Result: stencil -> foamB -> boundary hits (same structure, subset of above)
-        std::unordered_map<entt::entity,
-            std::unordered_map<int, std::vector<BoundaryHit>>> validStencilWork;
+    // 2) For each (stencil, foamB) pair, sample boundary points and Voronoi-test them
+    //    against candidate cells, building stencilBoundaryContacts and effectiveAABB.
+    constexpr float kStencilBoundaryOffset = 0.05f;
 
-        for (const auto& [stencil, foamBHits] : stencilBoundaryContacts) {
-            for (const auto& [foamB, hits] : foamBHits) {
-                // Build AABB over the hit points only.
-                AABB intersectionAABB{};
-                for (const auto& hit : hits) {
-                    intersectionAABB.min_pt = glm::min(intersectionAABB.min_pt, hit.localPoint);
-                    intersectionAABB.max_pt = glm::max(intersectionAABB.max_pt, hit.localPoint);
-                }
+    std::unordered_map<entt::entity,
+        std::unordered_map<int, std::vector<BoundaryHit>>> stencilBoundaryContacts;
 
-                const AABB& effAABB = effectiveStencilAABB.at(stencil).at(foamB);
+    for (const auto& [stencil, foamBMap] : result.cellContacts) {
+        int foamA = stencilFoamId.at(stencil);
+        const glm::mat4& txA = foamTransforms.at(foamA);
 
-                // Keep this (stencil, foamB) entry if the intersection AABB matches
-                // the effective stencil AABB on at least one axis.
-                bool spans =
-                    (intersectionAABB.min_pt.x == effAABB.min_pt.x && intersectionAABB.max_pt.x == effAABB.max_pt.x) ||
-                    (intersectionAABB.min_pt.y == effAABB.min_pt.y && intersectionAABB.max_pt.y == effAABB.max_pt.y) ||
-                    (intersectionAABB.min_pt.z == effAABB.min_pt.z && intersectionAABB.max_pt.z == effAABB.max_pt.z);
+        glm::vec3 stencilWorld =
+            glm::vec3(txA * glm::vec4(
+                particleRegistry.get<ParticleLocalPosition>(stencil).value, 1.0f));
 
-                if (spans)
-                    validStencilWork[stencil][foamB] = hits;
-            }
-        }
-        
-        // 4) Point creation
-        std::unordered_map<entt::entity, std::unordered_set<entt::entity>> stencilDirtyCells;
-        std::unordered_map<entt::entity, std::unordered_set<entt::entity>> cellSamples;
-        for (const auto& [stencil, foamBHits] : validStencilWork) {
-            for (const auto& [foamB, hits] : foamBHits) {
+        // Two world-space boundary samples per stencil axis (+-offset from midpoint).
+        std::vector<glm::vec3> boundaryPointsWorld;
+        const AdjacencyList& adjA = foamAdjacencyLists.at(foamA);
+        adjA.forEachNeighbor(static_cast<uint32_t>(stencil), [&](uint32_t nbId) {
+            entt::entity nb = static_cast<entt::entity>(nbId);
+            if (!particleRegistry.all_of<ParticleLocalPosition>(nb)) return;
+            glm::vec3 nbWorld = glm::vec3(txA * glm::vec4(
+                particleRegistry.get<ParticleLocalPosition>(nb).value, 1.0f));
+            glm::vec3 axis = nbWorld - stencilWorld;
+            boundaryPointsWorld.push_back(stencilWorld + (0.5f + kStencilBoundaryOffset) * axis);
+            boundaryPointsWorld.push_back(stencilWorld + (0.5f - kStencilBoundaryOffset) * axis);
+        });
 
-                // First, produce overlap set to filter downstream graph traversal.
-                // overlap_set: contact cells whose Voronoi AABB is entirely contained
-                // within the effectiveStencilAABB for this (stencil, foamB) pair.
-                std::unordered_set<entt::entity> overlap_set;
+        for (const auto& [foamB, candidates] : foamBMap) {
+            const glm::mat4      invTxB = glm::inverse(foamTransforms.at(foamB));
+            const AdjacencyList& adjB   = foamAdjacencyLists.at(foamB);
 
-                // Add covered particles
-                const AABB& effAABB = effectiveStencilAABB.at(stencil).at(foamB);
-                if (stencilCellContacts.count(stencil) &&
-                    stencilCellContacts.at(stencil).count(foamB))
-                {
-                    for (entt::entity cellEnt : stencilCellContacts.at(stencil).at(foamB)) {
-                        if (!particleRegistry.all_of<ParticleVertices>(cellEnt)) continue;
+            for (const glm::vec3& sampleWorld : boundaryPointsWorld) {
+                glm::vec3 sampleLocal = glm::vec3(invTxB * glm::vec4(sampleWorld, 1.0f));
 
-                        const auto& verts =
-                            particleRegistry.get<ParticleVertices>(cellEnt).vertices;
-                        if (verts.empty()) continue;
+                AABB& effAABB = result.effectiveAABB[stencil][foamB];
+                effAABB.min_pt = glm::min(effAABB.min_pt, sampleLocal);
+                effAABB.max_pt = glm::max(effAABB.max_pt, sampleLocal);
 
-                        // Build AABB directly from the Voronoi cell's local-space vertices.
-                        AABB cellAABB{};
-                        cellAABB.min_pt = verts[0];
-                        cellAABB.max_pt = verts[0];
-                        for (const auto& v : verts) {
-                            cellAABB.min_pt = glm::min(cellAABB.min_pt, v);
-                            cellAABB.max_pt = glm::max(cellAABB.max_pt, v);
-                        }
+                for (entt::entity mutParticle : candidates) {
+                    if (!particleRegistry.all_of<ParticleLocalPosition>(mutParticle)) continue;
 
-                        // Deposit cell if its AABB is entirely covered by effAABB.
-                        bool covered =
-                            cellAABB.min_pt.x >= effAABB.min_pt.x &&
-                            cellAABB.max_pt.x <= effAABB.max_pt.x &&
-                            cellAABB.min_pt.y >= effAABB.min_pt.y &&
-                            cellAABB.max_pt.y <= effAABB.max_pt.y &&
-                            cellAABB.min_pt.z >= effAABB.min_pt.z &&
-                            cellAABB.max_pt.z <= effAABB.max_pt.z;
+                    glm::vec3 cellCenter =
+                        particleRegistry.get<ParticleLocalPosition>(mutParticle).value;
 
-                        if (covered)
-                            overlap_set.insert(cellEnt);
-                    }
-                }
-
-                // Add boundary particles
-                for (const auto& hit : hits)
-                    overlap_set.insert(hit.mutParticle);
-
-                // Utility: create a new interior particle inheriting color, opacity, Surface,
-                // and Mutable from the intersected cell; mass and vertices are left as defaults
-                // to be populated after triangulation.
-                auto addInteriorParticle = [&](entt::entity stencilId,
-                                               entt::entity cellId,
-                                               glm::vec3    localPos) -> entt::entity
-                {
-                    entt::entity p = particleRegistry.create();
-                    particleRegistry.emplace<ParticleColor>(p, particleRegistry.get<ParticleColor>(cellId));
-                    particleRegistry.emplace<ParticleOpacity>(p, particleRegistry.get<ParticleOpacity>(cellId));
-                    particleRegistry.emplace<Surface>(p);
-                    particleRegistry.emplace<Mutable>(p);
-                    particleRegistry.emplace<ParticleMass>(p);
-                    particleRegistry.emplace<ParticleVertices>(p);
-                    particleRegistry.emplace<ParticleLocalPosition>(p, ParticleLocalPosition{ localPos });
-                    stencilDirtyCells[stencilId].insert(cellId);
-                    cellSamples[cellId].insert(p);
-                    return p;
-                };
-
-                // Utility: test whether point P is near the Voronoi bisector between
-                // cell center C and a neighbor at N (sdf(P) > sdf(C)).
-                // Returns the reflected point across that bisector, or std::nullopt.
-                auto faceReflect = [](const glm::vec3& P,
-                                      const glm::vec3& C,
-                                      const glm::vec3& N) -> std::optional<glm::vec3>
-                {
-                    glm::vec3 edge = N - C;
-                    float     len  = glm::length(edge);
-                    if (len < 1e-6f) return std::nullopt;
-                    glm::vec3 n   = edge / len;
-                    float sdf     = glm::dot(P - C, n) - 0.5f * len;
-                    if (sdf <= -0.5f * len) return std::nullopt; // not closer than center
-                    return P - 2.0f * sdf * n;
-                };
-
-                // Utility: create a zero-opacity air particle reflected across a Voronoi
-                // bisector plane; mass and vertices are left as defaults.
-                auto addAirParticle = [&](entt::entity cellId,
-                                          glm::vec3    localPos) -> entt::entity
-                {
-                    entt::entity p = particleRegistry.create();
-                    particleRegistry.emplace<ParticleColor>(p);
-                    particleRegistry.emplace<ParticleOpacity>(p, ParticleOpacity{ 0.0f });
-                    particleRegistry.emplace<ParticleMass>(p, ParticleMass{ 0.0f });
-                    particleRegistry.emplace<ParticleVertices>(p);
-                    particleRegistry.emplace<Mutable>(p);
-                    particleRegistry.emplace<ParticleLocalPosition>(p, ParticleLocalPosition{ localPos });
-                    cellSamples[cellId].insert(p);
-                    return p;
-                };
-
-                // Densification
-                for (const auto& hit: hits) {
-                    // Surface Cell Scaffolding
-                    entt::entity newParticle = addInteriorParticle(stencil, hit.mutParticle, hit.localPoint);
-                    const AdjacencyList& adjB = foamAdjacencyLists.at(foamB);
-                    const glm::vec3 cellCenter =
-                        particleRegistry.get<ParticleLocalPosition>(hit.mutParticle).value;
-
-                    // Reflected air particles across air-facing bisectors of hit.mutParticle.
-                    adjB.forEachNeighbor(static_cast<uint32_t>(hit.mutParticle), [&](uint32_t nbId) {
+                    std::vector<glm::vec3> cellNeighborCenters;
+                    adjB.forEachNeighbor(static_cast<uint32_t>(mutParticle), [&](uint32_t nbId) {
                         entt::entity nb = static_cast<entt::entity>(nbId);
-                        if (!particleRegistry.all_of<ParticleLocalPosition, ParticleOpacity>(nb)) return;
-                        if (particleRegistry.get<ParticleOpacity>(nb).value != 0.0f) return;
-
-                        glm::vec3 nbCenter = particleRegistry.get<ParticleLocalPosition>(nb).value;
-                        if (auto reflected = faceReflect(hit.localPoint, cellCenter, nbCenter))
-                            addAirParticle(hit.mutParticle, *reflected);
+                        if (!particleRegistry.all_of<ParticleLocalPosition>(nb)) return;
+                        cellNeighborCenters.push_back(
+                            particleRegistry.get<ParticleLocalPosition>(nb).value);
                     });
 
-                    // Surface Cell Neighbor Scaffolding
-                    // For each surface neighbor of hit.mutParticle outside the overlap region,
-                    // mirror hit.localPoint into that neighbor's cell to preserve the shared
-                    // edge under triangulation.
-                    adjB.forEachNeighbor(static_cast<uint32_t>(hit.mutParticle), [&](uint32_t nbrId) {
-                        entt::entity nbr = static_cast<entt::entity>(nbrId);
-                        if (!particleRegistry.all_of<Surface, ParticleLocalPosition>(nbr)) return;
-                        if (overlap_set.count(nbr)) return;
+                    if (voronoiContains(sampleLocal, cellCenter, cellNeighborCenters))
+                        stencilBoundaryContacts[stencil][foamB].push_back({sampleLocal, mutParticle});
+                }
+            }
+        }
+    }
 
-                        glm::vec3 nbrCenter = particleRegistry.get<ParticleLocalPosition>(nbr).value;
-                        auto reflectedIntoNbr = faceReflect(hit.localPoint, cellCenter, nbrCenter);
-                        if (!reflectedIntoNbr) return;
+    // 3) Filter to entries whose intersection AABB spans the effective stencil AABB on
+    //    at least one axis, indicating a genuine crossing.
+    for (const auto& [stencil, foamBHits] : stencilBoundaryContacts) {
+        for (const auto& [foamB, hits] : foamBHits) {
+            AABB intersectionAABB{};
+            for (const auto& hit : hits) {
+                intersectionAABB.min_pt = glm::min(intersectionAABB.min_pt, hit.localPoint);
+                intersectionAABB.max_pt = glm::max(intersectionAABB.max_pt, hit.localPoint);
+            }
 
-                        addInteriorParticle(stencil, nbr, *reflectedIntoNbr);
+            const AABB& effAABB = result.effectiveAABB.at(stencil).at(foamB);
 
-                        // For each air neighbor of nbr, produce a reflected air ghost.
-                        adjB.forEachNeighbor(nbrId, [&](uint32_t airNbrId) {
-                            entt::entity airNbr = static_cast<entt::entity>(airNbrId);
-                            if (!particleRegistry.all_of<Surface, ParticleLocalPosition, ParticleOpacity>(airNbr)) return;
-                            if (particleRegistry.get<ParticleOpacity>(airNbr).value != 0.0f) return;
+            bool spans =
+                (intersectionAABB.min_pt.x == effAABB.min_pt.x && intersectionAABB.max_pt.x == effAABB.max_pt.x) ||
+                (intersectionAABB.min_pt.y == effAABB.min_pt.y && intersectionAABB.max_pt.y == effAABB.max_pt.y) ||
+                (intersectionAABB.min_pt.z == effAABB.min_pt.z && intersectionAABB.max_pt.z == effAABB.max_pt.z);
 
-                            glm::vec3 airNbrCenter = particleRegistry.get<ParticleLocalPosition>(airNbr).value;
-                            if (auto reflectedAir = faceReflect(*reflectedIntoNbr, nbrCenter, airNbrCenter))
-                                addAirParticle(nbr, *reflectedAir);
-                        });
+            if (spans)
+                result.validWork[stencil][foamB] = hits;
+        }
+    }
+
+    return result;
+}
+
+// =============================================================================
+// update
+// =============================================================================
+
+std::vector<FoamTopologyUpdate> Topology::update(
+    const GpuSlabAllocator&                              gpuSlab,
+    std::unordered_map<int, AdjacencyList>&              foamAdjacencyLists,
+    const std::unordered_map<int, glm::mat4>&            foamTransforms,
+    const entt::registry&                                foamRegistry,
+    entt::registry&                                      particleRegistry)
+{
+    std::vector<FoamTopologyUpdate> results;
+
+    // Collect IDs needed by detectCollisions.
+    std::vector<int> foamIds;
+    foamIds.reserve(foamAdjacencyLists.size());
+    for (const auto& [id, _] : foamAdjacencyLists)
+        foamIds.push_back(id);
+
+    std::vector<int> primaryFoamIds;
+    for (auto entity : foamRegistry.view<Controller>())
+        primaryFoamIds.push_back(static_cast<int>(entity));
+
+    std::vector<uint32_t> primaryParticleIds;
+    for (auto entity : particleRegistry.view<Stencil>())
+        primaryParticleIds.push_back(static_cast<uint32_t>(entity));
+
+    auto collisions = detectCollisions(gpuSlab, foamTransforms, particleRegistry,
+                                       foamIds, primaryFoamIds, primaryParticleIds);
+
+    // Steps 1-3: collision filtering, boundary sampling, spanning-axis filter.
+    auto [cellContacts, effectiveAABB, validWork] =
+        buildStencilWork(collisions, foamAdjacencyLists, foamTransforms, particleRegistry);
+
+    // 4) Point creation
+    std::unordered_map<entt::entity, std::unordered_set<entt::entity>> stencilDirtyCells;
+    std::unordered_map<entt::entity, std::unordered_set<entt::entity>> cellSamples;
+
+    for (const auto& [stencil, foamBHits] : validWork) {
+        for (const auto& [foamB, hits] : foamBHits) {
+            const AdjacencyList& adjB    = foamAdjacencyLists.at(foamB);
+            const AABB&          effAABB = effectiveAABB.at(stencil).at(foamB);
+
+            // overlap_set: cells whose Voronoi AABB is fully covered by effAABB,
+            // plus the boundary hit cells themselves.
+            std::unordered_set<entt::entity> overlap_set;
+
+            if (cellContacts.count(stencil) && cellContacts.at(stencil).count(foamB)) {
+                for (entt::entity cellEnt : cellContacts.at(stencil).at(foamB)) {
+                    if (!particleRegistry.all_of<ParticleVertices>(cellEnt)) continue;
+                    const auto& verts = particleRegistry.get<ParticleVertices>(cellEnt).vertices;
+                    if (verts.empty()) continue;
+
+                    AABB cellAABB{ verts[0], verts[0] };
+                    for (const auto& v : verts) {
+                        cellAABB.min_pt = glm::min(cellAABB.min_pt, v);
+                        cellAABB.max_pt = glm::max(cellAABB.max_pt, v);
+                    }
+
+                    if (cellAABB.min_pt.x >= effAABB.min_pt.x && cellAABB.max_pt.x <= effAABB.max_pt.x &&
+                        cellAABB.min_pt.y >= effAABB.min_pt.y && cellAABB.max_pt.y <= effAABB.max_pt.y &&
+                        cellAABB.min_pt.z >= effAABB.min_pt.z && cellAABB.max_pt.z <= effAABB.max_pt.z)
+                        overlap_set.insert(cellEnt);
+                }
+            }
+            for (const auto& hit : hits)
+                overlap_set.insert(hit.mutParticle);
+
+            // Densification loop
+            for (const auto& hit : hits) {
+                const glm::vec3 cellCenter =
+                    particleRegistry.get<ParticleLocalPosition>(hit.mutParticle).value;
+
+                // Surface Cell Scaffolding: place a new particle at the boundary hit point.
+                addInteriorParticle(stencil, hit.mutParticle, hit.localPoint,
+                                    particleRegistry, stencilDirtyCells, cellSamples);
+
+                // Reflected air particles across air-facing bisectors of hit.mutParticle.
+                adjB.forEachNeighbor(static_cast<uint32_t>(hit.mutParticle), [&](uint32_t nbId) {
+                    entt::entity nb = static_cast<entt::entity>(nbId);
+                    if (!particleRegistry.all_of<ParticleLocalPosition, ParticleOpacity>(nb)) return;
+                    if (particleRegistry.get<ParticleOpacity>(nb).value != 0.0f) return;
+
+                    glm::vec3 nbCenter = particleRegistry.get<ParticleLocalPosition>(nb).value;
+                    if (auto reflected = faceReflect(hit.localPoint, cellCenter, nbCenter))
+                        addAirParticle(hit.mutParticle, *reflected, particleRegistry, cellSamples);
+                });
+
+                // Surface Cell Neighbor Scaffolding: mirror hit.localPoint into each
+                // surface neighbor outside the overlap region to preserve shared edges.
+                adjB.forEachNeighbor(static_cast<uint32_t>(hit.mutParticle), [&](uint32_t nbrId) {
+                    entt::entity nbr = static_cast<entt::entity>(nbrId);
+                    if (!particleRegistry.all_of<Surface, ParticleLocalPosition>(nbr)) return;
+                    if (overlap_set.count(nbr)) return;
+
+                    glm::vec3 nbrCenter = particleRegistry.get<ParticleLocalPosition>(nbr).value;
+                    auto reflectedIntoNbr = faceReflect(hit.localPoint, cellCenter, nbrCenter);
+                    if (!reflectedIntoNbr) return;
+
+                    addInteriorParticle(stencil, nbr, *reflectedIntoNbr,
+                                        particleRegistry, stencilDirtyCells, cellSamples);
+
+                    // Air ghosts for each air neighbor of nbr.
+                    adjB.forEachNeighbor(nbrId, [&](uint32_t airNbrId) {
+                        entt::entity airNbr = static_cast<entt::entity>(airNbrId);
+                        if (!particleRegistry.all_of<Surface, ParticleLocalPosition, ParticleOpacity>(airNbr)) return;
+                        if (particleRegistry.get<ParticleOpacity>(airNbr).value != 0.0f) return;
+
+                        glm::vec3 airNbrCenter = particleRegistry.get<ParticleLocalPosition>(airNbr).value;
+                        if (auto reflectedAir = faceReflect(*reflectedIntoNbr, nbrCenter, airNbrCenter))
+                            addAirParticle(nbr, *reflectedAir, particleRegistry, cellSamples);
                     });
+                });
 
-                    // Internal Densification
-                    // BFS from hit.mutParticle into non-surface, opaque interior cells.
-                    // At each visited cell, deposit N uniformly distributed sample points.
-                    constexpr int kDensifyDepth   = 2;
-                    constexpr int kSamplesPerCell = 2;
+                // Internal Densification: BFS into non-surface opaque interior cells,
+                // depositing N uniformly distributed sample points at each.
+                constexpr int kDensifyDepth   = 2;
+                constexpr int kSamplesPerCell = 2;
 
-                    struct BfsNode { entt::entity cell; int depth; };
-                    std::unordered_set<entt::entity> visited;
-                    std::queue<BfsNode> bfsQueue;
+                struct BfsNode { entt::entity cell; int depth; };
+                std::unordered_set<entt::entity> visited;
+                std::queue<BfsNode>              bfsQueue;
 
-                    visited.insert(hit.mutParticle);
-                    bfsQueue.push({ hit.mutParticle, 0 });
+                visited.insert(hit.mutParticle);
+                bfsQueue.push({ hit.mutParticle, 0 });
 
-                    while (!bfsQueue.empty()) {
-                        auto [current, depth] = bfsQueue.front();
-                        bfsQueue.pop();
-                        if (particleRegistry.all_of<ParticleLocalPosition, ParticleVertices>(current)) {
-                            const glm::vec3& currentCenter =
-                                particleRegistry.get<ParticleLocalPosition>(current).value;
-                            const auto& verts =
-                                particleRegistry.get<ParticleVertices>(current).vertices;
+                while (!bfsQueue.empty()) {
+                    auto [current, depth] = bfsQueue.front();
+                    bfsQueue.pop();
 
-                            if (!verts.empty()) {
-                                if constexpr (kSamplesPerCell == 1) {
-                                    // Single sample: preserve the cell center for a clean
-                                    // 1-to-1 replacement under triangulation.
-                                    addInteriorParticle(stencil, current, currentCenter);
-                                } else {
-                                    // Multiple samples: stride evenly across the vertex list,
-                                    // placing each point at the midpoint of center-to-vertex.
-                                    int stride = static_cast<int>(verts.size()) / kSamplesPerCell;
-                                    if (stride < 1) stride = 1;
-                                    for (int s = 0; s < kSamplesPerCell; ++s) {
-                                        int vi = (s * stride) % static_cast<int>(verts.size());
-                                        addInteriorParticle(stencil, current,
-                                            0.5f * (currentCenter + verts[vi]));
-                                    }
+                    stencilDirtyCells[stencil].insert(current);
+
+                    if (particleRegistry.all_of<ParticleLocalPosition, ParticleVertices>(current)) {
+                        const glm::vec3& currentCenter =
+                            particleRegistry.get<ParticleLocalPosition>(current).value;
+                        const auto& verts =
+                            particleRegistry.get<ParticleVertices>(current).vertices;
+
+                        if (!verts.empty()) {
+                            if constexpr (kSamplesPerCell == 1) {
+                                // Single sample: preserve the cell center.
+                                addInteriorParticle(stencil, current, currentCenter,
+                                                    particleRegistry, stencilDirtyCells, cellSamples);
+                            } else {
+                                // Multiple samples: stride evenly across the vertex list,
+                                // placing each point at the midpoint of center-to-vertex.
+                                int stride = static_cast<int>(verts.size()) / kSamplesPerCell;
+                                if (stride < 1) stride = 1;
+                                for (int s = 0; s < kSamplesPerCell; ++s) {
+                                    int vi = (s * stride) % static_cast<int>(verts.size());
+                                    addInteriorParticle(stencil, current,
+                                                        0.5f * (currentCenter + verts[vi]),
+                                                        particleRegistry, stencilDirtyCells, cellSamples);
                                 }
                             }
                         }
+                    }
 
-                        if (depth < kDensifyDepth) {
-                            adjB.forEachNeighbor(static_cast<uint32_t>(current), [&](uint32_t nbId) {
-                                entt::entity nb = static_cast<entt::entity>(nbId);
-                                if (visited.count(nb)) return;
-                                if (particleRegistry.all_of<Surface>(nb)) return;
-                                if (!particleRegistry.all_of<ParticleOpacity>(nb)) return;
-                                if (particleRegistry.get<ParticleOpacity>(nb).value == 0.0f) return;
-                                visited.insert(nb);
-                                bfsQueue.push({ nb, depth + 1 });
-                            });
-                        }
+                    if (depth < kDensifyDepth) {
+                        adjB.forEachNeighbor(static_cast<uint32_t>(current), [&](uint32_t nbId) {
+                            entt::entity nb = static_cast<entt::entity>(nbId);
+                            if (visited.count(nb)) return;
+                            if (particleRegistry.all_of<Surface>(nb)) return;
+                            if (!particleRegistry.all_of<ParticleOpacity>(nb)) return;
+                            if (particleRegistry.get<ParticleOpacity>(nb).value == 0.0f) return;
+                            visited.insert(nb);
+                            bfsQueue.push({ nb, depth + 1 });
+                        });
                     }
                 }
             }
         }
-
-        // 5) Triangulation 
-
-        // 6) CPU/GPU data structure updates
-
-        return results;
     }
+
+    // 5) Triangulation
+
+    // 6) CPU/GPU data structure updates
+
+    return results;
 }
+
+} // namespace DynamicFoam::Sim2D
