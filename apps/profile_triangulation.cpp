@@ -1,11 +1,14 @@
 /**
  * profile_triangulation.cpp
  *
- * Benchmark for triangulateWithMetadata() in utils.h.
- * Breaks timing down into three phases:
- *   1. dt.insert            – CGAL Delaunay insertion
- *   2. Adjacency build      – vertex→index mapping + edge walking
- *   3. Voronoi metadata     – volume + Voronoi-vertex per particle
+ * Benchmark for the core Delaunay triangulation pipeline used by
+ * triangulateVoronoiCells() in triangulation.h.
+ * Breaks timing down into five phases:
+ *   1. dt.insert      – CGAL Delaunay insertion
+ *   2. AdjEdge        – finite_edges iterator walk (CGAL side)
+ *   3. AdjMap         – AdjacencyList::addEdge hash-map insertions
+ *   4. Cache          – one dt.dual() per finite cell into ccCache
+ *   5. VorVerts       – incident_cells loop per vertex (reads cache)
  *
  * Build target: profile_triangulation  (added to apps/CMakeLists.txt)
  * Run:          ./profile_triangulation
