@@ -9,8 +9,24 @@
 #include "dynamic_foam/Sim2D/collision.cuh"
 #include "dynamic_foam/Sim2D/gpu_slab.cuh"
 #include "dynamic_foam/Sim2D/components.h"
+#include "dynamic_foam/Sim2D/triangulation.h"
 
 namespace DynamicFoam::Sim2D {
+
+    // Composite key used to index per-(stencil, foam) data.
+    // Both components are plain ints: stencil entity cast to int, foam id.
+    using StencilFoamKey = std::pair<int, int>;
+
+    struct StencilFoamKeyHash {
+        std::size_t operator()(const StencilFoamKey& k) const noexcept {
+            std::size_t h = std::hash<int>{}(k.first);
+            h ^= std::hash<int>{}(k.second) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
+    template<typename V>
+    using StencilFoamMap = std::unordered_map<StencilFoamKey, V, StencilFoamKeyHash>;
 
     // Describes a single foam that was structurally modified by Topology::update.
     struct FoamTopologyUpdate {
@@ -29,15 +45,12 @@ namespace DynamicFoam::Sim2D {
     // Aggregated output of the first three pipeline steps (collision filtering,
     // boundary sampling, spanning AABB filter).
     struct StencilWorkResult {
-        // stencil -> foamB -> candidate mutable cell ids (from AABB collision).
-        std::unordered_map<entt::entity,
-            std::unordered_map<int, std::vector<entt::entity>>>    cellContacts;
-        // stencil -> foamB -> AABB over all foamB-local boundary samples.
-        std::unordered_map<entt::entity,
-            std::unordered_map<int, AABB>>                         effectiveAABB;
-        // stencil -> foamB -> boundary hits that pass the spanning-axis filter.
-        std::unordered_map<entt::entity,
-            std::unordered_map<int, std::vector<BoundaryHit>>>     validWork;
+        // (stencil, foamB) -> candidate mutable cell ids (from AABB collision).
+        StencilFoamMap<std::vector<entt::entity>>    cellContacts;
+        // (stencil, foamB) -> AABB over all foamB-local boundary samples.
+        StencilFoamMap<AABB>                         effectiveAABB;
+        // (stencil, foamB) -> boundary hits that pass the spanning-axis filter.
+        StencilFoamMap<std::vector<BoundaryHit>>     validWork;
     };
 
     class Topology {
@@ -79,14 +92,15 @@ namespace DynamicFoam::Sim2D {
         );
 
         // Create a new interior particle inheriting appearance from cellId.
-        // Registers the new particle in stencilDirtyCells and cellSamples.
+        // Registers the new particle in stencilROI and cellSamples.
         static entt::entity addInteriorParticle(
-            entt::entity                                                          stencilId,
-            entt::entity                                                          cellId,
-            glm::vec3                                                             localPos,
-            entt::registry&                                                       registry,
-            std::unordered_map<entt::entity, std::unordered_set<entt::entity>>&  stencilDirtyCells,
-            std::unordered_map<entt::entity, std::unordered_set<entt::entity>>&  cellSamples
+            StencilFoamKey                                                                            key,
+            entt::entity                                                                              cellId,
+            glm::vec3                                                                                 localPos,
+            entt::registry&                                                                           registry,
+            const AdjacencyList&                                                                      adjList,
+            StencilFoamMap<std::unordered_set<entt::entity>>&                                        stencilROI,
+            std::unordered_map<entt::entity, std::unordered_set<entt::entity>>&                      cellSamples
         );
 
         // Create a zero-opacity air ghost particle.
