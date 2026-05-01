@@ -131,20 +131,6 @@ public:
         return {src, dst};
     }
 
-    // Returns node IDs in insertion order. Used by the render layer to build
-    // the per-foam slice of the flat position/color/surface-mask buffers in
-    // a deterministic order that matches the GPU CSR's sorted node layout.
-    // Call after buildGPUAdjacencyList so that insertion order matches the
-    // order nodes were added (which is the same order used for the nodes[]
-    // buffer when d_morton_sorted_ids is null).
-    std::vector<uint32_t> getOrderedNodeIds() const {
-        std::vector<uint32_t> ids;
-        ids.reserve(adj.size());
-        for (const auto& [node, _] : adj)
-            ids.push_back(node);
-        return ids;
-    }
-
     uint32_t nodeCount() const { return static_cast<uint32_t>(adj.size()); }
 
 private:

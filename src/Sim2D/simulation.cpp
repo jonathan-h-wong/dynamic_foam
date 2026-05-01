@@ -130,8 +130,8 @@ namespace DynamicFoam::Sim2D {
             // Bulk-upload particle data and Morton-sort every buffer together.
             // After this call d_active_ids is Morton-sorted and slot.active_count is set.
             {
-                const auto& ordered = adj.getOrderedNodeIds();
-                const int   Np      = static_cast<int>(ordered.size());
+                const auto& adjMap = adj.getAdjList();
+                const int   Np     = static_cast<int>(adjMap.size());
 
                 std::vector<AABB>      h_aabbs(Np);
                 std::vector<glm::vec4> h_colors(Np);
@@ -139,8 +139,9 @@ namespace DynamicFoam::Sim2D {
                 std::vector<uint8_t>   h_surface(Np, 0);
                 std::vector<uint32_t>  h_active_ids(Np);
 
-                for (int li = 0; li < Np; ++li) {
-                    const entt::entity e = static_cast<entt::entity>(ordered[li]);
+                int li = 0;
+                for (const auto& [nodeId, _] : adjMap) {
+                    const entt::entity e = static_cast<entt::entity>(nodeId);
 
                     const auto& verts = particleRegistry.get<ParticleVertices>(e).vertices;
                     h_positions[li] = particleRegistry.get<ParticleLocalPosition>(e).value;
@@ -159,7 +160,8 @@ namespace DynamicFoam::Sim2D {
 
                     if (particleRegistry.all_of<Surface>(e)) h_surface[li] = 1;
 
-                    h_active_ids[li] = ordered[li];
+                    h_active_ids[li] = nodeId;
+                    ++li;
                 }
 
                 gpuSlab.stageParticleData(foam_id,
@@ -476,10 +478,9 @@ namespace DynamicFoam::Sim2D {
                     // Since the parent's origin coincides with its CoM, particle local
                     // positions are already expressed relative to the parent CoM.  We
                     // only need local-space data — no per-particle world transform needed.
-                    const auto& child_adj_nodes = child_adj.getOrderedNodeIds();
                     std::unordered_map<entt::entity, glm::vec3> localPositions;
                     std::unordered_map<entt::entity, float>     masses;
-                    for (uint32_t pid : child_adj_nodes) {
+                    for (const auto& [pid, _] : child_adj.getAdjList()) {
                         const entt::entity e = static_cast<entt::entity>(pid);
                         localPositions[e] = particleRegistry.get<ParticleLocalPosition>(e).value;
                         masses[e]         = particleRegistry.get<ParticleMass>(e).value;

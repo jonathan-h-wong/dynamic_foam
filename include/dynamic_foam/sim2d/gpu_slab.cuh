@@ -95,6 +95,13 @@ struct FoamUpdate {
     // Edge insertion buffers — directed COO edges to append after deletions.
     // An edge (coo_src_ins[i], coo_dst_ins[i]) is appended to the slab COO
     // buffers.  Both vectors must be the same length.
+    //
+    // INVARIANT: edges must be bidirectional — the caller is responsible for
+    // ensuring that for every (a, b) entry there is a corresponding (b, a)
+    // entry in the same batch.  The GPU CSR builder (buildGPUAdjacencyList)
+    // sorts by source and builds row-pointers from the directed list as-is;
+    // it does NOT synthesise reverse edges.  Omitting the reverse half will
+    // produce an asymmetric CSR where b can reach a but not vice-versa.
     std::vector<uint32_t> coo_src_ins;
     std::vector<uint32_t> coo_dst_ins;
 
