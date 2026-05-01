@@ -113,13 +113,17 @@ struct FoamUpdate {
         std::vector<uint8_t>   surface_masks,
         std::vector<AABB>      aabbs,
         std::vector<uint32_t>  active_ids,
-        std::vector<uint32_t>  del_ids)
+        std::vector<uint32_t>  del_ids,
+        std::vector<uint32_t>  coo_src,
+        std::vector<uint32_t>  coo_dst)
         : particle_position_ins    (std::move(positions))
         , particle_color_ins       (std::move(colors))
         , particle_surface_mask_ins(std::move(surface_masks))
         , particle_aabb_ins        (std::move(aabbs))
         , particle_active_ids_ins  (std::move(active_ids))
         , particle_id_dels         (std::move(del_ids))
+        , coo_src_ins              (std::move(coo_src))
+        , coo_dst_ins              (std::move(coo_dst))
     {
         const size_t n = particle_position_ins.size();
         if (particle_color_ins.size()         != n ||
@@ -129,6 +133,11 @@ struct FoamUpdate {
         {
             throw std::invalid_argument(
                 "FoamUpdate: all insertion buffers must be the same length");
+        }
+        if (coo_src_ins.size() != coo_dst_ins.size())
+        {
+            throw std::invalid_argument(
+                "FoamUpdate: coo_src and coo_dst must be the same length");
         }
     }
 };

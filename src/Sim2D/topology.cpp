@@ -215,8 +215,6 @@ std::vector<FoamTopologyUpdate> Topology::update(
     const entt::registry&                                foamRegistry,
     entt::registry&                                      particleRegistry)
 {
-    std::vector<FoamTopologyUpdate> results;
-
     // Collect IDs needed by detectCollisions.
     std::vector<int> foamIds;
     foamIds.reserve(foamAdjacencyLists.size());
@@ -241,16 +239,13 @@ std::vector<FoamTopologyUpdate> Topology::update(
     // 4) Point creation
     StencilFoamMap<std::unordered_set<entt::entity>> stencilROI;
     StencilFoamMap<std::unordered_set<entt::entity>> stencilPerimeter;
+    StencilFoamMap<std::unordered_set<entt::entity>> stencilOverlap;
     std::unordered_map<entt::entity, std::unordered_set<entt::entity>> cellSamples;
 
     for (const auto& [key, hits] : validWork) {
         auto [stencilInt, targetFoamId] = key;
         const AdjacencyList& targetAdj = foamAdjacencyLists.at(targetFoamId);
         const AABB&          effAABB   = effectiveAABB.at(key);
-
-        // overlap_set: cells whose Voronoi AABB is fully covered by effAABB,
-        // plus the boundary hit cells themselves.
-        std::unordered_set<entt::entity> overlap_set;
 
         if (cellContacts.count(key)) {
             for (entt::entity cellEnt : cellContacts.at(key)) {
@@ -267,11 +262,11 @@ std::vector<FoamTopologyUpdate> Topology::update(
                 if (cellAABB.min_pt.x >= effAABB.min_pt.x && cellAABB.max_pt.x <= effAABB.max_pt.x &&
                     cellAABB.min_pt.y >= effAABB.min_pt.y && cellAABB.max_pt.y <= effAABB.max_pt.y &&
                     cellAABB.min_pt.z >= effAABB.min_pt.z && cellAABB.max_pt.z <= effAABB.max_pt.z)
-                    overlap_set.insert(cellEnt);
+                    stencilOverlap[key].insert(cellEnt);
             }
         }
         for (const auto& hit : hits)
-            overlap_set.insert(hit.mutParticle);
+            stencilOverlap[key].insert(hit.mutParticle);
 
         // Densification loop
         for (const auto& hit : hits) {
@@ -298,7 +293,7 @@ std::vector<FoamTopologyUpdate> Topology::update(
             targetAdj.forEachNeighbor(static_cast<uint32_t>(hit.mutParticle), [&](uint32_t nbrId) {
                 entt::entity nbr = static_cast<entt::entity>(nbrId);
                 if (!particleRegistry.all_of<Surface, ParticleLocalPosition>(nbr)) return;
-                if (overlap_set.count(nbr)) return;
+                if (stencilOverlap[key].count(nbr)) return;
 
                 glm::vec3 nbrCenter = particleRegistry.get<ParticleLocalPosition>(nbr).value;
                 auto reflectedIntoNbr = faceReflect(hit.localPoint, cellCenter, nbrCenter);
@@ -321,7 +316,7 @@ std::vector<FoamTopologyUpdate> Topology::update(
 
             // Internal Densification: BFS into non-surface opaque interior cells,
             // depositing N uniformly distributed sample points at each.
-            constexpr int kDensifyDepth   = 2;
+            constexpr int kDensifyDepth   = 1;
             constexpr int kSamplesPerCell = 2;
 
             struct BfsNode { entt::entity cell; int depth; };
@@ -374,14 +369,18 @@ std::vector<FoamTopologyUpdate> Topology::update(
                 }
             }
 
-            // Perimeter = nodes at the maximum depth actually reached by the BFS.
-            // This is correct even when the graph is smaller than kDensifyDepth.
+            // Perimeter = nodes at the maximum depth actually reached by the BFS,
+            // plus all surface cells in the stencil ROI (they form the boundary
+            // between the intersection region and the surrounding foam).
             int maxDepth = 0;
             for (const auto& [e, d] : nodeDepth)
                 maxDepth = std::max(maxDepth, d);
             for (const auto& [e, d] : nodeDepth)
                 if (d == maxDepth)
                     stencilPerimeter[key].insert(e);
+            for (entt::entity roiCell : stencilROI[key])
+                if (particleRegistry.all_of<Surface>(roiCell))
+                    stencilPerimeter[key].insert(roiCell);
         }
     }
 
@@ -405,26 +404,33 @@ std::vector<FoamTopologyUpdate> Topology::update(
             }
         }
 
-        // Add one layer beyond the perimeter: neighbors of perimeter nodes that are
-        // non-air, opaque, and not already covered by the ROI. If the neighbor has
-        // samples in cellSamples, include those; otherwise fall back to its center.
+        // Add geometric support beyond the perimeter: for each neighbor of a perimeter
+        // cell, classify and include it so the triangulation has proper boundary context:
+        //   - Air neighbor (opacity == 0): include its position directly.
+        //   - Non-ROI, non-sampled neighbor: include its center position directly.
+        //   - Otherwise (sampled by another stencil's ROI): include all its cellSamples.
         const auto& roiCells = stencilROI.at(key);
         for (entt::entity perimCell : stencilPerimeter.at(key)) {
             targetAdj.forEachNeighbor(static_cast<uint32_t>(perimCell), [&](uint32_t nbId) {
                 entt::entity nb = static_cast<entt::entity>(nbId);
                 if (roiCells.count(nb)) return;
-                if (!particleRegistry.all_of<ParticleOpacity>(nb)) return;
-                if (particleRegistry.get<ParticleOpacity>(nb).value == 0.0f) return;
+                if (!particleRegistry.all_of<ParticleLocalPosition>(nb)) return;
 
-                if (cellSamples.count(nb)) {
-                    for (entt::entity sample : cellSamples.at(nb)) {
-                        triangulationVertices[static_cast<uint32_t>(sample)] =
-                            particleRegistry.get<ParticleLocalPosition>(sample).value;
-                    }
+                const glm::vec3 nbPos = particleRegistry.get<ParticleLocalPosition>(nb).value;
+
+                if (particleRegistry.all_of<ParticleOpacity>(nb) &&
+                    particleRegistry.get<ParticleOpacity>(nb).value == 0.0f) {
+                    // Air particle — include its position as a boundary anchor.
+                    triangulationVertices[static_cast<uint32_t>(nb)] = nbPos;
+                } else if (!cellSamples.count(nb)) {
+                    // Interior cell with no generated samples — use its center.
+                    triangulationVertices[static_cast<uint32_t>(nb)] = nbPos;
                 } else {
-                    if (particleRegistry.all_of<ParticleLocalPosition>(nb)) {
-                        triangulationVertices[static_cast<uint32_t>(nb)] =
-                            particleRegistry.get<ParticleLocalPosition>(nb).value;
+                    // Cell has samples from another stencil's ROI — include all of them.
+                    for (entt::entity sample : cellSamples.at(nb)) {
+                        if (particleRegistry.all_of<ParticleLocalPosition>(sample))
+                            triangulationVertices[static_cast<uint32_t>(sample)] =
+                                particleRegistry.get<ParticleLocalPosition>(sample).value;
                     }
                 }
             });
@@ -453,6 +459,165 @@ std::vector<FoamTopologyUpdate> Topology::update(
     
 
     // 6) CPU/GPU data structure updates
+    std::vector<FoamTopologyUpdate> results;
+
+    // Accumulate per-foam changes across all (stencil, foam) keys before
+    // building the final FoamTopologyUpdate structs.
+    std::unordered_map<int, std::unordered_set<uint32_t>>                          foamParticleAdditions;
+    std::unordered_map<int, std::unordered_set<uint32_t>>                          foamParticleDeletions;
+    std::unordered_map<int, std::vector<std::pair<uint32_t, uint32_t>>> foamEdgeAdditions;
+
+    for (const auto& [key, triResult] : triangulationResults) {
+        // Update ParticleVertices and ParticleMass for all newly added particles
+        auto [stencilInt, targetFoamId] = key;
+        const auto& voronoiVertices = std::get<1>(triResult);
+
+        // Retrieve the foam's density so we can approximate each cell's mass.
+        entt::entity foamEnt = static_cast<entt::entity>(targetFoamId);
+        float density = 1.0f;
+        if (foamRegistry.all_of<Density>(foamEnt))
+            density = foamRegistry.get<Density>(foamEnt).value;
+
+        for (const auto& [rawId, verts] : voronoiVertices) {
+            if (verts.empty()) continue;
+
+            entt::entity particle = static_cast<entt::entity>(rawId);
+
+            // Update Voronoi vertices.
+            particleRegistry.get<ParticleVertices>(particle).vertices = verts;
+
+            // Approximate volume from Voronoi AABB and multiply by density.
+            glm::vec3 aabbMin = verts[0];
+            glm::vec3 aabbMax = verts[0];
+            for (const auto& v : verts) {
+                aabbMin = glm::min(aabbMin, v);
+                aabbMax = glm::max(aabbMax, v);
+            }
+            glm::vec3 extent = aabbMax - aabbMin;
+            float approxVolume = extent.x * extent.y * extent.z;
+            particleRegistry.get<ParticleMass>(particle).value = approxVolume * density;
+        }
+
+        // Update CPU adjacency list.
+        AdjacencyList& foamAdj = foamAdjacencyLists.at(targetFoamId);
+
+        // Deletions: remove every node in the stencil ROI and overlap region.
+        // stencilROI holds the original cells that were resampled; stencilOverlap
+        // holds cells fully inside the stencil AABB. Both sets are replaced by
+        // the triangulation's output nodes.
+        for (entt::entity e : stencilROI.at(key))
+            foamAdj.deleteNode(static_cast<uint32_t>(e));
+        for (entt::entity e : stencilOverlap.at(key))
+            foamAdj.deleteNode(static_cast<uint32_t>(e));
+
+        // Additions: merge all nodes from the triangulation result into the foam's
+        // adjacency list; the predicate admits every node unconditionally.
+        const AdjacencyList& resultAdj = std::get<0>(triResult);
+        foamAdj.copyNodesFrom(resultAdj, [](uint32_t) { return true; });
+
+        // Particle additions: collect every sample generated inside the ROI cells.
+        auto& additions = foamParticleAdditions[targetFoamId];
+        for (entt::entity roiCell : stencilROI.at(key)) {
+            auto it = cellSamples.find(roiCell);
+            if (it == cellSamples.end()) continue;
+            for (entt::entity sample : it->second)
+                additions.insert(static_cast<uint32_t>(sample));
+        }
+
+        // Particle deletions: the original ROI nodes are being replaced.
+        auto& deletions = foamParticleDeletions[targetFoamId];
+        for (entt::entity roiCell : stencilROI.at(key))
+            deletions.insert(static_cast<uint32_t>(roiCell));
+
+        // Edge additions: union all edges from the triangulation result.
+        auto [cooSrc, cooDst] = resultAdj.buildCOO();
+        auto& edges = foamEdgeAdditions[targetFoamId];
+        for (size_t i = 0; i < cooSrc.size(); ++i)
+            edges.emplace_back(cooSrc[i], cooDst[i]);
+    }
+
+    // Construct one FoamTopologyUpdate per foam that was touched.
+    // Gather the union of all foam ids across the three maps.
+    std::unordered_set<int> touchedFoams;
+    for (const auto& [id, _] : foamParticleAdditions) touchedFoams.insert(id);
+    for (const auto& [id, _] : foamParticleDeletions)  touchedFoams.insert(id);
+    for (const auto& [id, _] : foamEdgeAdditions)      touchedFoams.insert(id);
+
+    for (int foamId : touchedFoams) {
+        std::vector<glm::vec3> positions;
+        std::vector<glm::vec4> colors;
+        std::vector<uint8_t>   surface_masks;
+        std::vector<AABB>      aabbs;
+        std::vector<uint32_t>  active_ids;
+
+        if (foamParticleAdditions.count(foamId)) {
+            for (uint32_t rawId : foamParticleAdditions.at(foamId)) {
+                entt::entity p = static_cast<entt::entity>(rawId);
+
+                // Position
+                positions.push_back(
+                    particleRegistry.get<ParticleLocalPosition>(p).value);
+
+                // Color (rgb) + opacity packed into vec4
+                const auto& col = particleRegistry.get<ParticleColor>(p);
+                float opacity   = particleRegistry.get<ParticleOpacity>(p).value;
+                colors.push_back(glm::vec4(col.rgb, opacity));
+
+                // Surface mask
+                surface_masks.push_back(
+                    particleRegistry.all_of<Surface>(p) ? uint8_t(1) : uint8_t(0));
+
+                // AABB from Voronoi vertices
+                const auto& verts = particleRegistry.get<ParticleVertices>(p).vertices;
+                if (verts.empty()) {
+                    const glm::vec3& pos = positions.back();
+                    aabbs.push_back(AABB{ pos, pos });
+                } else {
+                    AABB aabb{ verts[0], verts[0] };
+                    for (const auto& v : verts) {
+                        aabb.min_pt = glm::min(aabb.min_pt, v);
+                        aabb.max_pt = glm::max(aabb.max_pt, v);
+                    }
+                    aabbs.push_back(aabb);
+                }
+
+                active_ids.push_back(rawId);
+            }
+        }
+
+        // Deletions
+        std::vector<uint32_t> del_ids;
+        if (foamParticleDeletions.count(foamId))
+            del_ids.assign(
+                foamParticleDeletions.at(foamId).begin(),
+                foamParticleDeletions.at(foamId).end());
+
+        // COO edge buffers — deserialize vector<pair> into parallel src/dst vectors
+        std::vector<uint32_t> coo_src;
+        std::vector<uint32_t> coo_dst;
+        if (foamEdgeAdditions.count(foamId)) {
+            const auto& edgePairs = foamEdgeAdditions.at(foamId);
+            coo_src.reserve(edgePairs.size());
+            coo_dst.reserve(edgePairs.size());
+            for (const auto& [s, d] : edgePairs) {
+                coo_src.push_back(s);
+                coo_dst.push_back(d);
+            }
+        }
+
+        results.push_back(FoamTopologyUpdate{
+            static_cast<entt::entity>(foamId),
+            FoamUpdate(
+                std::move(positions),
+                std::move(colors),
+                std::move(surface_masks),
+                std::move(aabbs),
+                std::move(active_ids),
+                std::move(del_ids),
+                std::move(coo_src),
+                std::move(coo_dst))
+        });
+    }
 
     return results;
 }

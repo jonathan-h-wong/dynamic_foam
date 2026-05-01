@@ -525,15 +525,15 @@ namespace DynamicFoam::Sim2D {
 
                         // (6d) Submit the FoamUpdate: delete the copied original-air entries
                         // and insert the per-component clone particles with their COO edges.
-                        FoamUpdate childUpdate;
-                        childUpdate.particle_id_dels         = std::move(clone_del_ids);
-                        childUpdate.particle_position_ins    = std::move(clone_positions);
-                        childUpdate.particle_color_ins       = std::move(clone_colors);
-                        childUpdate.particle_surface_mask_ins= std::move(clone_surface_masks);
-                        childUpdate.particle_aabb_ins        = std::move(clone_aabbs);
-                        childUpdate.particle_active_ids_ins  = std::move(clone_active_ids);
-                        childUpdate.coo_src_ins              = std::move(clone_coo_src);
-                        childUpdate.coo_dst_ins              = std::move(clone_coo_dst);
+                        FoamUpdate childUpdate(
+                            std::move(clone_positions),
+                            std::move(clone_colors),
+                            std::move(clone_surface_masks),
+                            std::move(clone_aabbs),
+                            std::move(clone_active_ids),
+                            std::move(clone_del_ids),
+                            std::move(clone_coo_src),
+                            std::move(clone_coo_dst));
                         gpuSlab.updateFoamData(child_id, childUpdate);
 
                         // (6e) Re-sort, refit BVH, and rebuild CSR for the new child slot.
