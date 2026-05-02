@@ -32,13 +32,13 @@ enum class ProjectionType : int { Orthographic = 0, Perspective = 1 };
 // For perspective cameras, fovY is the vertical field-of-view in radians;
 // width/height are unused (aspect ratio is derived from the render resolution).
 struct CameraParams {
-    glm::vec3      origin  = {0.f,  0.f, -5.f};
+    glm::vec3      origin  = {0.f,  8.f,  6.f}; // Overhead angle above the ground plane
     glm::vec3      lookAt  = {0.f,  0.f,  0.f};
     glm::vec3      up      = {0.f,  1.f,  0.f};
     float          width   = 3.f;
     float          height  = 3.f;
     float          fovY    = 0.785398f; // 45 degrees in radians
-    ProjectionType type    = ProjectionType::Orthographic;
+    ProjectionType type    = ProjectionType::Perspective;
 };
 
 // Generates a ray for pixel (ray_idx % img_width, ray_idx / img_width).

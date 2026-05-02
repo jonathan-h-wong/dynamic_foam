@@ -95,6 +95,60 @@ namespace DynamicFoam::Sim2D {
         return Foam(particleIds, positions, stencil, mutable_map, color, opacity, 1.0f);
     }
 
+    Foam generateFoamSword(
+        float            radius,
+        float            length,
+        int              numDepth,
+        float            density,
+        const glm::vec3& color_param,
+        float            base_opacity)
+    {
+        std::vector<uint32_t>                   particleIds;
+        std::vector<glm::vec3>                  positions;
+        std::unordered_map<uint32_t, bool>      stencil;
+        std::unordered_map<uint32_t, bool>      mutable_map;
+        std::unordered_map<uint32_t, glm::vec3> color;
+        std::unordered_map<uint32_t, float>     opacity;
+
+        // Cylinder axis points along local +Z.
+        // 8 radial vertices per depth slice; an extra outer ring at 3× radius
+        // and two end-cap layers at z = -dz and z = length + dz form the
+        // padding boundary (opacity = 0, Immutable).
+        constexpr int numFaces  = 8;
+        const int     numRadial = numFaces + 1; // [0..7] core, [8] outer pad ring
+        const int     numDepthT = numDepth + 2; // [0] front cap, [1..numDepth] core, [numDepth+1] back cap
+
+        const float dz       = length / static_cast<float>(numDepth - 1);
+        const float rOuter   = radius * 3.0f;
+        const float twoPi    = 2.0f * glm::pi<float>();
+
+        uint32_t id_counter = 0;
+        for (int j = 0; j < numDepthT; ++j) {
+            const float z       = static_cast<float>(j - 1) * dz; // j=0 → -dz, j=1 → 0, j=numDepth → length
+            const bool  isEndCap = (j == 0 || j == numDepthT - 1);
+
+            for (int i = 0; i < numRadial; ++i) {
+                const bool  isOuterRing = (i == numFaces);
+                const bool  isPadding   = isEndCap || isOuterRing;
+
+                const float theta = twoPi * static_cast<float>(i) / static_cast<float>(numFaces);
+                const float r     = isOuterRing ? rOuter : radius;
+
+                const uint32_t id = id_counter++;
+                particleIds.push_back(id);
+                positions.push_back(glm::vec3(r * std::cos(theta), r * std::sin(theta), z));
+
+                // Core stencil particles drive simulation; padding boundary is Immutable.
+                stencil[id]     = !isPadding;
+                mutable_map[id] = false;
+                color[id]       = color_param;
+                opacity[id]     = isPadding ? 0.0f : base_opacity;
+            }
+        }
+
+        return Foam(particleIds, positions, stencil, mutable_map, color, opacity, density);
+    }
+
     Foam generateFoamFloorPlane(
         float widthX,
         float widthZ,
@@ -161,14 +215,24 @@ namespace DynamicFoam::Sim2D {
         std::unordered_map<int, bool> dynamic_map;
 
         foams[0] = generateFoamBar(1.0f, 0.5f, 0.2f, 10, 5, 2, 1.0f, glm::vec3(0.0f, 0.5f, 1.0f));
-        transforms[0] = glm::mat4(1.0f); // Identity transform
+        transforms[0] = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.25f, 0.0f)); // Resting on the ground plane (y=0)
         controller_map[0] = false; // Not a controller
         dynamic_map[0] = true; // Dynamic foam
 
-        foams[1] = generateFoamPointCursor();
-        transforms[1] = glm::translate(glm::mat4(1.0f), glm::vec3(0.5f, 0.0f, 0.0f)); // Positioned to the right of the bar
-        controller_map[1] = true; // Controller foam
-        dynamic_map[1] = false; // Not dynamic
+        // Sword (controller) — a bright yellow laser cylinder.
+        // Placed at camera origin each frame; initial transform is identity
+        // since applyControllerCursor overwrites Position/Orientation on step 1.
+        // base_opacity = 0.3: dimly visible while hovering, 1.0 when clicking.
+        foams[1] = generateFoamSword(
+            0.02f,                          // radius (m) — skinny laser cross-section
+            5.0f,                           // length (m) — finite extent into the scene
+            20,                             // depth samples
+            1.0f,                           // density
+            glm::vec3(1.0f, 0.95f, 0.1f),  // bright yellow
+            0.3f);                          // base (hover) opacity
+        transforms[1]     = glm::mat4(1.0f); // overwritten per-frame
+        controller_map[1] = true;            // controller — driven by cursor ray
+        dynamic_map[1]    = false;           // not dynamic
 
         // Floor plane — immobile, immutable, static, non-controller.
         // 20x20 interior particles centred at the origin at y=0.

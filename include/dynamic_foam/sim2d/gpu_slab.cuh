@@ -77,11 +77,11 @@ struct FoamSlot {
 };
 
 // =============================================================================
-// FoamUpdate — describes a batch of particle insertions and deletions for one
+// FoamDelta — describes a batch of particle insertions and deletions for one
 // foam.  All insertion buffers must be the same length; this is enforced by
 // the constructor.
 // =============================================================================
-struct FoamUpdate {
+struct FoamDelta {
     // Insertion buffers (one entry per new particle):
     std::vector<glm::vec3> particle_position_ins;
     std::vector<glm::vec4> particle_color_ins;
@@ -105,9 +105,9 @@ struct FoamUpdate {
     std::vector<uint32_t> coo_src_ins;
     std::vector<uint32_t> coo_dst_ins;
 
-    FoamUpdate() = default;
+    FoamDelta() = default;
 
-    FoamUpdate(
+    FoamDelta(
         std::vector<glm::vec3> positions,
         std::vector<glm::vec4> colors,
         std::vector<uint8_t>   surface_masks,
@@ -132,12 +132,12 @@ struct FoamUpdate {
             particle_active_ids_ins.size()    != n)
         {
             throw std::invalid_argument(
-                "FoamUpdate: all insertion buffers must be the same length");
+                "FoamDelta: all insertion buffers must be the same length");
         }
         if (coo_src_ins.size() != coo_dst_ins.size())
         {
             throw std::invalid_argument(
-                "FoamUpdate: coo_src and coo_dst must be the same length");
+                "FoamDelta: coo_src and coo_dst must be the same length");
         }
     }
 };
@@ -432,7 +432,7 @@ public:
     }
 
     // -------------------------------------------------------------------------
-    // updateFoamData — applies a FoamUpdate to the particle slab buffers for
+    // applyFoamDelta — applies a FoamDelta to the particle slab buffers for
     // foam_id.  Deletions are resolved by searching d_active_ids for matching
     // entity IDs and compacting all five particle arrays.  Insertions are
     // appended after the surviving particles; if the post-update count would
@@ -444,7 +444,17 @@ public:
     // particle counts changed.
     // Implemented in gpu_slab.cu (requires nvcc).
     // -------------------------------------------------------------------------
-    void updateFoamData(int foam_id, const FoamUpdate& update);
+    void applyFoamDelta(int foam_id, const FoamDelta& delta);
+
+    // -------------------------------------------------------------------------
+    // updateFoamColors — sparse in-place color scatter for one foam.
+    // Finds each entry of ids[] in d_active_ids and writes the corresponding
+    // entry of colors[] into d_particle_colors.  No Morton sort, BVH rebuild,
+    // or CSR rebuild is required.  Implemented in gpu_slab.cu (requires nvcc).
+    // -------------------------------------------------------------------------
+    void updateFoamColors(int foam_id,
+                          const std::vector<uint32_t>&  ids,
+                          const std::vector<glm::vec4>& colors);
 
     // -------------------------------------------------------------------------
     // copyFoamData — D→D copy of a foam slot's data to a freshly allocated

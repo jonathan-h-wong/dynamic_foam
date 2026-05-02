@@ -47,7 +47,9 @@ class Simulation {
         // all Controller foam bodies to it.  Separated from handleUserInput so
         // it can be called a second time immediately before render() to minimise
         // input-to-display latency without re-applying camera or click logic.
-        void applyControllerCursor(ImVec2 mouse_pos);
+        // clicked — true when the primary mouse button is held;
+        //           drives sword opacity (dim when hovering, bright when pressing).
+        void applyControllerCursor(ImVec2 mouse_pos, bool clicked = false);
 
         // Rebuilds the BVH for a foam body by reading ParticleVertices directly
         // from the particle registry, ordered by getOrderedNodeIds() so that

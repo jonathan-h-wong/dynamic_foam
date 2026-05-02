@@ -18,7 +18,30 @@ namespace DynamicFoam::Sim2D {
         float density,
         const glm::vec3& color_param
     );
-    Foam generateFoamPointCursor();
+    /**
+     * @brief Generate a cylindrical foam sword (laser-pointer shape).
+     *
+     * Produces a thin cylinder with 8 radial particles per depth slice and
+     * @p numDepth interior depth layers, all tagged as Stencil.  The cylinder
+     * axis aligns with local +Z (pointing "into the scene" away from the
+     * camera).  A single outer padding ring and two end-cap layers (opacity=0)
+     * give the Delaunay triangulation a closed convex boundary.
+     *
+     * @param radius       Cylinder cross-section radius (world-space units).
+     * @param length       Total cylinder length along local +Z.
+     * @param numDepth     Number of depth-axis sample slices (e.g. 20).
+     * @param density      Foam density.
+     * @param color_param  RGB colour for the stencil particles.
+     * @param base_opacity Initial opacity for stencil particles [0,1].
+     */
+    Foam generateFoamSword(
+        float            radius,
+        float            length,
+        int              numDepth,
+        float            density,
+        const glm::vec3& color_param,
+        float            base_opacity
+    );
 
     /**
      * @brief Generate a flat foam floor plane.

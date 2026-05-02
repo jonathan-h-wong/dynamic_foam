@@ -29,11 +29,11 @@ namespace DynamicFoam::Sim2D {
     using StencilFoamMap = std::unordered_map<StencilFoamKey, V, StencilFoamKeyHash>;
 
     // Describes a single foam that was structurally modified by Topology::update.
-    struct FoamTopologyUpdate {
+    struct TopologyResult {
         // The foam whose topology changed.
         entt::entity foamId;
         // The particle insertions and deletions to apply to the GPU slab for this foam.
-        FoamUpdate foamUpdate;
+        FoamDelta delta;
     };
 
     // A foamB-local point that landed inside a mutable cell during boundary sampling.
@@ -59,7 +59,7 @@ namespace DynamicFoam::Sim2D {
         ~Topology() = default;
 
         // Returns one result per foam that was structurally modified this tick.
-        std::vector<FoamTopologyUpdate> update(
+        std::vector<TopologyResult> update(
             const GpuSlabAllocator&                              gpuSlab,
             std::unordered_map<int, AdjacencyList>&              foamAdjacencyLists,
             const std::unordered_map<int, glm::mat4>&            foamTransforms,

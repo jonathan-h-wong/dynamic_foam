@@ -208,7 +208,7 @@ StencilWorkResult Topology::buildStencilWork(
 // update
 // =============================================================================
 
-std::vector<FoamTopologyUpdate> Topology::update(
+std::vector<TopologyResult> Topology::update(
     const GpuSlabAllocator&                              gpuSlab,
     std::unordered_map<int, AdjacencyList>&              foamAdjacencyLists,
     const std::unordered_map<int, glm::mat4>&            foamTransforms,
@@ -221,13 +221,27 @@ std::vector<FoamTopologyUpdate> Topology::update(
     for (const auto& [id, _] : foamAdjacencyLists)
         foamIds.push_back(id);
 
+    // Only active controllers participate in topology collisions.
     std::vector<int> primaryFoamIds;
     for (auto entity : foamRegistry.view<Controller>())
-        primaryFoamIds.push_back(static_cast<int>(entity));
+        if (foamRegistry.get<Controller>(entity).active)
+            primaryFoamIds.push_back(static_cast<int>(entity));
 
+    // Collect stencil particles that belong to an active controller foam.
     std::vector<uint32_t> primaryParticleIds;
-    for (auto entity : particleRegistry.view<Stencil>())
-        primaryParticleIds.push_back(static_cast<uint32_t>(entity));
+    for (auto entity : particleRegistry.view<Stencil>()) {
+        // Stencil particles' entity IDs are used as node IDs in their foam's
+        // adjacency list; find which foam owns this particle by checking each
+        // active controller's adjacency list.
+        const uint32_t pid = static_cast<uint32_t>(entity);
+        for (int fid : primaryFoamIds) {
+            if (foamAdjacencyLists.count(fid) &&
+                foamAdjacencyLists.at(fid).getAdjList().count(pid)) {
+                primaryParticleIds.push_back(pid);
+                break;
+            }
+        }
+    }
 
     auto collisions = detectCollisions(gpuSlab, foamTransforms, particleRegistry,
                                        foamIds, primaryFoamIds, primaryParticleIds);
@@ -459,10 +473,10 @@ std::vector<FoamTopologyUpdate> Topology::update(
     
 
     // 6) CPU/GPU data structure updates
-    std::vector<FoamTopologyUpdate> results;
+    std::vector<TopologyResult> results;
 
     // Accumulate per-foam changes across all (stencil, foam) keys before
-    // building the final FoamTopologyUpdate structs.
+    // building the final TopologyResult structs.
     std::unordered_map<int, std::unordered_set<uint32_t>>                          foamParticleAdditions;
     std::unordered_map<int, std::unordered_set<uint32_t>>                          foamParticleDeletions;
     std::unordered_map<int, std::vector<std::pair<uint32_t, uint32_t>>> foamEdgeAdditions;
@@ -536,7 +550,7 @@ std::vector<FoamTopologyUpdate> Topology::update(
             edges.emplace_back(cooSrc[i], cooDst[i]);
     }
 
-    // Construct one FoamTopologyUpdate per foam that was touched.
+    // Construct one TopologyResult per foam that was touched.
     // Gather the union of all foam ids across the three maps.
     std::unordered_set<int> touchedFoams;
     for (const auto& [id, _] : foamParticleAdditions) touchedFoams.insert(id);
@@ -605,9 +619,9 @@ std::vector<FoamTopologyUpdate> Topology::update(
             }
         }
 
-        results.push_back(FoamTopologyUpdate{
+        results.push_back(TopologyResult{
             static_cast<entt::entity>(foamId),
-            FoamUpdate(
+            FoamDelta(
                 std::move(positions),
                 std::move(colors),
                 std::move(surface_masks),

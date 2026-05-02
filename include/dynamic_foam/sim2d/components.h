@@ -22,7 +22,9 @@ namespace DynamicFoam::Sim2D {
     // Initialzed once per foam
     struct Static {};
     struct Dynamic {};
-    struct Controller {};
+    // active — true while the primary mouse button is held; gates topology
+    // collision so that the controller only cuts foam when the user is clicking.
+    struct Controller { bool active = false; };
 
     // Transient Components
     struct Position {

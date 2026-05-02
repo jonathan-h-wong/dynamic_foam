@@ -2,6 +2,7 @@
 #include "dynamic_foam/Sim2D/simulation.h"
 #include "dynamic_foam/Sim2D/utils.h"
 #include <entt/entity/registry.hpp>
+#include <glm/gtx/quaternion.hpp>
 
 namespace DynamicFoam::Sim2D {
 
@@ -269,26 +270,58 @@ namespace DynamicFoam::Sim2D {
             }
         }
 
-        applyControllerCursor(input.mouse_pos);
+        applyControllerCursor(input.mouse_pos, input.left_mouse_clicked);
     }
 
-    void Simulation::applyControllerCursor(ImVec2 mouse_pos) {
+    void Simulation::applyControllerCursor(ImVec2 mouse_pos, bool clicked) {
         // Guard: ImGui reports (-FLT_MAX, -FLT_MAX) when the mouse is outside the window.
         if (mouse_pos.x < -1e6f || mouse_pos.y < -1e6f) return;
 
-        // Convert from ImGui pixel coordinates (top-left origin) to world space
-        // using the camera's projection. unprojectPixel delegates to generateRay,
-        // so the mapping is consistent with the GPU rendering kernels.
-        const glm::vec3 world   = unprojectPixel(camera_, glm::vec2(mouse_pos.x, mouse_pos.y), windowSize_);
-        const float     world_x = world.x;
-        const float     world_y = world.y;
+        // Compute the camera ray through the cursor pixel.  For a perspective
+        // camera ray_origin == camera_.origin; for orthographic it is the point
+        // on the near plane.  ray_dir is the normalised view direction.
+        glm::vec3 ray_origin, ray_dir;
+        generateRay(camera_,
+            static_cast<int>(mouse_pos.y) * windowSize_.x + static_cast<int>(mouse_pos.x),
+            windowSize_.x, windowSize_.y,
+            ray_origin, ray_dir);
 
-        foamRegistry.view<Controller, Position>().each([&](auto entity, auto& pos) {
-            pos.value = glm::vec3(world_x, world_y, 0.0f);
-            // Local-space particle positions are static; only the rigid-body
-            // Position component needs updating. The renderer reads the foam
-            // transform each frame, so no stageParticleData call is required.
-        });
+        // Quaternion that rotates local +Z onto ray_dir so the sword cylinder
+        // extends along the view ray from the camera position.
+        const glm::vec3 localAxis(0.f, 0.f, 1.f);
+        const glm::quat rayOrient = glm::rotation(localAxis, ray_dir);
+
+        // Opacity: bright (1.0) while clicking the mouse, dim (0.3) otherwise.
+        const float target_opacity = clicked ? 1.0f : 0.3f;
+
+        foamRegistry.view<Controller, Position, Orientation>().each(
+            [&](entt::entity entity, Controller& ctrl, Position& pos, Orientation& ori) {
+                // Gate topology collision: sword only cuts while the mouse is held.
+                ctrl.active = clicked;
+                // Place the sword at the camera origin aligned with the cursor ray.
+                pos.value = ray_origin;
+                ori.value = rayOrient;
+
+                // Scatter a sparse color update: only the Stencil particles of
+                // *this* foam; padding particles stay at opacity 0.
+                const int foam_id = static_cast<int>(entity);
+                std::vector<uint32_t>  color_ids;
+                std::vector<glm::vec4> color_values;
+                if (foamAdjacencyLists.count(foam_id)) {
+                    for (const auto& [nodeId, _] : foamAdjacencyLists.at(foam_id).getAdjList()) {
+                        const entt::entity pe = static_cast<entt::entity>(nodeId);
+                        if (!particleRegistry.all_of<Stencil>(pe)) continue;
+                        auto* col = particleRegistry.try_get<ParticleColor>(pe);
+                        auto* op  = particleRegistry.try_get<ParticleOpacity>(pe);
+                        if (!col || !op) continue;
+                        op->value = target_opacity;
+                        color_ids.push_back(nodeId);
+                        color_values.push_back(glm::vec4(col->rgb, op->value));
+                    }
+                }
+                if (!color_ids.empty())
+                    gpuSlab.updateFoamColors(foam_id, color_ids, color_values);
+            });
     }
 
     void Simulation::updateTopology() {
@@ -323,7 +356,7 @@ namespace DynamicFoam::Sim2D {
                 num_components = std::max(num_components, comp_id);
             
             // Update regardless of split or no-split
-            gpuSlab.updateFoamData(foam_id, result.foamUpdate);
+            gpuSlab.applyFoamDelta(foam_id, result.delta);
             const int N = gpuSlab.slots.at(foam_id).active_count;
             gpuSlab.bulkMortonSort(foam_id, N);
             buildBVH(result.foamId);
@@ -385,7 +418,7 @@ namespace DynamicFoam::Sim2D {
                         return copy_set.count(id) > 0;
                     });
 
-                    // FoamUpdate accumulators — built during steps (3)/(4) where all
+                    // FoamDelta accumulators — built during steps (3)/(4) where all
                     // clone entity IDs and properties are defined.  Positions are stored in
                     // parent-local space here and shifted to child-local space after the CoM
                     // is known in step (5), immediately before the GPU update in step (6).
@@ -439,7 +472,7 @@ namespace DynamicFoam::Sim2D {
                                 child_adj.addEdge(clone_id, nbr);
                         });
 
-                        // Populate GPU FoamUpdate insertion buffers for this clone.
+                        // Populate GPU FoamDelta insertion buffers for this clone.
                         // Positions are in parent-local space for now; subtraction of
                         // childCoM_local happens after step (5) below.
                         // All four components are guaranteed present: every particle
@@ -523,9 +556,9 @@ namespace DynamicFoam::Sim2D {
                             a.max_pt -= childCoM_local;
                         }
 
-                        // (6d) Submit the FoamUpdate: delete the copied original-air entries
+                        // (6d) Submit the FoamDelta: delete the copied original-air entries
                         // and insert the per-component clone particles with their COO edges.
-                        FoamUpdate childUpdate(
+                        FoamDelta childDelta(
                             std::move(clone_positions),
                             std::move(clone_colors),
                             std::move(clone_surface_masks),
@@ -534,7 +567,7 @@ namespace DynamicFoam::Sim2D {
                             std::move(clone_del_ids),
                             std::move(clone_coo_src),
                             std::move(clone_coo_dst));
-                        gpuSlab.updateFoamData(child_id, childUpdate);
+                        gpuSlab.applyFoamDelta(child_id, childDelta);
 
                         // (6e) Re-sort, refit BVH, and rebuild CSR for the new child slot.
                         const int child_N = gpuSlab.slots.at(child_id).active_count;
@@ -622,7 +655,7 @@ namespace DynamicFoam::Sim2D {
         // Re-sample the cursor position after the expensive subsystems so that
         // Controller foam is placed at its true on-screen location when the GPU
         // kernel fires, minimising input-to-display latency.
-        applyControllerCursor(ImGui::GetIO().MousePos);
+        applyControllerCursor(ImGui::GetIO().MousePos, ImGui::GetIO().MouseDown[0]);
         render();
     }
 };

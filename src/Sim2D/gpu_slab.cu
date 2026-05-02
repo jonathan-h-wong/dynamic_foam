@@ -212,8 +212,32 @@ void GpuSlabAllocator::bulkMortonSort(int foam_id, int n_particles)
 }
 
 // =============================================================================
-// updateFoamData — apply FoamUpdate (deletions then insertions)
+// updateFoamColors — sparse in-place color scatter
+// applyFoamDelta    — topology delta (deletions then insertions)
 // =============================================================================
+
+// Scatter a batch of new colors into d_particle_colors by searching
+// d_active_ids for each entity ID.
+// Complexity: O(N × M). In practice M is tiny (e.g. ~22 sword particles),
+// so a simple linear search beats building a hash table on device.
+static __global__ void k_scatter_colors(
+    const uint32_t* __restrict__ active_ids,
+    glm::vec4*                   d_colors,    // base of the slot (particle_offset already applied by caller)
+    const uint32_t* __restrict__ upd_ids,
+    const glm::vec4* __restrict__ upd_colors,
+    int n_active,
+    int n_updates)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_active) return;
+    const uint32_t id = active_ids[i];
+    for (int j = 0; j < n_updates; ++j) {
+        if (upd_ids[j] == id) {
+            d_colors[i] = upd_colors[j];
+            return;
+        }
+    }
+}
 
 // Generic per-particle flag kernel.
 // d_flags[i] = match_value   if active_ids[i] is found in id_set,
@@ -261,7 +285,38 @@ static __global__ void k_build_edge_id_match_flags(
     d_flags[i] = flag;
 }
 
-void GpuSlabAllocator::updateFoamData(int foam_id, const FoamUpdate& update)
+void GpuSlabAllocator::updateFoamColors(int foam_id,
+                                         const std::vector<uint32_t>&  ids,
+                                         const std::vector<glm::vec4>& colors)
+{
+    auto it = slots.find(foam_id);
+    if (it == slots.end() || it->second.dead) return;
+    const int n_col_upd = static_cast<int>(ids.size());
+    if (n_col_upd == 0) return;
+    const FoamSlot& s = it->second;
+    const int N = s.active_count;
+    if (N == 0) return;
+
+    uint32_t*  d_upd_ids    = nullptr;
+    glm::vec4* d_upd_colors = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_upd_ids,    n_col_upd * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_upd_colors, n_col_upd * sizeof(glm::vec4)));
+    CUDA_CHECK(cudaMemcpy(d_upd_ids,    ids.data(),
+        n_col_upd * sizeof(uint32_t),  cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_upd_colors, colors.data(),
+        n_col_upd * sizeof(glm::vec4), cudaMemcpyHostToDevice));
+
+    k_scatter_colors<<<grid_size(N), 256>>>(
+        d_active_ids      + s.active_offset,
+        d_particle_colors + s.particle_offset,
+        d_upd_ids, d_upd_colors, N, n_col_upd);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaFree(d_upd_ids));
+    CUDA_CHECK(cudaFree(d_upd_colors));
+}
+
+void GpuSlabAllocator::applyFoamDelta(int foam_id, const FoamDelta& update)
 {
     auto it = slots.find(foam_id);
     if (it == slots.end() || it->second.dead) return;
