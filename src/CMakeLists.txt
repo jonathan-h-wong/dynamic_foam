@@ -1,4 +1,7 @@
 # Find packages
+# CMP0167: FindBoost module removed in CMake 3.30+; use Boost's own config file instead.
+# vcpkg provides a proper BoostConfig.cmake so NEW is correct here.
+cmake_policy(SET CMP0167 NEW)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
@@ -60,7 +63,6 @@ set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/gpu_slab.cu
     # .cpp files routed through NVCC (LANGUAGE CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/physics.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/topology.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/user_input.cpp
     # Third-party imgui backends (don't use entt/glm)
     ${imgui_backends_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
@@ -93,7 +95,9 @@ target_link_libraries(dynamic_foam
 )
 
 # CGAL header-only configuration
-target_compile_definitions(dynamic_foam PRIVATE CGAL_HEADER_ONLY=1)
+# GLM_ENABLE_EXPERIMENTAL is required for glm/gtx/ headers (e.g. gtx/quaternion.hpp)
+# which transitively include experimental extensions like gtx/component_wise.hpp.
+target_compile_definitions(dynamic_foam PRIVATE CGAL_HEADER_ONLY=1 GLM_ENABLE_EXPERIMENTAL)
 
 # CUDA settings
 set_target_properties(dynamic_foam PROPERTIES
@@ -109,8 +113,10 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/W3>
         $<$<COMPILE_LANGUAGE:CXX>:/MP>
         $<$<COMPILE_LANGUAGE:CXX>:/WX>
+        $<$<COMPILE_LANGUAGE:CXX>:/diagnostics:caret>
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/diagnostics:caret>
     )
 else()
     target_compile_options(dynamic_foam PRIVATE
@@ -123,12 +129,12 @@ endif()
 # These .cpp files include .cuh headers (adjacency.cuh, bvh.cuh) which expose
 # CUB/Thrust device code that MSVC cannot parse. Routing them through NVCC via
 # LANGUAGE CUDA makes them part of the CUDA translation unit while still running
-# entirely on the host. simulation.cpp and sample_scene.cpp are Tier 3 (pure
-# MSVC) -- they own EnTT registries and call CGAL, both of which break under
-# NVCC, so their .cuh include paths are guarded with #ifdef __CUDACC__.
+# entirely on the host. simulation.cpp, topology.cpp, and sample_scene.cpp are
+# Tier 3 (pure MSVC) -- they own EnTT registries and/or call CGAL, both of
+# which break under NVCC, so their .cuh include paths are guarded with
+# #ifdef __CUDACC__.
 set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/physics.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/topology.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/Sim2D/user_input.cpp
     PROPERTIES LANGUAGE CUDA
 )

@@ -110,39 +110,47 @@ namespace DynamicFoam::Sim2D {
         std::unordered_map<uint32_t, glm::vec3> color;
         std::unordered_map<uint32_t, float>     opacity;
 
-        // Cylinder axis points along local +Z.
-        // 8 radial vertices per depth slice; an extra outer ring at 3× radius
-        // and two end-cap layers at z = -dz and z = length + dz form the
-        // padding boundary (opacity = 0, Immutable).
+        // Layout per depth slice:
+        //   slot 0        : center-axis particle — stencil in core slices, padding in end caps
+        //   slots 1..numFaces : outer ring at rOuter — always invisible padding
+        //
+        // This produces a clean line of stencil particles along local +Z,
+        // enclosed by a convex cylindrical padding shell so the Delaunay
+        // triangulation has a well-defined boundary.
         constexpr int numFaces  = 8;
-        const int     numRadial = numFaces + 1; // [0..7] core, [8] outer pad ring
-        const int     numDepthT = numDepth + 2; // [0] front cap, [1..numDepth] core, [numDepth+1] back cap
+        const int     numPerSlice = 1 + numFaces; // center + outer ring
+        const int     numDepthT = numDepth + 2;   // [0] front cap, [1..numDepth] core, [numDepth+1] back cap
 
-        const float dz       = length / static_cast<float>(numDepth - 1);
-        const float rOuter   = radius * 3.0f;
-        const float twoPi    = 2.0f * glm::pi<float>();
+        const float dz     = length / static_cast<float>(numDepth - 1);
+        const float rOuter = radius * 3.0f;
+        const float twoPi  = 2.0f * glm::pi<float>();
 
         uint32_t id_counter = 0;
         for (int j = 0; j < numDepthT; ++j) {
-            const float z       = static_cast<float>(j - 1) * dz; // j=0 → -dz, j=1 → 0, j=numDepth → length
+            const float z        = static_cast<float>(j - 1) * dz;
             const bool  isEndCap = (j == 0 || j == numDepthT - 1);
 
-            for (int i = 0; i < numRadial; ++i) {
-                const bool  isOuterRing = (i == numFaces);
-                const bool  isPadding   = isEndCap || isOuterRing;
-
-                const float theta = twoPi * static_cast<float>(i) / static_cast<float>(numFaces);
-                const float r     = isOuterRing ? rOuter : radius;
-
+            // --- slot 0: center-axis particle ---
+            {
                 const uint32_t id = id_counter++;
                 particleIds.push_back(id);
-                positions.push_back(glm::vec3(r * std::cos(theta), r * std::sin(theta), z));
-
-                // Core stencil particles drive simulation; padding boundary is Immutable.
-                stencil[id]     = !isPadding;
+                positions.push_back(glm::vec3(0.0f, 0.0f, z));
+                stencil[id]     = !isEndCap;   // stencil in core, padding at caps
                 mutable_map[id] = false;
                 color[id]       = color_param;
-                opacity[id]     = isPadding ? 0.0f : base_opacity;
+                opacity[id]     = isEndCap ? 0.0f : base_opacity;
+            }
+
+            // --- slots 1..numFaces: outer padding ring ---
+            for (int i = 0; i < numFaces; ++i) {
+                const float    theta = twoPi * static_cast<float>(i) / static_cast<float>(numFaces);
+                const uint32_t id    = id_counter++;
+                particleIds.push_back(id);
+                positions.push_back(glm::vec3(rOuter * std::cos(theta), rOuter * std::sin(theta), z));
+                stencil[id]     = false;
+                mutable_map[id] = false;
+                color[id]       = color_param;
+                opacity[id]     = 0.0f;  // always invisible
             }
         }
 
@@ -158,7 +166,7 @@ namespace DynamicFoam::Sim2D {
         const glm::vec3& color_param)
     {
         std::vector<uint32_t>                       particleIds;
-        std::vector<glm::vec3>                 positions;
+        std::vector<glm::vec3>                      positions;
         std::unordered_map<uint32_t, bool>          stencil;
         std::unordered_map<uint32_t, bool>          mutable_map;
         std::unordered_map<uint32_t, glm::vec3>     color;
@@ -225,7 +233,7 @@ namespace DynamicFoam::Sim2D {
         // base_opacity = 0.3: dimly visible while hovering, 1.0 when clicking.
         foams[1] = generateFoamSword(
             0.02f,                          // radius (m) — skinny laser cross-section
-            5.0f,                           // length (m) — finite extent into the scene
+            10.0f,                          // length (m) — doubled for reach
             20,                             // depth samples
             1.0f,                           // density
             glm::vec3(1.0f, 0.95f, 0.1f),  // bright yellow
@@ -235,15 +243,11 @@ namespace DynamicFoam::Sim2D {
         dynamic_map[1]    = false;           // not dynamic
 
         // Floor plane — immobile, immutable, static, non-controller.
-        // 20x20 interior particles centred at the origin at y=0.
         foams[2]          = generateFoamFloorPlane(
-            10.0f, 10.0f,                    // 10 m × 10 m
-            20, 20,                           // 20 × 20 interior centres
-            1.0f,                             // density
-            glm::vec3(0.5f, 0.5f, 0.5f));    // grey
-        transforms[2]     = glm::mat4(1.0f); // identity — already at origin
-        controller_map[2] = false;           // not a controller
-        dynamic_map[2]    = false;           // static
+            10.0f, 10.0f, 20, 20, 1.0f, glm::vec3(0.5f, 0.5f, 0.5f));
+        transforms[2]     = glm::mat4(1.0f);
+        controller_map[2] = false;
+        dynamic_map[2]    = false;
 
         return SceneGraph(foams, transforms, controller_map, dynamic_map);
     }
